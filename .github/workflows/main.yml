@@ -1,0 +1,23 @@
+name: Build
+
+on:
+  push:
+    branches: [ "master" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install Dependencies
+        run: |
+          sudo apt update
+          sudo apt install libelf-dev libssl-dev
+
+      - name: Build
+        run: |
+          make mrproper
+          make defconfig
+          make -j$(nproc)
