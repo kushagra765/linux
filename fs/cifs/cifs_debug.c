@@ -8,6 +8,7 @@
 #include <linux/fs.h>
 #include <linux/string.h>
 #include <linux/ctype.h>
+#include <linux/kstrtox.h>
 #include <linux/module.h>
 #include <linux/proc_fs.h>
 #include <linux/uaccess.h>
@@ -419,6 +420,11 @@ skip_rdma:
 				   from_kuid(&init_user_ns, ses->linux_uid),
 				   from_kuid(&init_user_ns, ses->cred_uid));
 
+			if (ses->dfs_root_ses) {
+				seq_printf(m, "\n\tDFS root session id: 0x%llx",
+					   ses->dfs_root_ses->Suid);
+			}
+
 			spin_lock(&ses->chan_lock);
 			if (CIFS_CHAN_NEEDS_RECONNECT(ses, 0))
 				seq_puts(m, "\tPrimary channel: DISCONNECTED ");
@@ -455,8 +461,10 @@ skip_rdma:
 
 			spin_lock(&ses->iface_lock);
 			if (ses->iface_count)
-				seq_printf(m, "\n\n\tServer interfaces: %zu",
-					   ses->iface_count);
+				seq_printf(m, "\n\n\tServer interfaces: %zu"
+					   "\tLast updated: %lu seconds ago",
+					   ses->iface_count,
+					   (jiffies - ses->iface_last_update) / HZ);
 			j = 0;
 			list_for_each_entry(iface, &ses->iface_list,
 						 iface_head) {
@@ -787,7 +795,7 @@ static ssize_t cifsFYI_proc_write(struct file *file, const char __user *buffer,
 	rc = get_user(c[0], buffer);
 	if (rc)
 		return rc;
-	if (strtobool(c, &bv) == 0)
+	if (kstrtobool(c, &bv) == 0)
 		cifsFYI = bv;
 	else if ((c[0] > '1') && (c[0] <= '9'))
 		cifsFYI = (int) (c[0] - '0'); /* see cifs_debug.h for meanings */
@@ -947,7 +955,7 @@ static ssize_t cifs_security_flags_proc_write(struct file *file,
 
 	if (count < 3) {
 		/* single char or single char followed by null */
-		if (strtobool(flags_string, &bv) == 0) {
+		if (kstrtobool(flags_string, &bv) == 0) {
 			global_secflags = bv ? CIFSSEC_MAX : CIFSSEC_DEF;
 			return count;
 		} else if (!isdigit(flags_string[0])) {
