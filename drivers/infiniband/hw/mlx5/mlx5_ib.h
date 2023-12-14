@@ -25,6 +25,8 @@
 #include <rdma/mlx5_user_ioctl_verbs.h>
 
 #include "srq.h"
+#include "qp.h"
+#include "macsec.h"
 
 #define mlx5_ib_dbg(_dev, format, arg...)                                      \
 	dev_dbg(&(_dev)->ib_dev.dev, "%s:%d:(pid %d): " format, __func__,      \
@@ -237,8 +239,19 @@ enum {
 #define MLX5_IB_NUM_SNIFFER_FTS		2
 #define MLX5_IB_NUM_EGRESS_FTS		1
 #define MLX5_IB_NUM_FDB_FTS		MLX5_BY_PASS_NUM_REGULAR_PRIOS
+
+struct mlx5_ib_anchor {
+	struct mlx5_flow_table *ft;
+	struct mlx5_flow_group *fg_goto_table;
+	struct mlx5_flow_group *fg_drop;
+	struct mlx5_flow_handle *rule_goto_table;
+	struct mlx5_flow_handle *rule_drop;
+	unsigned int rule_goto_table_ref;
+};
+
 struct mlx5_ib_flow_prio {
 	struct mlx5_flow_table		*flow_table;
+	struct mlx5_ib_anchor		anchor;
 	unsigned int			refcount;
 };
 
@@ -740,10 +753,25 @@ struct umr_common {
 	unsigned int state;
 };
 
+#define NUM_MKEYS_PER_PAGE \
+	((PAGE_SIZE - sizeof(struct list_head)) / sizeof(u32))
+
+struct mlx5_mkeys_page {
+	u32 mkeys[NUM_MKEYS_PER_PAGE];
+	struct list_head list;
+};
+static_assert(sizeof(struct mlx5_mkeys_page) == PAGE_SIZE);
+
+struct mlx5_mkeys_queue {
+	struct list_head pages_list;
+	u32 num_pages;
+	unsigned long ci;
+	spinlock_t lock; /* sync list ops */
+};
+
 struct mlx5_cache_ent {
-	struct xarray		mkeys;
-	unsigned long		stored;
-	unsigned long		reserved;
+	struct mlx5_mkeys_queue	mkeys_queue;
+	u32			pending;
 
 	char                    name[4];
 
@@ -858,6 +886,9 @@ struct mlx5_ib_port {
 	struct mlx5_ib_dbg_cc_params *dbg_cc_params;
 	struct mlx5_roce roce;
 	struct mlx5_eswitch_rep		*rep;
+#ifdef CONFIG_MLX5_MACSEC
+	struct mlx5_reserved_gids *reserved_gids;
+#endif
 };
 
 struct mlx5_ib_dbg_param {
@@ -1074,6 +1105,12 @@ struct mlx5_special_mkeys {
 	__be32 terminate_scatter_list_mkey;
 };
 
+struct mlx5_macsec {
+	struct mutex lock; /* Protects mlx5_macsec internal contexts */
+	struct list_head macsec_devices_list;
+	struct notifier_block blocking_events_nb;
+};
+
 struct mlx5_ib_dev {
 	struct ib_device		ib_dev;
 	struct mlx5_core_dev		*mdev;
@@ -1133,6 +1170,10 @@ struct mlx5_ib_dev {
 	u16 pkey_table_len;
 	u8 lag_ports;
 	struct mlx5_special_mkeys mkeys;
+
+#ifdef CONFIG_MLX5_MACSEC
+	struct mlx5_macsec macsec;
+#endif
 };
 
 static inline struct mlx5_ib_cq *to_mibcq(struct mlx5_core_cq *mcq)
@@ -1587,6 +1628,9 @@ static inline bool mlx5_ib_lag_should_assign_affinity(struct mlx5_ib_dev *dev)
 	    MLX5_CAP_PORT_SELECTION(dev->mdev, port_select_flow_table_bypass))
 		return 0;
 
+	if (mlx5_lag_is_lacp_owner(dev->mdev) && !dev->lag_active)
+		return 0;
+
 	return dev->lag_active ||
 		(MLX5_CAP_GEN(dev->mdev, num_lag_ports) > 1 &&
 		 MLX5_CAP_GEN(dev->mdev, lag_tx_port_affinity));
@@ -1633,4 +1677,7 @@ static inline bool mlx5_umem_needs_ats(struct mlx5_ib_dev *dev,
 	return access_flags & IB_ACCESS_RELAXED_ORDERING;
 }
 
+int set_roce_addr(struct mlx5_ib_dev *dev, u32 port_num,
+		  unsigned int index, const union ib_gid *gid,
+		  const struct ib_gid_attr *attr);
 #endif /* MLX5_IB_H */

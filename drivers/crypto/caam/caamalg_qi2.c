@@ -641,7 +641,8 @@ static int chachapoly_setkey(struct crypto_aead *aead, const u8 *key,
 	if (keylen != CHACHA_KEY_SIZE + saltlen)
 		return -EINVAL;
 
-	ctx->cdata.key_virt = key;
+	memcpy(ctx->key, key, keylen);
+	ctx->cdata.key_virt = ctx->key;
 	ctx->cdata.keylen = keylen - saltlen;
 
 	return chachapoly_set_sh_desc(aead);
@@ -5402,7 +5403,7 @@ err_dma_mask:
 	return err;
 }
 
-static int __cold dpaa2_caam_remove(struct fsl_mc_device *ls_dev)
+static void __cold dpaa2_caam_remove(struct fsl_mc_device *ls_dev)
 {
 	struct device *dev;
 	struct dpaa2_caam_priv *priv;
@@ -5443,8 +5444,6 @@ static int __cold dpaa2_caam_remove(struct fsl_mc_device *ls_dev)
 	free_percpu(priv->ppriv);
 	fsl_mc_portal_free(priv->mc_io);
 	kmem_cache_destroy(qi_cache);
-
-	return 0;
 }
 
 int dpaa2_caam_enqueue(struct device *dev, struct caam_request *req)

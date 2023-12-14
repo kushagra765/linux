@@ -47,6 +47,7 @@
 #include <asm/smp.h>
 #include <asm/time.h>
 #include <asm/machdep.h>
+#include <asm/mmu_context.h>
 #include <asm/cputhreads.h>
 #include <asm/cputable.h>
 #include <asm/mpic.h>
@@ -291,7 +292,7 @@ void smp_muxed_ipi_set_message(int cpu, int msg)
 	 * Order previous accesses before accesses in the IPI handler.
 	 */
 	smp_mb();
-	message[msg] = 1;
+	WRITE_ONCE(message[msg], 1);
 }
 
 void smp_muxed_ipi_message_pass(int cpu, int msg)
@@ -350,7 +351,7 @@ irqreturn_t smp_ipi_demux_relaxed(void)
 		if (all & IPI_MESSAGE(PPC_MSG_NMI_IPI))
 			nmi_ipi_action(0, NULL);
 #endif
-	} while (info->messages);
+	} while (READ_ONCE(info->messages));
 
 	return IRQ_HANDLED;
 }
@@ -417,9 +418,9 @@ noinstr static void nmi_ipi_lock_start(unsigned long *flags)
 {
 	raw_local_irq_save(*flags);
 	hard_irq_disable();
-	while (arch_atomic_cmpxchg(&__nmi_ipi_lock, 0, 1) == 1) {
+	while (raw_atomic_cmpxchg(&__nmi_ipi_lock, 0, 1) == 1) {
 		raw_local_irq_restore(*flags);
-		spin_until_cond(arch_atomic_read(&__nmi_ipi_lock) == 0);
+		spin_until_cond(raw_atomic_read(&__nmi_ipi_lock) == 0);
 		raw_local_irq_save(*flags);
 		hard_irq_disable();
 	}
@@ -427,15 +428,15 @@ noinstr static void nmi_ipi_lock_start(unsigned long *flags)
 
 noinstr static void nmi_ipi_lock(void)
 {
-	while (arch_atomic_cmpxchg(&__nmi_ipi_lock, 0, 1) == 1)
-		spin_until_cond(arch_atomic_read(&__nmi_ipi_lock) == 0);
+	while (raw_atomic_cmpxchg(&__nmi_ipi_lock, 0, 1) == 1)
+		spin_until_cond(raw_atomic_read(&__nmi_ipi_lock) == 0);
 }
 
 noinstr static void nmi_ipi_unlock(void)
 {
 	smp_mb();
-	WARN_ON(arch_atomic_read(&__nmi_ipi_lock) != 1);
-	arch_atomic_set(&__nmi_ipi_lock, 0);
+	WARN_ON(raw_atomic_read(&__nmi_ipi_lock) != 1);
+	raw_atomic_set(&__nmi_ipi_lock, 0);
 }
 
 noinstr static void nmi_ipi_unlock_end(unsigned long *flags)
@@ -1050,7 +1051,7 @@ static struct sched_domain_topology_level powerpc_topology[] = {
 #endif
 	{ shared_cache_mask, powerpc_shared_cache_flags, SD_INIT_NAME(CACHE) },
 	{ cpu_mc_mask, SD_INIT_NAME(MC) },
-	{ cpu_cpu_mask, SD_INIT_NAME(DIE) },
+	{ cpu_cpu_mask, SD_INIT_NAME(PKG) },
 	{ NULL, },
 };
 
@@ -1087,7 +1088,7 @@ static int __init init_big_cores(void)
 
 void __init smp_prepare_cpus(unsigned int max_cpus)
 {
-	unsigned int cpu;
+	unsigned int cpu, num_threads;
 
 	DBG("smp_prepare_cpus\n");
 
@@ -1154,6 +1155,12 @@ void __init smp_prepare_cpus(unsigned int max_cpus)
 
 	if (smp_ops && smp_ops->probe)
 		smp_ops->probe();
+
+	// Initalise the generic SMT topology support
+	num_threads = 1;
+	if (smt_enabled_at_boot)
+		num_threads = smt_enabled_at_boot;
+	cpu_smt_set_num_threads(num_threads, threads_per_core);
 }
 
 void smp_prepare_boot_cpu(void)
@@ -1588,7 +1595,7 @@ static void add_cpu_to_masks(int cpu)
 	/* Skip all CPUs already part of current CPU core mask */
 	cpumask_andnot(mask, cpu_online_mask, cpu_core_mask(cpu));
 
-	/* If chip_id is -1; limit the cpu_core_mask to within DIE*/
+	/* If chip_id is -1; limit the cpu_core_mask to within PKG */
 	if (chip_id == -1)
 		cpumask_and(mask, mask, cpu_cpu_mask(cpu));
 
@@ -1605,6 +1612,7 @@ static void add_cpu_to_masks(int cpu)
 }
 
 /* Activate a secondary processor. */
+__no_stack_protector
 void start_secondary(void *unused)
 {
 	unsigned int cpu = raw_smp_processor_id();
@@ -1615,10 +1623,13 @@ void start_secondary(void *unused)
 
 	mmgrab_lazy_tlb(&init_mm);
 	current->active_mm = &init_mm;
+	VM_WARN_ON(cpumask_test_cpu(smp_processor_id(), mm_cpumask(&init_mm)));
+	cpumask_set_cpu(cpu, mm_cpumask(&init_mm));
+	inc_mm_active_cpus(&init_mm);
 
 	smp_store_cpu_info(cpu);
 	set_dec(tb_ticks_per_jiffy);
-	rcu_cpu_starting(cpu);
+	rcutree_report_cpu_starting(cpu);
 	cpu_callin_map[cpu] = 1;
 
 	if (smp_ops->setup_cpu)
@@ -1750,6 +1761,14 @@ int __cpu_disable(void)
 
 void __cpu_die(unsigned int cpu)
 {
+	/*
+	 * This could perhaps be a generic call in idlea_task_dead(), but
+	 * that requires testing from all archs, so first put it here to
+	 */
+	VM_WARN_ON_ONCE(!cpumask_test_cpu(cpu, mm_cpumask(&init_mm)));
+	dec_mm_active_cpus(&init_mm);
+	cpumask_clear_cpu(cpu, mm_cpumask(&init_mm));
+
 	if (smp_ops->cpu_die)
 		smp_ops->cpu_die(cpu);
 }

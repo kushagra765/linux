@@ -10,6 +10,7 @@
 #ifndef __PDX86_X86_ANDROID_TABLETS_H
 #define __PDX86_X86_ANDROID_TABLETS_H
 
+#include <linux/gpio/consumer.h>
 #include <linux/gpio_keys.h>
 #include <linux/i2c.h>
 #include <linux/irqdomain_defs.h>
@@ -37,6 +38,7 @@ struct x86_acpi_irq_data {
 	int index;
 	int trigger;  /* ACPI_EDGE_SENSITIVE / ACPI_LEVEL_SENSITIVE */
 	int polarity; /* ACPI_ACTIVE_HIGH / ACPI_ACTIVE_LOW / ACPI_ACTIVE_BOTH */
+	const char *con_id;
 };
 
 /* Structs to describe devices to instantiate */
@@ -66,22 +68,24 @@ struct x86_gpio_button {
 };
 
 struct x86_dev_info {
-	char *invalid_aei_gpiochip;
 	const char * const *modules;
 	const struct software_node *bat_swnode;
 	struct gpiod_lookup_table * const *gpiod_lookup_tables;
 	const struct x86_i2c_client_info *i2c_client_info;
 	const struct platform_device_info *pdev_info;
 	const struct x86_serdev_info *serdev_info;
-	struct x86_gpio_button *gpio_button;
+	const struct x86_gpio_button *gpio_button;
 	int i2c_client_count;
 	int pdev_count;
 	int serdev_count;
+	int gpio_button_count;
 	int (*init)(void);
 	void (*exit)(void);
 };
 
-int x86_android_tablet_get_gpiod(const char *label, int pin, struct gpio_desc **desc);
+int x86_android_tablet_get_gpiod(const char *chip, int pin, const char *con_id,
+				 bool active_low, enum gpiod_flags dflags,
+				 struct gpio_desc **desc);
 int x86_acpi_irq_helper_get(const struct x86_acpi_irq_data *data);
 
 /*
@@ -93,6 +97,7 @@ extern const struct x86_dev_info advantech_mica_071_info;
 extern const struct x86_dev_info asus_me176c_info;
 extern const struct x86_dev_info asus_tf103c_info;
 extern const struct x86_dev_info chuwi_hi8_info;
+extern const struct x86_dev_info cyberbook_t116_info;
 extern const struct x86_dev_info czc_p10t;
 extern const struct x86_dev_info lenovo_yogabook_x90_info;
 extern const struct x86_dev_info lenovo_yogabook_x91_info;
@@ -100,6 +105,7 @@ extern const struct x86_dev_info lenovo_yoga_tab2_830_1050_info;
 extern const struct x86_dev_info lenovo_yt3_info;
 extern const struct x86_dev_info medion_lifetab_s10346_info;
 extern const struct x86_dev_info nextbook_ares8_info;
+extern const struct x86_dev_info nextbook_ares8a_info;
 extern const struct x86_dev_info peaq_c1010_info;
 extern const struct x86_dev_info whitelabel_tm800a550l_info;
 extern const struct x86_dev_info xiaomi_mipad2_info;

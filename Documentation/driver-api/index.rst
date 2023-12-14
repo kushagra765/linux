@@ -113,6 +113,8 @@ available subsections can be seen below.
    xillybus
    zorro
    hte/index
+   wmi
+   dpll
 
 .. only::  subproject and html
 

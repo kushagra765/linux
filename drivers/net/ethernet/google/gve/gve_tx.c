@@ -248,7 +248,7 @@ static int gve_tx_alloc_ring(struct gve_priv *priv, int idx)
 	tx->mask = slots - 1;
 
 	/* alloc metadata */
-	tx->info = vzalloc(sizeof(*tx->info) * slots);
+	tx->info = vcalloc(slots, sizeof(*tx->info));
 	if (!tx->info)
 		return -ENOMEM;
 
@@ -924,10 +924,6 @@ bool gve_xdp_poll(struct gve_notify_block *block, int budget)
 	u32 nic_done;
 	bool repoll;
 	u32 to_do;
-
-	/* If budget is 0, do all the work */
-	if (budget == 0)
-		budget = INT_MAX;
 
 	/* Find out how much work there is to be done */
 	nic_done = gve_tx_load_event_counter(priv, tx);

@@ -10,6 +10,7 @@
 #ifndef _LINUX_PROPERTY_H_
 #define _LINUX_PROPERTY_H_
 
+#include <linux/args.h>
 #include <linux/bits.h>
 #include <linux/fwnode.h>
 #include <linux/stddef.h>
@@ -83,6 +84,18 @@ static inline
 bool fwnode_device_is_compatible(const struct fwnode_handle *fwnode, const char *compat)
 {
 	return fwnode_property_match_string(fwnode, "compatible", compat) >= 0;
+}
+
+/**
+ * device_is_compatible - match 'compatible' property of the device with a given string
+ * @dev: Pointer to the struct device
+ * @compat: The string to match 'compatible' property with
+ *
+ * Returns: true if matches, otherwise false.
+ */
+static inline bool device_is_compatible(const struct device *dev, const char *compat)
+{
+	return fwnode_device_is_compatible(dev_fwnode(dev), compat);
 }
 
 int fwnode_property_get_reference_args(const struct fwnode_handle *fwnode,
@@ -276,7 +289,7 @@ struct software_node_ref_args {
 #define SOFTWARE_NODE_REFERENCE(_ref_, ...)			\
 (const struct software_node_ref_args) {				\
 	.node = _ref_,						\
-	.nargs = ARRAY_SIZE(((u64[]){ 0, ##__VA_ARGS__ })) - 1,	\
+	.nargs = COUNT_ARGS(__VA_ARGS__),			\
 	.args = { __VA_ARGS__ },				\
 }
 

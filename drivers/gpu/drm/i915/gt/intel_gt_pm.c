@@ -13,6 +13,7 @@
 #include "intel_engine_pm.h"
 #include "intel_gt.h"
 #include "intel_gt_clock_utils.h"
+#include "intel_gt_mcr.h"
 #include "intel_gt_pm.h"
 #include "intel_gt_print.h"
 #include "intel_gt_requests.h"
@@ -87,7 +88,7 @@ static int __gt_unpark(struct intel_wakeref *wf)
 
 	intel_rc6_unpark(&gt->rc6);
 	intel_rps_unpark(&gt->rps);
-	i915_pmu_gt_unparked(i915);
+	i915_pmu_gt_unparked(gt);
 	intel_guc_busyness_unpark(gt);
 
 	intel_gt_unpark_requests(gt);
@@ -109,7 +110,7 @@ static int __gt_park(struct intel_wakeref *wf)
 
 	intel_guc_busyness_park(gt);
 	i915_vma_parked(gt);
-	i915_pmu_gt_parked(i915);
+	i915_pmu_gt_parked(gt);
 	intel_rps_park(&gt->rps);
 	intel_rc6_park(&gt->rc6);
 
@@ -137,7 +138,7 @@ void intel_gt_pm_init_early(struct intel_gt *gt)
 	 * runtime_pm is per-device rather than per-tile, so this is still the
 	 * correct structure.
 	 */
-	intel_wakeref_init(&gt->wakeref, &gt->i915->runtime_pm, &wf_ops);
+	intel_wakeref_init(&gt->wakeref, gt->i915, &wf_ops);
 	seqcount_mutex_init(&gt->stats.lock, &gt->wakeref.mutex);
 }
 
@@ -216,6 +217,21 @@ void intel_gt_pm_fini(struct intel_gt *gt)
 	intel_rc6_fini(&gt->rc6);
 }
 
+void intel_gt_resume_early(struct intel_gt *gt)
+{
+	/*
+	 * Sanitize steer semaphores during driver resume. This is necessary
+	 * to address observed cases of steer semaphores being
+	 * held after a suspend operation. Confirmation from the hardware team
+	 * assures the safety of this operation, as no lock acquisitions
+	 * by other agents occur during driver load/resume process.
+	 */
+	intel_gt_mcr_lock_sanitize(gt);
+
+	intel_uncore_resume_early(gt->uncore);
+	intel_gt_check_and_clear_faults(gt);
+}
+
 int intel_gt_resume(struct intel_gt *gt)
 {
 	struct intel_engine_cs *engine;
@@ -280,6 +296,7 @@ int intel_gt_resume(struct intel_gt *gt)
 out_fw:
 	intel_uncore_forcewake_put(gt->uncore, FORCEWAKE_ALL);
 	intel_gt_pm_put(gt);
+	intel_gt_bind_context_set_ready(gt);
 	return err;
 
 err_wedged:
@@ -306,6 +323,7 @@ static void wait_for_suspend(struct intel_gt *gt)
 
 void intel_gt_suspend_prepare(struct intel_gt *gt)
 {
+	intel_gt_bind_context_set_unready(gt);
 	user_forcewake(gt, true);
 	wait_for_suspend(gt);
 }
@@ -359,6 +377,7 @@ void intel_gt_suspend_late(struct intel_gt *gt)
 
 void intel_gt_runtime_suspend(struct intel_gt *gt)
 {
+	intel_gt_bind_context_set_unready(gt);
 	intel_uc_runtime_suspend(&gt->uc);
 
 	GT_TRACE(gt, "\n");
@@ -376,6 +395,7 @@ int intel_gt_runtime_resume(struct intel_gt *gt)
 	if (ret)
 		return ret;
 
+	intel_gt_bind_context_set_ready(gt);
 	return 0;
 }
 

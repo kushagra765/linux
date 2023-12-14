@@ -31,7 +31,6 @@ struct handshake_req {
 	struct list_head		hr_list;
 	struct rhash_head		hr_rhash;
 	unsigned long			hr_flags;
-	struct file			*hr_file;
 	const struct handshake_proto	*hr_proto;
 	struct sock			*hr_sk;
 	void				(*hr_odestruct)(struct sock *sk);
@@ -42,7 +41,10 @@ struct handshake_req {
 
 enum hr_flags_bits {
 	HANDSHAKE_F_REQ_COMPLETED,
+	HANDSHAKE_F_REQ_SESSION,
 };
+
+struct genl_info;
 
 /* Invariants for all handshake requests for one transport layer
  * security protocol
@@ -63,6 +65,9 @@ struct handshake_proto {
 enum hp_flags_bits {
 	HANDSHAKE_F_PROTO_NOTIFY,
 };
+
+/* alert.c */
+int tls_alert_send(struct socket *sock, u8 level, u8 description);
 
 /* netlink.c */
 int handshake_genl_notify(struct net *net, const struct handshake_proto *proto,

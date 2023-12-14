@@ -88,10 +88,27 @@ smb2_hdr_assemble(struct smb2_hdr *shdr, __le16 smb2_cmd,
 		  const struct cifs_tcon *tcon,
 		  struct TCP_Server_Info *server)
 {
+	struct smb3_hdr_req *smb3_hdr;
+
 	shdr->ProtocolId = SMB2_PROTO_NUMBER;
 	shdr->StructureSize = cpu_to_le16(64);
 	shdr->Command = smb2_cmd;
+
 	if (server) {
+		/* After reconnect SMB3 must set ChannelSequence on subsequent reqs */
+		if (server->dialect >= SMB30_PROT_ID) {
+			smb3_hdr = (struct smb3_hdr_req *)shdr;
+			/*
+			 * if primary channel is not set yet, use default
+			 * channel for chan sequence num
+			 */
+			if (SERVER_IS_CHAN(server))
+				smb3_hdr->ChannelSequence =
+					cpu_to_le16(server->primary_server->channel_sequence_num);
+			else
+				smb3_hdr->ChannelSequence =
+					cpu_to_le16(server->channel_sequence_num);
+		}
 		spin_lock(&server->req_lock);
 		/* Request up to 10 credits but don't go over the limit. */
 		if (server->credits >= server->max_credits)
@@ -141,11 +158,14 @@ out:
 
 static int
 smb2_reconnect(__le16 smb2_command, struct cifs_tcon *tcon,
-	       struct TCP_Server_Info *server)
+	       struct TCP_Server_Info *server, bool from_reconnect)
 {
 	int rc = 0;
 	struct nls_table *nls_codepage = NULL;
 	struct cifs_ses *ses;
+	int xid;
+	struct TCP_Server_Info *pserver;
+	unsigned int chan_index;
 
 	/*
 	 * SMB2s NegProt, SessSetup, Logoff do not have tcon yet so
@@ -206,6 +226,12 @@ smb2_reconnect(__le16 smb2_command, struct cifs_tcon *tcon,
 			return -EAGAIN;
 		}
 	}
+
+	/* if server is marked for termination, cifsd will cleanup */
+	if (server->terminate) {
+		spin_unlock(&server->srv_lock);
+		return -EHOSTDOWN;
+	}
 	spin_unlock(&server->srv_lock);
 
 again:
@@ -225,11 +251,23 @@ again:
 
 	mutex_lock(&ses->session_mutex);
 	/*
+	 * if this is called by delayed work, and the channel has been disabled
+	 * in parallel, the delayed work can continue to execute in parallel
+	 * there's a chance that this channel may not exist anymore
+	 */
+	spin_lock(&server->srv_lock);
+	if (server->tcpStatus == CifsExiting) {
+		spin_unlock(&server->srv_lock);
+		mutex_unlock(&ses->session_mutex);
+		rc = -EHOSTDOWN;
+		goto out;
+	}
+
+	/*
 	 * Recheck after acquire mutex. If another thread is negotiating
 	 * and the server never sends an answer the socket will be closed
 	 * and tcpStatus set to reconnect.
 	 */
-	spin_lock(&server->srv_lock);
 	if (server->tcpStatus == CifsNeedReconnect) {
 		spin_unlock(&server->srv_lock);
 		mutex_unlock(&ses->session_mutex);
@@ -242,7 +280,7 @@ again:
 	}
 	spin_unlock(&server->srv_lock);
 
-	nls_codepage = load_nls_default();
+	nls_codepage = ses->local_nls;
 
 	/*
 	 * need to prevent multiple threads trying to simultaneously
@@ -266,6 +304,53 @@ again:
 
 	rc = cifs_negotiate_protocol(0, ses, server);
 	if (!rc) {
+		/*
+		 * if server stopped supporting multichannel
+		 * and the first channel reconnected, disable all the others.
+		 */
+		if (ses->chan_count > 1 &&
+		    !(server->capabilities & SMB2_GLOBAL_CAP_MULTI_CHANNEL)) {
+			if (SERVER_IS_CHAN(server)) {
+				cifs_dbg(VFS, "server %s does not support " \
+					 "multichannel anymore. skipping secondary channel\n",
+					 ses->server->hostname);
+
+				spin_lock(&ses->chan_lock);
+				chan_index = cifs_ses_get_chan_index(ses, server);
+				if (chan_index == CIFS_INVAL_CHAN_INDEX) {
+					spin_unlock(&ses->chan_lock);
+					goto skip_terminate;
+				}
+
+				ses->chans[chan_index].server = NULL;
+				spin_unlock(&ses->chan_lock);
+
+				/*
+				 * the above reference of server by channel
+				 * needs to be dropped without holding chan_lock
+				 * as cifs_put_tcp_session takes a higher lock
+				 * i.e. cifs_tcp_ses_lock
+				 */
+				cifs_put_tcp_session(server, from_reconnect);
+
+				server->terminate = true;
+				cifs_signal_cifsd_for_reconnect(server, false);
+
+				/* mark primary server as needing reconnect */
+				pserver = server->primary_server;
+				cifs_signal_cifsd_for_reconnect(pserver, false);
+
+skip_terminate:
+				mutex_unlock(&ses->session_mutex);
+				rc = -EHOSTDOWN;
+				goto out;
+			} else {
+				cifs_server_dbg(VFS, "does not support " \
+					 "multichannel anymore. disabling all other channels\n");
+				cifs_disable_secondary_channels(ses);
+			}
+		}
+
 		rc = cifs_setup_session(0, ses, server, nls_codepage);
 		if ((rc == -EACCES) && !tcon->retry) {
 			mutex_unlock(&ses->session_mutex);
@@ -290,17 +375,44 @@ skip_sess_setup:
 		tcon->need_reopen_files = true;
 
 	rc = cifs_tree_connect(0, tcon, nls_codepage);
-	mutex_unlock(&ses->session_mutex);
 
 	cifs_dbg(FYI, "reconnect tcon rc = %d\n", rc);
 	if (rc) {
 		/* If sess reconnected but tcon didn't, something strange ... */
+		mutex_unlock(&ses->session_mutex);
 		cifs_dbg(VFS, "reconnect tcon failed rc = %d\n", rc);
 		goto out;
 	}
 
+	if (!rc &&
+	    (server->capabilities & SMB2_GLOBAL_CAP_MULTI_CHANNEL)) {
+		mutex_unlock(&ses->session_mutex);
+
+		/*
+		 * query server network interfaces, in case they change
+		 */
+		xid = get_xid();
+		rc = SMB3_request_interfaces(xid, tcon, false);
+		free_xid(xid);
+
+		if (rc)
+			cifs_dbg(FYI, "%s: failed to query server interfaces: %d\n",
+				 __func__, rc);
+
+		if (ses->chan_max > ses->chan_count &&
+		    !SERVER_IS_CHAN(server)) {
+			if (ses->chan_count == 1)
+				cifs_server_dbg(VFS, "supports multichannel now\n");
+
+			cifs_try_adding_channels(ses);
+		}
+	} else {
+		mutex_unlock(&ses->session_mutex);
+	}
+
 	if (smb2_command != SMB2_INTERNAL_CMD)
-		mod_delayed_work(cifsiod_wq, &server->reconnect, 0);
+		if (mod_delayed_work(cifsiod_wq, &server->reconnect, 0))
+			cifs_put_tcp_session(server, false);
 
 	atomic_inc(&tconInfoReconnectCount);
 out:
@@ -324,7 +436,6 @@ out:
 		rc = -EAGAIN;
 	}
 failed:
-	unload_nls(nls_codepage);
 	return rc;
 }
 
@@ -388,7 +499,7 @@ static int smb2_plain_req_init(__le16 smb2_command, struct cifs_tcon *tcon,
 {
 	int rc;
 
-	rc = smb2_reconnect(smb2_command, tcon, server);
+	rc = smb2_reconnect(smb2_command, tcon, server, false);
 	if (rc)
 		return rc;
 
@@ -554,7 +665,7 @@ assemble_neg_contexts(struct smb2_negotiate_req *req,
 	 * secondary channels don't have the hostname field populated
 	 * use the hostname field in the primary channel instead
 	 */
-	pserver = CIFS_SERVER_IS_CHAN(server) ? server->primary_server : server;
+	pserver = SERVER_IS_CHAN(server) ? server->primary_server : server;
 	cifs_server_lock(pserver);
 	hostname = pserver->hostname;
 	if (hostname && (hostname[0] != 0)) {
@@ -832,7 +943,7 @@ add_posix_context(struct kvec *iov, unsigned int *num_iovec, umode_t mode)
 
 	iov[num].iov_base = create_posix_buf(mode);
 	if (mode == ACL_NO_MODE)
-		cifs_dbg(FYI, "Invalid mode\n");
+		cifs_dbg(FYI, "%s: no mode\n", __func__);
 	if (iov[num].iov_base == NULL)
 		return -ENOMEM;
 	iov[num].iov_len = sizeof(struct create_posix);
@@ -1305,7 +1416,12 @@ SMB2_sess_alloc_buffer(struct SMB2_sess_data *sess_data)
 	}
 
 	/* enough to enable echos and oplocks and one max size write */
-	req->hdr.CreditRequest = cpu_to_le16(130);
+	if (server->credits >= server->max_credits)
+		req->hdr.CreditRequest = cpu_to_le16(0);
+	else
+		req->hdr.CreditRequest = cpu_to_le16(
+			min_t(int, server->max_credits -
+			      server->credits, 130));
 
 	/* only one of SMB2 signing flags may be set in SMB2 request */
 	if (server->sign)
@@ -1899,7 +2015,12 @@ SMB2_tcon(const unsigned int xid, struct cifs_ses *ses, const char *tree,
 	rqst.rq_nvec = 2;
 
 	/* Need 64 for max size write so ask for more in case not there yet */
-	req->hdr.CreditRequest = cpu_to_le16(64);
+	if (server->credits >= server->max_credits)
+		req->hdr.CreditRequest = cpu_to_le16(0);
+	else
+		req->hdr.CreditRequest = cpu_to_le16(
+			min_t(int, server->max_credits -
+			      server->credits, 64));
 
 	rc = cifs_send_recv(xid, ses, server,
 			    &rqst, &resp_buftype, flags, &rsp_iov);
@@ -2214,7 +2335,7 @@ create_durable_v2_buf(struct cifs_open_parms *oparms)
 	 * (most servers default to 120 seconds) and most clients default to 0.
 	 * This can be overridden at mount ("handletimeout=") if the user wants
 	 * a different persistent (or resilient) handle timeout for all opens
-	 * opens on a particular SMB3 mount.
+	 * on a particular SMB3 mount.
 	 */
 	buf->dcontext.Timeout = cpu_to_le32(oparms->tcon->handle_timeout);
 	buf->dcontext.Flags = cpu_to_le32(SMB2_DHANDLE_FLAG_PERSISTENT);
@@ -2359,7 +2480,7 @@ add_twarp_context(struct kvec *iov, unsigned int *num_iovec, __u64 timewarp)
 	return 0;
 }
 
-/* See See http://technet.microsoft.com/en-us/library/hh509017(v=ws.10).aspx */
+/* See http://technet.microsoft.com/en-us/library/hh509017(v=ws.10).aspx */
 static void setup_owner_group_sids(char *buf)
 {
 	struct owner_group_sids *sids = (struct owner_group_sids *)buf;
@@ -2561,8 +2682,8 @@ alloc_path_with_tree_prefix(__le16 **out_path, int *out_size, int *out_len,
 
 	/* Do not append the separator if the path is empty */
 	if (path[0] != cpu_to_le16(0x0000)) {
-		UniStrcat(*out_path, sep);
-		UniStrcat(*out_path, path);
+		UniStrcat((wchar_t *)*out_path, (wchar_t *)sep);
+		UniStrcat((wchar_t *)*out_path, (wchar_t *)path);
 	}
 
 	unload_nls(cp);
@@ -3104,6 +3225,7 @@ void
 SMB2_ioctl_free(struct smb_rqst *rqst)
 {
 	int i;
+
 	if (rqst && rqst->rq_iov) {
 		cifs_small_buf_release(rqst->rq_iov[0].iov_base); /* request */
 		for (i = 1; i < rqst->rq_nvec; i++)
@@ -3350,12 +3472,10 @@ __SMB2_close(const unsigned int xid, struct cifs_tcon *tcon,
 	} else {
 		trace_smb3_close_done(xid, persistent_fid, tcon->tid,
 				      ses->Suid);
-		/*
-		 * Note that have to subtract 4 since struct network_open_info
-		 * has a final 4 byte pad that close response does not have
-		 */
 		if (pbuf)
-			memcpy(pbuf, (char *)&rsp->CreationTime, sizeof(*pbuf) - 4);
+			memcpy(&pbuf->network_open_info,
+			       &rsp->network_open_info,
+			       sizeof(pbuf->network_open_info));
 	}
 
 	atomic_dec(&tcon->num_remote_opens);
@@ -3775,11 +3895,27 @@ void smb2_reconnect_server(struct work_struct *work)
 	int rc;
 	bool resched = false;
 
+	/* first check if ref count has reached 0, if not inc ref count */
+	spin_lock(&cifs_tcp_ses_lock);
+	if (!server->srv_count) {
+		spin_unlock(&cifs_tcp_ses_lock);
+		return;
+	}
+	server->srv_count++;
+	spin_unlock(&cifs_tcp_ses_lock);
+
 	/* If server is a channel, select the primary channel */
-	pserver = CIFS_SERVER_IS_CHAN(server) ? server->primary_server : server;
+	pserver = SERVER_IS_CHAN(server) ? server->primary_server : server;
 
 	/* Prevent simultaneous reconnects that can corrupt tcon->rlist list */
 	mutex_lock(&pserver->reconnect_mutex);
+
+	/* if the server is marked for termination, drop the ref count here */
+	if (server->terminate) {
+		cifs_put_tcp_session(server, true);
+		mutex_unlock(&pserver->reconnect_mutex);
+		return;
+	}
 
 	INIT_LIST_HEAD(&tmp_list);
 	INIT_LIST_HEAD(&tmp_ses_list);
@@ -3787,6 +3923,12 @@ void smb2_reconnect_server(struct work_struct *work)
 
 	spin_lock(&cifs_tcp_ses_lock);
 	list_for_each_entry(ses, &pserver->smb_ses_list, smb_ses_list) {
+		spin_lock(&ses->ses_lock);
+		if (ses->ses_status == SES_EXITING) {
+			spin_unlock(&ses->ses_lock);
+			continue;
+		}
+		spin_unlock(&ses->ses_lock);
 
 		tcon_selected = false;
 
@@ -3819,17 +3961,10 @@ void smb2_reconnect_server(struct work_struct *work)
 		}
 		spin_unlock(&ses->chan_lock);
 	}
-	/*
-	 * Get the reference to server struct to be sure that the last call of
-	 * cifs_put_tcon() in the loop below won't release the server pointer.
-	 */
-	if (tcon_exist || ses_exist)
-		server->srv_count++;
-
 	spin_unlock(&cifs_tcp_ses_lock);
 
 	list_for_each_entry_safe(tcon, tcon2, &tmp_list, rlist) {
-		rc = smb2_reconnect(SMB2_INTERNAL_CMD, tcon, server);
+		rc = smb2_reconnect(SMB2_INTERNAL_CMD, tcon, server, true);
 		if (!rc)
 			cifs_reopen_persistent_handles(tcon);
 		else
@@ -3845,7 +3980,7 @@ void smb2_reconnect_server(struct work_struct *work)
 		goto done;
 
 	/* allocate a dummy tcon struct used for reconnect */
-	tcon = tconInfoAlloc();
+	tcon = tcon_info_alloc(false);
 	if (!tcon) {
 		resched = true;
 		list_for_each_entry_safe(ses, ses2, &tmp_ses_list, rlist) {
@@ -3862,7 +3997,7 @@ void smb2_reconnect_server(struct work_struct *work)
 	/* now reconnect sessions for necessary channels */
 	list_for_each_entry_safe(ses, ses2, &tmp_ses_list, rlist) {
 		tcon->ses = ses;
-		rc = smb2_reconnect(SMB2_INTERNAL_CMD, tcon, server);
+		rc = smb2_reconnect(SMB2_INTERNAL_CMD, tcon, server, true);
 		if (rc)
 			resched = true;
 		list_del_init(&ses->rlist);
@@ -3877,8 +4012,7 @@ done:
 	mutex_unlock(&pserver->reconnect_mutex);
 
 	/* now we can safely release srv struct */
-	if (tcon_exist || ses_exist)
-		cifs_put_tcp_session(server, 1);
+	cifs_put_tcp_session(server, true);
 }
 
 int
@@ -4227,6 +4361,7 @@ smb2_async_readv(struct cifs_readdata *rdata)
 	struct TCP_Server_Info *server;
 	struct cifs_tcon *tcon = tlink_tcon(rdata->cfile->tlink);
 	unsigned int total_len;
+	int credit_request;
 
 	cifs_dbg(FYI, "%s: offset=%llu bytes=%u\n",
 		 __func__, rdata->offset, rdata->bytes);
@@ -4258,7 +4393,13 @@ smb2_async_readv(struct cifs_readdata *rdata)
 	if (rdata->credits.value > 0) {
 		shdr->CreditCharge = cpu_to_le16(DIV_ROUND_UP(rdata->bytes,
 						SMB2_MAX_BUFFER_SIZE));
-		shdr->CreditRequest = cpu_to_le16(le16_to_cpu(shdr->CreditCharge) + 8);
+		credit_request = le16_to_cpu(shdr->CreditCharge) + 8;
+		if (server->credits >= server->max_credits)
+			shdr->CreditRequest = cpu_to_le16(0);
+		else
+			shdr->CreditRequest = cpu_to_le16(
+				min_t(int, server->max_credits -
+						server->credits, credit_request));
 
 		rc = adjust_credits(server, &rdata->credits, rdata->bytes);
 		if (rc)
@@ -4468,6 +4609,7 @@ smb2_async_writev(struct cifs_writedata *wdata,
 	unsigned int total_len;
 	struct cifs_io_parms _io_parms;
 	struct cifs_io_parms *io_parms = NULL;
+	int credit_request;
 
 	if (!wdata->server)
 		server = wdata->server = cifs_pick_channel(tcon->ses);
@@ -4572,7 +4714,13 @@ smb2_async_writev(struct cifs_writedata *wdata,
 	if (wdata->credits.value > 0) {
 		shdr->CreditCharge = cpu_to_le16(DIV_ROUND_UP(wdata->bytes,
 						    SMB2_MAX_BUFFER_SIZE));
-		shdr->CreditRequest = cpu_to_le16(le16_to_cpu(shdr->CreditCharge) + 8);
+		credit_request = le16_to_cpu(shdr->CreditCharge) + 8;
+		if (server->credits >= server->max_credits)
+			shdr->CreditRequest = cpu_to_le16(0);
+		else
+			shdr->CreditRequest = cpu_to_le16(
+				min_t(int, server->max_credits -
+						server->credits, credit_request));
 
 		rc = adjust_credits(server, &wdata->credits, io_parms->length);
 		if (rc)

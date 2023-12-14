@@ -22,8 +22,6 @@
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/of.h>
-#include <linux/of_address.h>
-#include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
 #include <linux/thermal.h>
@@ -282,8 +280,7 @@ static int amlogic_thermal_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	if (devm_thermal_add_hwmon_sysfs(&pdev->dev, pdata->tzd))
-		dev_warn(&pdev->dev, "Failed to add hwmon sysfs attributes\n");
+	devm_thermal_add_hwmon_sysfs(&pdev->dev, pdata->tzd);
 
 	ret = amlogic_thermal_initialize(pdata);
 	if (ret)
@@ -294,11 +291,11 @@ static int amlogic_thermal_probe(struct platform_device *pdev)
 	return ret;
 }
 
-static int amlogic_thermal_remove(struct platform_device *pdev)
+static void amlogic_thermal_remove(struct platform_device *pdev)
 {
 	struct amlogic_thermal *data = platform_get_drvdata(pdev);
 
-	return amlogic_thermal_disable(data);
+	amlogic_thermal_disable(data);
 }
 
 static int __maybe_unused amlogic_thermal_suspend(struct device *dev)
@@ -324,8 +321,8 @@ static struct platform_driver amlogic_thermal_driver = {
 		.pm		= &amlogic_thermal_pm_ops,
 		.of_match_table = of_amlogic_thermal_match,
 	},
-	.probe	= amlogic_thermal_probe,
-	.remove	= amlogic_thermal_remove,
+	.probe = amlogic_thermal_probe,
+	.remove_new = amlogic_thermal_remove,
 };
 
 module_platform_driver(amlogic_thermal_driver);

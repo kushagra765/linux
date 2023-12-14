@@ -26,8 +26,8 @@
 #include <linux/writeback.h>
 #include <linux/compaction.h>
 #include <linux/mm_inline.h>
-#include <linux/page_ext.h>
 #include <linux/page_owner.h>
+#include <linux/sched/isolation.h>
 
 #include "internal.h"
 
@@ -559,8 +559,10 @@ static inline void mod_zone_state(struct zone *zone,
 {
 	struct per_cpu_zonestat __percpu *pcp = zone->per_cpu_zonestats;
 	s8 __percpu *p = pcp->vm_stat_diff + item;
-	long o, n, t, z;
+	long n, t, z;
+	s8 o;
 
+	o = this_cpu_read(*p);
 	do {
 		z = 0;  /* overflow to zone counters */
 
@@ -576,8 +578,7 @@ static inline void mod_zone_state(struct zone *zone,
 		 */
 		t = this_cpu_read(pcp->stat_threshold);
 
-		o = this_cpu_read(*p);
-		n = delta + o;
+		n = delta + (long)o;
 
 		if (abs(n) > t) {
 			int os = overstep_mode * (t >> 1) ;
@@ -586,7 +587,7 @@ static inline void mod_zone_state(struct zone *zone,
 			z = n + os;
 			n = -os;
 		}
-	} while (this_cpu_cmpxchg(*p, o, n) != o);
+	} while (!this_cpu_try_cmpxchg(*p, &o, n));
 
 	if (z)
 		zone_page_state_add(z, zone, item);
@@ -616,7 +617,8 @@ static inline void mod_node_state(struct pglist_data *pgdat,
 {
 	struct per_cpu_nodestat __percpu *pcp = pgdat->per_cpu_nodestats;
 	s8 __percpu *p = pcp->vm_node_stat_diff + item;
-	long o, n, t, z;
+	long n, t, z;
+	s8 o;
 
 	if (vmstat_item_in_bytes(item)) {
 		/*
@@ -629,6 +631,7 @@ static inline void mod_node_state(struct pglist_data *pgdat,
 		delta >>= PAGE_SHIFT;
 	}
 
+	o = this_cpu_read(*p);
 	do {
 		z = 0;  /* overflow to node counters */
 
@@ -644,8 +647,7 @@ static inline void mod_node_state(struct pglist_data *pgdat,
 		 */
 		t = this_cpu_read(pcp->stat_threshold);
 
-		o = this_cpu_read(*p);
-		n = delta + o;
+		n = delta + (long)o;
 
 		if (abs(n) > t) {
 			int os = overstep_mode * (t >> 1) ;
@@ -654,7 +656,7 @@ static inline void mod_node_state(struct pglist_data *pgdat,
 			z = n + os;
 			n = -os;
 		}
-	} while (this_cpu_cmpxchg(*p, o, n) != o);
+	} while (!this_cpu_try_cmpxchg(*p, &o, n));
 
 	if (z)
 		node_page_state_add(z, pgdat, item);
@@ -814,9 +816,7 @@ static int refresh_cpu_vm_stats(bool do_pagesets)
 
 	for_each_populated_zone(zone) {
 		struct per_cpu_zonestat __percpu *pzstats = zone->per_cpu_zonestats;
-#ifdef CONFIG_NUMA
 		struct per_cpu_pages __percpu *pcp = zone->per_cpu_pageset;
-#endif
 
 		for (i = 0; i < NR_VM_ZONE_STAT_ITEMS; i++) {
 			int v;
@@ -832,10 +832,12 @@ static int refresh_cpu_vm_stats(bool do_pagesets)
 #endif
 			}
 		}
-#ifdef CONFIG_NUMA
 
 		if (do_pagesets) {
 			cond_resched();
+
+			changes += decay_pcp_high(zone, this_cpu_ptr(pcp));
+#ifdef CONFIG_NUMA
 			/*
 			 * Deal with draining the remote pageset of this
 			 * processor
@@ -855,15 +857,17 @@ static int refresh_cpu_vm_stats(bool do_pagesets)
 				continue;
 			}
 
-			if (__this_cpu_dec_return(pcp->expire))
+			if (__this_cpu_dec_return(pcp->expire)) {
+				changes++;
 				continue;
+			}
 
 			if (__this_cpu_read(pcp->count)) {
 				drain_zone_pages(zone, this_cpu_ptr(pcp));
 				changes++;
 			}
-		}
 #endif
+		}
 	}
 
 	for_each_online_pgdat(pgdat) {
@@ -1180,6 +1184,9 @@ const char * const vmstat_text[] = {
 	"nr_zspages",
 #endif
 	"nr_free_cma",
+#ifdef CONFIG_UNACCEPTED_MEMORY
+	"nr_unaccepted",
+#endif
 
 	/* enum numa_stat_item counters */
 #ifdef CONFIG_NUMA
@@ -2021,6 +2028,20 @@ static void vmstat_shepherd(struct work_struct *w)
 	/* Check processors whose vmstat worker threads have been disabled */
 	for_each_online_cpu(cpu) {
 		struct delayed_work *dw = &per_cpu(vmstat_work, cpu);
+
+		/*
+		 * In kernel users of vmstat counters either require the precise value and
+		 * they are using zone_page_state_snapshot interface or they can live with
+		 * an imprecision as the regular flushing can happen at arbitrary time and
+		 * cumulative error can grow (see calculate_normal_threshold).
+		 *
+		 * From that POV the regular flushing can be postponed for CPUs that have
+		 * been isolated from the kernel interference without critical
+		 * infrastructure ever noticing. Skip regular flushing from vmstat_shepherd
+		 * for all isolated CPUs to avoid interference with the isolated workload.
+		 */
+		if (cpu_is_isolated(cpu))
+			continue;
 
 		if (!delayed_work_pending(dw) && need_update(cpu))
 			queue_delayed_work_on(cpu, mm_percpu_wq, dw, 0);

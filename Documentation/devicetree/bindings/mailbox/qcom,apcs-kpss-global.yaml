@@ -18,6 +18,7 @@ properties:
     oneOf:
       - items:
           - enum:
+              - qcom,ipq5018-apcs-apps-global
               - qcom,ipq5332-apcs-apps-global
               - qcom,ipq8074-apcs-apps-global
               - qcom,ipq9574-apcs-apps-global
@@ -124,10 +125,12 @@ allOf:
           items:
             - description: primary pll parent of the clock driver
             - description: XO clock
+            - description: GCC GPLL0 clock source
         clock-names:
           items:
             - const: pll
             - const: xo
+            - const: gpll0
 
   - if:
       properties:

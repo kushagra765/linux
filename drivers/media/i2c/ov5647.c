@@ -109,7 +109,6 @@ struct ov5647 {
 	struct v4l2_ctrl		*hblank;
 	struct v4l2_ctrl		*vblank;
 	struct v4l2_ctrl		*exposure;
-	bool				streaming;
 };
 
 static inline struct ov5647 *to_sensor(struct v4l2_subdev *sd)
@@ -898,10 +897,6 @@ static int ov5647_s_stream(struct v4l2_subdev *sd, int enable)
 	int ret;
 
 	mutex_lock(&sensor->lock);
-	if (sensor->streaming == enable) {
-		mutex_unlock(&sensor->lock);
-		return 0;
-	}
 
 	if (enable) {
 		ret = pm_runtime_resume_and_get(&client->dev);
@@ -922,7 +917,6 @@ static int ov5647_s_stream(struct v4l2_subdev *sd, int enable)
 		pm_runtime_put(&client->dev);
 	}
 
-	sensor->streaming = enable;
 	mutex_unlock(&sensor->lock);
 
 	return 0;
@@ -1515,7 +1509,7 @@ static struct i2c_driver ov5647_driver = {
 		.name	= "ov5647",
 		.pm	= &ov5647_pm_ops,
 	},
-	.probe_new	= ov5647_probe,
+	.probe		= ov5647_probe,
 	.remove		= ov5647_remove,
 	.id_table	= ov5647_id,
 };

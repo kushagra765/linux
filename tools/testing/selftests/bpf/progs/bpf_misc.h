@@ -86,6 +86,10 @@
 #define POINTER_VALUE	0xcafe4all
 #define TEST_DATA_LEN	64
 
+#ifndef __used
+#define __used __attribute__((used))
+#endif
+
 #if defined(__TARGET_ARCH_x86)
 #define SYSCALL_WRAPPER 1
 #define SYS_PREFIX "__x64_"
@@ -95,6 +99,9 @@
 #elif defined(__TARGET_ARCH_arm64)
 #define SYSCALL_WRAPPER 1
 #define SYS_PREFIX "__arm64_"
+#elif defined(__TARGET_ARCH_riscv)
+#define SYSCALL_WRAPPER 1
+#define SYS_PREFIX "__riscv_"
 #else
 #define SYSCALL_WRAPPER 0
 #define SYS_PREFIX "__se_"

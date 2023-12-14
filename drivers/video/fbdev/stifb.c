@@ -69,11 +69,11 @@
 #include <asm/grfioctl.h>	/* for HP-UX compatibility */
 #include <linux/uaccess.h>
 
-#include "sticore.h"
+#include <video/sticore.h>
 
-/* REGION_BASE(fb_info, index) returns the virtual address for region <index> */
+/* REGION_BASE(fb_info, index) returns the physical address for region <index> */
 #define REGION_BASE(fb_info, index) \
-	F_EXTEND(fb_info->sti->glob_cfg->region_ptrs[index])
+	F_EXTEND(fb_info->sti->regions_phys[index])
 
 #define NGLEDEVDEPROM_CRT_REGION 1
 
@@ -527,8 +527,8 @@ rattlerSetupPlanes(struct stifb_info *fb)
 	fb->id = saved_id;
 
 	for (y = 0; y < fb->info.var.yres; ++y)
-		fb_memset(fb->info.screen_base + y * fb->info.fix.line_length,
-			0xff, fb->info.var.xres * fb->info.var.bits_per_pixel/8);
+		fb_memset_io(fb->info.screen_base + y * fb->info.fix.line_length,
+			     0xff, fb->info.var.xres * fb->info.var.bits_per_pixel/8);
 
 	CRX24_SET_OVLY_MASK(fb);
 	SETUP_FB(fb);
@@ -1167,12 +1167,14 @@ stifb_init_display(struct stifb_info *fb)
 
 static const struct fb_ops stifb_ops = {
 	.owner		= THIS_MODULE,
+	__FB_DEFAULT_IOMEM_OPS_RDWR,
 	.fb_check_var	= stifb_check_var,
 	.fb_setcolreg	= stifb_setcolreg,
 	.fb_blank	= stifb_blank,
 	.fb_fillrect	= stifb_fillrect,
 	.fb_copyarea	= stifb_copyarea,
 	.fb_imageblit	= cfb_imageblit,
+	__FB_DEFAULT_IOMEM_OPS_MMAP,
 };
 
 

@@ -188,7 +188,7 @@ getname_flags(const char __user *filename, int flags, int *empty)
 		}
 	}
 
-	result->refcnt = 1;
+	atomic_set(&result->refcnt, 1);
 	/* The empty path is special. */
 	if (unlikely(!len)) {
 		if (empty)
@@ -249,7 +249,7 @@ getname_kernel(const char * filename)
 	memcpy((char *)result->name, filename, len);
 	result->uptr = NULL;
 	result->aname = NULL;
-	result->refcnt = 1;
+	atomic_set(&result->refcnt, 1);
 	audit_getname(result);
 
 	return result;
@@ -261,9 +261,10 @@ void putname(struct filename *name)
 	if (IS_ERR(name))
 		return;
 
-	BUG_ON(name->refcnt <= 0);
+	if (WARN_ON_ONCE(!atomic_read(&name->refcnt)))
+		return;
 
-	if (--name->refcnt > 0)
+	if (!atomic_dec_and_test(&name->refcnt))
 		return;
 
 	if (name->name != name->iname) {
@@ -643,6 +644,8 @@ static bool nd_alloc_stack(struct nameidata *nd)
 
 /**
  * path_connected - Verify that a dentry is below mnt.mnt_root
+ * @mnt: The mountpoint to check.
+ * @dentry: The dentry to check.
  *
  * Rename can sometimes move a file or directory outside of a bind
  * mount, path_connected allows those cases to be detected.
@@ -1083,6 +1086,7 @@ fs_initcall(init_fs_namei_sysctls);
 /**
  * may_follow_link - Check symlink following for unsafe situations
  * @nd: nameidata pathwalk data
+ * @inode: Used for idmapping.
  *
  * In the case of the sysctl_protected_symlinks sysctl being enabled,
  * CAP_DAC_OVERRIDE needs to be specifically ignored if the symlink is
@@ -2890,7 +2894,7 @@ int path_pts(struct path *path)
 	dput(path->dentry);
 	path->dentry = parent;
 	child = d_hash_and_lookup(parent, &this);
-	if (!child)
+	if (IS_ERR_OR_NULL(child))
 		return -ENOENT;
 
 	path->dentry = child;
@@ -3028,8 +3032,8 @@ static struct dentry *lock_two_directories(struct dentry *p1, struct dentry *p2)
 		return p;
 	}
 
-	inode_lock_nested(p1->d_inode, I_MUTEX_PARENT);
-	inode_lock_nested(p2->d_inode, I_MUTEX_PARENT2);
+	lock_two_inodes(p1->d_inode, p2->d_inode,
+			I_MUTEX_PARENT, I_MUTEX_PARENT2);
 	return NULL;
 }
 
@@ -3099,25 +3103,6 @@ void unlock_rename(struct dentry *p1, struct dentry *p2)
 	}
 }
 EXPORT_SYMBOL(unlock_rename);
-
-/**
- * mode_strip_umask - handle vfs umask stripping
- * @dir:	parent directory of the new inode
- * @mode:	mode of the new inode to be created in @dir
- *
- * Umask stripping depends on whether or not the filesystem supports POSIX
- * ACLs. If the filesystem doesn't support it umask stripping is done directly
- * in here. If the filesystem does support POSIX ACLs umask stripping is
- * deferred until the filesystem calls posix_acl_create().
- *
- * Returns: mode
- */
-static inline umode_t mode_strip_umask(const struct inode *dir, umode_t mode)
-{
-	if (!IS_POSIXACL(dir))
-		mode &= ~current_umask();
-	return mode;
-}
 
 /**
  * vfs_prepare_mode - prepare the mode to be used for a new inode
@@ -3532,7 +3517,8 @@ static const char *open_last_lookups(struct nameidata *nd,
 		if (likely(dentry))
 			goto finish_lookup;
 
-		BUG_ON(nd->flags & LOOKUP_RCU);
+		if (WARN_ON_ONCE(nd->flags & LOOKUP_RCU))
+			return ERR_PTR(-ECHILD);
 	} else {
 		/* create side of things */
 		if (nd->flags & LOOKUP_RCU) {
@@ -3703,7 +3689,7 @@ static int vfs_tmpfile(struct mnt_idmap *idmap,
 }
 
 /**
- * vfs_tmpfile_open - open a tmpfile for kernel internal use
+ * kernel_tmpfile_open - open a tmpfile for kernel internal use
  * @idmap:	idmap of the mount the inode was found from
  * @parentpath:	path of the base directory
  * @mode:	mode of the new tmpfile
@@ -3714,24 +3700,26 @@ static int vfs_tmpfile(struct mnt_idmap *idmap,
  * hence this is only for kernel internal use, and must not be installed into
  * file tables or such.
  */
-struct file *vfs_tmpfile_open(struct mnt_idmap *idmap,
-			  const struct path *parentpath,
-			  umode_t mode, int open_flag, const struct cred *cred)
+struct file *kernel_tmpfile_open(struct mnt_idmap *idmap,
+				 const struct path *parentpath,
+				 umode_t mode, int open_flag,
+				 const struct cred *cred)
 {
 	struct file *file;
 	int error;
 
 	file = alloc_empty_file_noaccount(open_flag, cred);
-	if (!IS_ERR(file)) {
-		error = vfs_tmpfile(idmap, parentpath, file, mode);
-		if (error) {
-			fput(file);
-			file = ERR_PTR(error);
-		}
+	if (IS_ERR(file))
+		return file;
+
+	error = vfs_tmpfile(idmap, parentpath, file, mode);
+	if (error) {
+		fput(file);
+		file = ERR_PTR(error);
 	}
 	return file;
 }
-EXPORT_SYMBOL(vfs_tmpfile_open);
+EXPORT_SYMBOL(kernel_tmpfile_open);
 
 static int do_tmpfile(struct nameidata *nd, unsigned flags,
 		const struct open_flags *op,
@@ -3797,7 +3785,10 @@ static struct file *path_openat(struct nameidata *nd,
 		WARN_ON(1);
 		error = -EINVAL;
 	}
-	fput(file);
+	if (unlikely(file->f_mode & FMODE_OPENED))
+		fput(file);
+	else
+		release_empty_file(file);
 	if (error == -EOPENSTALE) {
 		if (flags & LOOKUP_RCU)
 			error = -ECHILD;
@@ -4381,11 +4372,9 @@ retry_deleg:
 	if (!IS_ERR(dentry)) {
 
 		/* Why not before? Because we want correct error value */
-		if (last.name[last.len])
+		if (last.name[last.len] || d_is_negative(dentry))
 			goto slashes;
 		inode = dentry->d_inode;
-		if (d_is_negative(dentry))
-			goto slashes;
 		ihold(inode);
 		error = security_path_unlink(&path, dentry);
 		if (error)
@@ -4731,7 +4720,7 @@ SYSCALL_DEFINE2(link, const char __user *, oldname, const char __user *, newname
  *	   sb->s_vfs_rename_mutex. We might be more accurate, but that's another
  *	   story.
  *	c) we have to lock _four_ objects - parents and victim (if it exists),
- *	   and source (if it is not a directory).
+ *	   and source.
  *	   And that - after we got ->i_mutex on parents (until then we don't know
  *	   whether the target exists).  Solution: try to be smart with locking
  *	   order for inodes.  We rely on the fact that tree topology may change
@@ -4815,10 +4804,16 @@ int vfs_rename(struct renamedata *rd)
 
 	take_dentry_name_snapshot(&old_name, old_dentry);
 	dget(new_dentry);
-	if (!is_dir || (flags & RENAME_EXCHANGE))
-		lock_two_nondirectories(source, target);
-	else if (target)
-		inode_lock(target);
+	/*
+	 * Lock all moved children. Moved directories may need to change parent
+	 * pointer so they need the lock to prevent against concurrent
+	 * directory changes moving parent pointer. For regular files we've
+	 * historically always done this. The lockdep locking subclasses are
+	 * somewhat arbitrary but RENAME_EXCHANGE in particular can swap
+	 * regular files and directories so it's difficult to tell which
+	 * subclasses to use.
+	 */
+	lock_two_inodes(source, target, I_MUTEX_NORMAL, I_MUTEX_NONDIR2);
 
 	error = -EPERM;
 	if (IS_SWAPFILE(source) || (target && IS_SWAPFILE(target)))
@@ -4866,9 +4861,8 @@ int vfs_rename(struct renamedata *rd)
 			d_exchange(old_dentry, new_dentry);
 	}
 out:
-	if (!is_dir || (flags & RENAME_EXCHANGE))
-		unlock_two_nondirectories(source, target);
-	else if (target)
+	inode_unlock(source);
+	if (target)
 		inode_unlock(target);
 	dput(new_dentry);
 	if (!error) {

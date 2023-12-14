@@ -28,7 +28,7 @@ struct bpf_stack_map {
 	void *elems;
 	struct pcpu_freelist freelist;
 	u32 n_buckets;
-	struct stack_map_bucket *buckets[];
+	struct stack_map_bucket *buckets[] __counted_by(n_buckets);
 };
 
 static inline bool stack_map_use_build_id(struct bpf_map *map)
@@ -73,9 +73,6 @@ static struct bpf_map *stack_map_alloc(union bpf_attr *attr)
 	struct bpf_stack_map *smap;
 	u64 cost, n_buckets;
 	int err;
-
-	if (!bpf_capable())
-		return ERR_PTR(-EPERM);
 
 	if (attr->map_flags & ~STACK_CREATE_FLAG_MASK)
 		return ERR_PTR(-EINVAL);

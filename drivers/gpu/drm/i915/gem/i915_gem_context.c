@@ -844,6 +844,7 @@ static int set_proto_ctx_sseu(struct drm_i915_file_private *fpriv,
 		if (idx >= pc->num_user_engines)
 			return -EINVAL;
 
+		idx = array_index_nospec(idx, pc->num_user_engines);
 		pe = &pc->user_engines[idx];
 
 		/* Only render engine supports RPCS configuration. */
@@ -964,7 +965,11 @@ static int intel_context_set_gem(struct intel_context *ce,
 	RCU_INIT_POINTER(ce->gem_context, ctx);
 
 	GEM_BUG_ON(intel_context_is_pinned(ce));
-	ce->ring_size = SZ_16K;
+
+	if (ce->engine->class == COMPUTE_CLASS)
+		ce->ring_size = SZ_512K;
+	else
+		ce->ring_size = SZ_16K;
 
 	i915_vm_put(ce->vm);
 	ce->vm = i915_gem_context_get_eb_vm(ctx);

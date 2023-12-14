@@ -5,6 +5,7 @@
 #include "en.h"
 #include "ipsec.h"
 #include "lib/crypto.h"
+#include "lib/ipsec_fs_roce.h"
 
 enum {
 	MLX5_IPSEC_ASO_REMOVE_FLOW_PKT_CNT_OFFSET,
@@ -45,8 +46,9 @@ u32 mlx5_ipsec_device_caps(struct mlx5_core_dev *mdev)
 		    MLX5_CAP_FLOWTABLE_NIC_RX(mdev, decap))
 			caps |= MLX5_IPSEC_CAP_PACKET_OFFLOAD;
 
-		if (MLX5_CAP_FLOWTABLE_NIC_TX(mdev, ignore_flow_level) &&
-		    MLX5_CAP_FLOWTABLE_NIC_RX(mdev, ignore_flow_level))
+		if ((MLX5_CAP_FLOWTABLE_NIC_TX(mdev, ignore_flow_level) &&
+		     MLX5_CAP_FLOWTABLE_NIC_RX(mdev, ignore_flow_level)) ||
+		    MLX5_CAP_ESW_FLOWTABLE_FDB(mdev, ignore_flow_level))
 			caps |= MLX5_IPSEC_CAP_PRIO;
 
 		if (MLX5_CAP_FLOWTABLE_NIC_TX(mdev,
@@ -54,9 +56,15 @@ u32 mlx5_ipsec_device_caps(struct mlx5_core_dev *mdev)
 		    MLX5_CAP_FLOWTABLE_NIC_RX(mdev,
 					      reformat_l3_esp_tunnel_to_l2))
 			caps |= MLX5_IPSEC_CAP_TUNNEL;
+
+		if (MLX5_CAP_FLOWTABLE_NIC_TX(mdev,
+					      reformat_add_esp_transport_over_udp) &&
+		    MLX5_CAP_FLOWTABLE_NIC_RX(mdev,
+					      reformat_del_esp_transport_over_udp))
+			caps |= MLX5_IPSEC_CAP_ESPINUDP;
 	}
 
-	if (mlx5_get_roce_state(mdev) &&
+	if (mlx5_get_roce_state(mdev) && mlx5_ipsec_fs_is_mpv_roce_supported(mdev) &&
 	    MLX5_CAP_GEN_2(mdev, flow_table_type_2_type) & MLX5_FT_NIC_RX_2_NIC_RX_RDMA &&
 	    MLX5_CAP_GEN_2(mdev, flow_table_type_2_type) & MLX5_FT_NIC_TX_RDMA_2_NIC_TX)
 		caps |= MLX5_IPSEC_CAP_ROCE;
@@ -305,7 +313,17 @@ static void mlx5e_ipsec_update_esn_state(struct mlx5e_ipsec_sa_entry *sa_entry,
 	}
 
 	mlx5e_ipsec_build_accel_xfrm_attrs(sa_entry, &attrs);
+
+	/* It is safe to execute the modify below unlocked since the only flows
+	 * that could affect this HW object, are create, destroy and this work.
+	 *
+	 * Creation flow can't co-exist with this modify work, the destruction
+	 * flow would cancel this work, and this work is a single entity that
+	 * can't conflict with it self.
+	 */
+	spin_unlock_bh(&sa_entry->x->lock);
 	mlx5_accel_esp_modify_xfrm(sa_entry, &attrs);
+	spin_lock_bh(&sa_entry->x->lock);
 
 	data.data_offset_condition_operand =
 		MLX5_IPSEC_ASO_REMOVE_FLOW_PKT_CNT_OFFSET;
@@ -431,7 +449,7 @@ static void mlx5e_ipsec_handle_event(struct work_struct *_work)
 	aso = sa_entry->ipsec->aso;
 	attrs = &sa_entry->attrs;
 
-	spin_lock(&sa_entry->x->lock);
+	spin_lock_bh(&sa_entry->x->lock);
 	ret = mlx5e_ipsec_aso_query(sa_entry, NULL);
 	if (ret)
 		goto unlock;
@@ -447,7 +465,7 @@ static void mlx5e_ipsec_handle_event(struct work_struct *_work)
 		mlx5e_ipsec_handle_limits(sa_entry);
 
 unlock:
-	spin_unlock(&sa_entry->x->lock);
+	spin_unlock_bh(&sa_entry->x->lock);
 	kfree(work);
 }
 
@@ -596,7 +614,8 @@ int mlx5e_ipsec_aso_query(struct mlx5e_ipsec_sa_entry *sa_entry,
 	do {
 		ret = mlx5_aso_poll_cq(aso->aso, false);
 		if (ret)
-			usleep_range(2, 10);
+			/* We are in atomic context */
+			udelay(10);
 	} while (ret && time_is_after_jiffies(expires));
 	spin_unlock_bh(&aso->lock);
 	return ret;

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright(c) 2020 Intel Corporation. All rights reserved. */
+#include <linux/platform_device.h>
 #include <linux/memregion.h>
 #include <linux/workqueue.h>
 #include <linux/debugfs.h>
@@ -27,8 +28,21 @@
  * instantiated by the core.
  */
 
+/*
+ * All changes to the interleave configuration occur with this lock held
+ * for write.
+ */
+DECLARE_RWSEM(cxl_region_rwsem);
+
 static DEFINE_IDA(cxl_port_ida);
 static DEFINE_XARRAY(cxl_root_buses);
+
+int cxl_num_decoders_committed(struct cxl_port *port)
+{
+	lockdep_assert_held(&cxl_region_rwsem);
+
+	return port->commit_end + 1;
+}
 
 static ssize_t devtype_show(struct device *dev, struct device_attribute *attr,
 			    char *buf)
@@ -56,6 +70,8 @@ static int cxl_device_id(const struct device *dev)
 		return CXL_DEVICE_MEMORY_EXPANDER;
 	if (dev->type == CXL_REGION_TYPE())
 		return CXL_DEVICE_REGION;
+	if (dev->type == &cxl_pmu_type)
+		return CXL_DEVICE_PMU;
 	return 0;
 }
 
@@ -117,9 +133,9 @@ static ssize_t target_type_show(struct device *dev,
 	struct cxl_decoder *cxld = to_cxl_decoder(dev);
 
 	switch (cxld->target_type) {
-	case CXL_DECODER_ACCELERATOR:
+	case CXL_DECODER_DEVMEM:
 		return sysfs_emit(buf, "accelerator\n");
-	case CXL_DECODER_EXPANDER:
+	case CXL_DECODER_HOSTONLYMEM:
 		return sysfs_emit(buf, "expander\n");
 	}
 	return -ENXIO;
@@ -275,6 +291,15 @@ static ssize_t interleave_ways_show(struct device *dev,
 
 static DEVICE_ATTR_RO(interleave_ways);
 
+static ssize_t qos_class_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct cxl_root_decoder *cxlrd = to_cxl_root_decoder(dev);
+
+	return sysfs_emit(buf, "%d\n", cxlrd->qos_class);
+}
+static DEVICE_ATTR_RO(qos_class);
+
 static struct attribute *cxl_decoder_base_attrs[] = {
 	&dev_attr_start.attr,
 	&dev_attr_size.attr,
@@ -294,6 +319,7 @@ static struct attribute *cxl_decoder_root_attrs[] = {
 	&dev_attr_cap_type2.attr,
 	&dev_attr_cap_type3.attr,
 	&dev_attr_target_list.attr,
+	&dev_attr_qos_class.attr,
 	SET_CXL_REGION_ATTR(create_pmem_region)
 	SET_CXL_REGION_ATTR(create_ram_region)
 	SET_CXL_REGION_ATTR(delete_region)
@@ -518,8 +544,33 @@ static void cxl_port_release(struct device *dev)
 	kfree(port);
 }
 
+static ssize_t decoders_committed_show(struct device *dev,
+				       struct device_attribute *attr, char *buf)
+{
+	struct cxl_port *port = to_cxl_port(dev);
+	int rc;
+
+	down_read(&cxl_region_rwsem);
+	rc = sysfs_emit(buf, "%d\n", cxl_num_decoders_committed(port));
+	up_read(&cxl_region_rwsem);
+
+	return rc;
+}
+
+static DEVICE_ATTR_RO(decoders_committed);
+
+static struct attribute *cxl_port_attrs[] = {
+	&dev_attr_decoders_committed.attr,
+	NULL,
+};
+
+static struct attribute_group cxl_port_attribute_group = {
+	.attrs = cxl_port_attrs,
+};
+
 static const struct attribute_group *cxl_port_attribute_groups[] = {
 	&cxl_base_attribute_group,
+	&cxl_port_attribute_group,
 	NULL,
 };
 
@@ -561,9 +612,9 @@ static void unregister_port(void *_port)
 	 * unregistered while holding their parent port lock.
 	 */
 	if (!parent)
-		lock_dev = port->uport;
+		lock_dev = port->uport_dev;
 	else if (is_cxl_root(parent))
-		lock_dev = parent->uport;
+		lock_dev = parent->uport_dev;
 	else
 		lock_dev = &parent->dev;
 
@@ -583,7 +634,8 @@ static int devm_cxl_link_uport(struct device *host, struct cxl_port *port)
 {
 	int rc;
 
-	rc = sysfs_create_link(&port->dev.kobj, &port->uport->kobj, "uport");
+	rc = sysfs_create_link(&port->dev.kobj, &port->uport_dev->kobj,
+			       "uport");
 	if (rc)
 		return rc;
 	return devm_add_action_or_reset(host, cxl_unlink_uport, port);
@@ -605,7 +657,7 @@ static int devm_cxl_link_parent_dport(struct device *host,
 	if (!parent_dport)
 		return 0;
 
-	rc = sysfs_create_link(&port->dev.kobj, &parent_dport->dport->kobj,
+	rc = sysfs_create_link(&port->dev.kobj, &parent_dport->dport_dev->kobj,
 			       "parent_dport");
 	if (rc)
 		return rc;
@@ -614,8 +666,7 @@ static int devm_cxl_link_parent_dport(struct device *host,
 
 static struct lock_class_key cxl_port_key;
 
-static struct cxl_port *cxl_port_alloc(struct device *uport,
-				       resource_size_t component_reg_phys,
+static struct cxl_port *cxl_port_alloc(struct device *uport_dev,
 				       struct cxl_dport *parent_dport)
 {
 	struct cxl_port *port;
@@ -630,7 +681,7 @@ static struct cxl_port *cxl_port_alloc(struct device *uport,
 	if (rc < 0)
 		goto err;
 	port->id = rc;
-	port->uport = uport;
+	port->uport_dev = uport_dev;
 
 	/*
 	 * The top-level cxl_port "cxl_root" does not have a cxl_port as
@@ -658,14 +709,14 @@ static struct cxl_port *cxl_port_alloc(struct device *uport,
 		if (iter->host_bridge)
 			port->host_bridge = iter->host_bridge;
 		else if (parent_dport->rch)
-			port->host_bridge = parent_dport->dport;
+			port->host_bridge = parent_dport->dport_dev;
 		else
-			port->host_bridge = iter->uport;
-		dev_dbg(uport, "host-bridge: %s\n", dev_name(port->host_bridge));
+			port->host_bridge = iter->uport_dev;
+		dev_dbg(uport_dev, "host-bridge: %s\n",
+			dev_name(port->host_bridge));
 	} else
-		dev->parent = uport;
+		dev->parent = uport_dev;
 
-	port->component_reg_phys = component_reg_phys;
 	ida_init(&port->decoder_ida);
 	port->hdm_end = -1;
 	port->commit_end = -1;
@@ -686,8 +737,54 @@ err:
 	return ERR_PTR(rc);
 }
 
+static int cxl_setup_comp_regs(struct device *host, struct cxl_register_map *map,
+			       resource_size_t component_reg_phys)
+{
+	*map = (struct cxl_register_map) {
+		.host = host,
+		.reg_type = CXL_REGLOC_RBI_EMPTY,
+		.resource = component_reg_phys,
+	};
+
+	if (component_reg_phys == CXL_RESOURCE_NONE)
+		return 0;
+
+	map->reg_type = CXL_REGLOC_RBI_COMPONENT;
+	map->max_size = CXL_COMPONENT_REG_BLOCK_SIZE;
+
+	return cxl_setup_regs(map);
+}
+
+static int cxl_port_setup_regs(struct cxl_port *port,
+			resource_size_t component_reg_phys)
+{
+	if (dev_is_platform(port->uport_dev))
+		return 0;
+	return cxl_setup_comp_regs(&port->dev, &port->reg_map,
+				   component_reg_phys);
+}
+
+static int cxl_dport_setup_regs(struct device *host, struct cxl_dport *dport,
+				resource_size_t component_reg_phys)
+{
+	int rc;
+
+	if (dev_is_platform(dport->dport_dev))
+		return 0;
+
+	/*
+	 * use @dport->dport_dev for the context for error messages during
+	 * register probing, and fixup @host after the fact, since @host may be
+	 * NULL.
+	 */
+	rc = cxl_setup_comp_regs(dport->dport_dev, &dport->reg_map,
+				 component_reg_phys);
+	dport->reg_map.host = host;
+	return rc;
+}
+
 static struct cxl_port *__devm_cxl_add_port(struct device *host,
-					    struct device *uport,
+					    struct device *uport_dev,
 					    resource_size_t component_reg_phys,
 					    struct cxl_dport *parent_dport)
 {
@@ -695,16 +792,35 @@ static struct cxl_port *__devm_cxl_add_port(struct device *host,
 	struct device *dev;
 	int rc;
 
-	port = cxl_port_alloc(uport, component_reg_phys, parent_dport);
+	port = cxl_port_alloc(uport_dev, parent_dport);
 	if (IS_ERR(port))
 		return port;
 
 	dev = &port->dev;
-	if (is_cxl_memdev(uport))
+	if (is_cxl_memdev(uport_dev)) {
+		struct cxl_memdev *cxlmd = to_cxl_memdev(uport_dev);
+		struct cxl_dev_state *cxlds = cxlmd->cxlds;
+
 		rc = dev_set_name(dev, "endpoint%d", port->id);
-	else if (parent_dport)
+		if (rc)
+			goto err;
+
+		/*
+		 * The endpoint driver already enumerated the component and RAS
+		 * registers. Reuse that enumeration while prepping them to be
+		 * mapped by the cxl_port driver.
+		 */
+		port->reg_map = cxlds->reg_map;
+		port->reg_map.host = &port->dev;
+	} else if (parent_dport) {
 		rc = dev_set_name(dev, "port%d", port->id);
-	else
+		if (rc)
+			goto err;
+
+		rc = cxl_port_setup_regs(port, component_reg_phys);
+		if (rc)
+			goto err;
+	} else
 		rc = dev_set_name(dev, "root%d", port->id);
 	if (rc)
 		goto err;
@@ -735,28 +851,29 @@ err:
 /**
  * devm_cxl_add_port - register a cxl_port in CXL memory decode hierarchy
  * @host: host device for devm operations
- * @uport: "physical" device implementing this upstream port
+ * @uport_dev: "physical" device implementing this upstream port
  * @component_reg_phys: (optional) for configurable cxl_port instances
  * @parent_dport: next hop up in the CXL memory decode hierarchy
  */
-struct cxl_port *devm_cxl_add_port(struct device *host, struct device *uport,
+struct cxl_port *devm_cxl_add_port(struct device *host,
+				   struct device *uport_dev,
 				   resource_size_t component_reg_phys,
 				   struct cxl_dport *parent_dport)
 {
 	struct cxl_port *port, *parent_port;
 
-	port = __devm_cxl_add_port(host, uport, component_reg_phys,
+	port = __devm_cxl_add_port(host, uport_dev, component_reg_phys,
 				   parent_dport);
 
 	parent_port = parent_dport ? parent_dport->port : NULL;
 	if (IS_ERR(port)) {
-		dev_dbg(uport, "Failed to add%s%s%s: %ld\n",
+		dev_dbg(uport_dev, "Failed to add%s%s%s: %ld\n",
 			parent_port ? " port to " : "",
 			parent_port ? dev_name(&parent_port->dev) : "",
 			parent_port ? "" : " root port",
 			PTR_ERR(port));
 	} else {
-		dev_dbg(uport, "%s added%s%s%s\n",
+		dev_dbg(uport_dev, "%s added%s%s%s\n",
 			dev_name(&port->dev),
 			parent_port ? " to " : "",
 			parent_port ? dev_name(&parent_port->dev) : "",
@@ -773,33 +890,34 @@ struct pci_bus *cxl_port_to_pci_bus(struct cxl_port *port)
 	if (is_cxl_root(port))
 		return NULL;
 
-	if (dev_is_pci(port->uport)) {
-		struct pci_dev *pdev = to_pci_dev(port->uport);
+	if (dev_is_pci(port->uport_dev)) {
+		struct pci_dev *pdev = to_pci_dev(port->uport_dev);
 
 		return pdev->subordinate;
 	}
 
-	return xa_load(&cxl_root_buses, (unsigned long)port->uport);
+	return xa_load(&cxl_root_buses, (unsigned long)port->uport_dev);
 }
 EXPORT_SYMBOL_NS_GPL(cxl_port_to_pci_bus, CXL);
 
-static void unregister_pci_bus(void *uport)
+static void unregister_pci_bus(void *uport_dev)
 {
-	xa_erase(&cxl_root_buses, (unsigned long)uport);
+	xa_erase(&cxl_root_buses, (unsigned long)uport_dev);
 }
 
-int devm_cxl_register_pci_bus(struct device *host, struct device *uport,
+int devm_cxl_register_pci_bus(struct device *host, struct device *uport_dev,
 			      struct pci_bus *bus)
 {
 	int rc;
 
-	if (dev_is_pci(uport))
+	if (dev_is_pci(uport_dev))
 		return -EINVAL;
 
-	rc = xa_insert(&cxl_root_buses, (unsigned long)uport, bus, GFP_KERNEL);
+	rc = xa_insert(&cxl_root_buses, (unsigned long)uport_dev, bus,
+		       GFP_KERNEL);
 	if (rc)
 		return rc;
-	return devm_add_action_or_reset(host, unregister_pci_bus, uport);
+	return devm_add_action_or_reset(host, unregister_pci_bus, uport_dev);
 }
 EXPORT_SYMBOL_NS_GPL(devm_cxl_register_pci_bus, CXL);
 
@@ -847,22 +965,22 @@ static struct cxl_dport *find_dport(struct cxl_port *port, int id)
 	return NULL;
 }
 
-static int add_dport(struct cxl_port *port, struct cxl_dport *new)
+static int add_dport(struct cxl_port *port, struct cxl_dport *dport)
 {
 	struct cxl_dport *dup;
 	int rc;
 
 	device_lock_assert(&port->dev);
-	dup = find_dport(port, new->port_id);
+	dup = find_dport(port, dport->port_id);
 	if (dup) {
 		dev_err(&port->dev,
 			"unable to add dport%d-%s non-unique port id (%s)\n",
-			new->port_id, dev_name(new->dport),
-			dev_name(dup->dport));
+			dport->port_id, dev_name(dport->dport_dev),
+			dev_name(dup->dport_dev));
 		return -EBUSY;
 	}
 
-	rc = xa_insert(&port->dports, (unsigned long)new->dport, new,
+	rc = xa_insert(&port->dports, (unsigned long)dport->dport_dev, dport,
 		       GFP_KERNEL);
 	if (rc)
 		return rc;
@@ -895,8 +1013,8 @@ static void cxl_dport_remove(void *data)
 	struct cxl_dport *dport = data;
 	struct cxl_port *port = dport->port;
 
-	xa_erase(&port->dports, (unsigned long) dport->dport);
-	put_device(dport->dport);
+	xa_erase(&port->dports, (unsigned long) dport->dport_dev);
+	put_device(dport->dport_dev);
 }
 
 static void cxl_dport_unlink(void *data)
@@ -920,7 +1038,7 @@ __devm_cxl_add_dport(struct cxl_port *port, struct device *dport_dev,
 	int rc;
 
 	if (is_cxl_root(port))
-		host = port->uport;
+		host = port->uport_dev;
 	else
 		host = &port->dev;
 
@@ -938,13 +1056,38 @@ __devm_cxl_add_dport(struct cxl_port *port, struct device *dport_dev,
 	if (!dport)
 		return ERR_PTR(-ENOMEM);
 
-	dport->dport = dport_dev;
+	dport->dport_dev = dport_dev;
 	dport->port_id = port_id;
-	dport->component_reg_phys = component_reg_phys;
 	dport->port = port;
-	if (rcrb != CXL_RESOURCE_NONE)
+
+	if (rcrb == CXL_RESOURCE_NONE) {
+		rc = cxl_dport_setup_regs(&port->dev, dport,
+					  component_reg_phys);
+		if (rc)
+			return ERR_PTR(rc);
+	} else {
+		dport->rcrb.base = rcrb;
+		component_reg_phys = __rcrb_to_component(dport_dev, &dport->rcrb,
+							 CXL_RCRB_DOWNSTREAM);
+		if (component_reg_phys == CXL_RESOURCE_NONE) {
+			dev_warn(dport_dev, "Invalid Component Registers in RCRB");
+			return ERR_PTR(-ENXIO);
+		}
+
+		/*
+		 * RCH @dport is not ready to map until associated with its
+		 * memdev
+		 */
+		rc = cxl_dport_setup_regs(NULL, dport, component_reg_phys);
+		if (rc)
+			return ERR_PTR(rc);
+
 		dport->rch = true;
-	dport->rcrb = rcrb;
+	}
+
+	if (component_reg_phys != CXL_RESOURCE_NONE)
+		dev_dbg(dport_dev, "Component Registers found for dport: %pa\n",
+			&component_reg_phys);
 
 	cond_cxl_root_lock(port);
 	rc = add_dport(port, dport);
@@ -1004,14 +1147,12 @@ EXPORT_SYMBOL_NS_GPL(devm_cxl_add_dport, CXL);
  * @port: the cxl_port that references this dport
  * @dport_dev: firmware or PCI device representing the dport
  * @port_id: identifier for this dport in a decoder's target list
- * @component_reg_phys: optional location of CXL component registers
  * @rcrb: mandatory location of a Root Complex Register Block
  *
  * See CXL 3.0 9.11.8 CXL Devices Attached to an RCH
  */
 struct cxl_dport *devm_cxl_add_rch_dport(struct cxl_port *port,
 					 struct device *dport_dev, int port_id,
-					 resource_size_t component_reg_phys,
 					 resource_size_t rcrb)
 {
 	struct cxl_dport *dport;
@@ -1022,7 +1163,7 @@ struct cxl_dport *devm_cxl_add_rch_dport(struct cxl_port *port,
 	}
 
 	dport = __devm_cxl_add_dport(port, dport_dev, port_id,
-				     component_reg_phys, rcrb);
+				     CXL_RESOURCE_NONE, rcrb);
 	if (IS_ERR(dport)) {
 		dev_dbg(dport_dev, "failed to add RCH dport to %s: %ld\n",
 			dev_name(&port->dev), PTR_ERR(dport));
@@ -1158,36 +1299,41 @@ static struct device *grandparent(struct device *dev)
 	return NULL;
 }
 
+static struct device *endpoint_host(struct cxl_port *endpoint)
+{
+	struct cxl_port *port = to_cxl_port(endpoint->dev.parent);
+
+	if (is_cxl_root(port))
+		return port->uport_dev;
+	return &port->dev;
+}
+
 static void delete_endpoint(void *data)
 {
 	struct cxl_memdev *cxlmd = data;
-	struct cxl_port *endpoint = dev_get_drvdata(&cxlmd->dev);
-	struct cxl_port *parent_port;
-	struct device *parent;
+	struct cxl_port *endpoint = cxlmd->endpoint;
+	struct device *host = endpoint_host(endpoint);
 
-	parent_port = cxl_mem_find_port(cxlmd, NULL);
-	if (!parent_port)
-		goto out;
-	parent = &parent_port->dev;
-
-	device_lock(parent);
-	if (parent->driver && !endpoint->dead) {
-		devm_release_action(parent, cxl_unlink_parent_dport, endpoint);
-		devm_release_action(parent, cxl_unlink_uport, endpoint);
-		devm_release_action(parent, unregister_port, endpoint);
+	device_lock(host);
+	if (host->driver && !endpoint->dead) {
+		devm_release_action(host, cxl_unlink_parent_dport, endpoint);
+		devm_release_action(host, cxl_unlink_uport, endpoint);
+		devm_release_action(host, unregister_port, endpoint);
 	}
-	device_unlock(parent);
-	put_device(parent);
-out:
+	cxlmd->endpoint = NULL;
+	device_unlock(host);
 	put_device(&endpoint->dev);
+	put_device(host);
 }
 
 int cxl_endpoint_autoremove(struct cxl_memdev *cxlmd, struct cxl_port *endpoint)
 {
+	struct device *host = endpoint_host(endpoint);
 	struct device *dev = &cxlmd->dev;
 
+	get_device(host);
 	get_device(&endpoint->dev);
-	dev_set_drvdata(dev, endpoint);
+	cxlmd->endpoint = endpoint;
 	cxlmd->depth = endpoint->depth;
 	return devm_add_action_or_reset(dev, delete_endpoint, cxlmd);
 }
@@ -1363,7 +1509,7 @@ out:
 		rc = PTR_ERR(port);
 	else {
 		dev_dbg(&cxlmd->dev, "add to new port %s:%s\n",
-			dev_name(&port->dev), dev_name(port->uport));
+			dev_name(&port->dev), dev_name(port->uport_dev));
 		rc = cxl_add_ep(dport, &cxlmd->dev);
 		if (rc == -EBUSY) {
 			/*
@@ -1408,7 +1554,11 @@ retry:
 		struct cxl_dport *dport;
 		struct cxl_port *port;
 
-		if (!dport_dev)
+		/*
+		 * The terminal "grandparent" in PCI is NULL and @platform_bus
+		 * for platform devices
+		 */
+		if (!dport_dev || dport_dev == &platform_bus)
 			return 0;
 
 		uport_dev = dport_dev->parent;
@@ -1425,7 +1575,8 @@ retry:
 		if (port) {
 			dev_dbg(&cxlmd->dev,
 				"found already registered port %s:%s\n",
-				dev_name(&port->dev), dev_name(port->uport));
+				dev_name(&port->dev),
+				dev_name(port->uport_dev));
 			rc = cxl_add_ep(dport, &cxlmd->dev);
 
 			/*
@@ -1464,6 +1615,13 @@ retry:
 	return 0;
 }
 EXPORT_SYMBOL_NS_GPL(devm_cxl_enumerate_ports, CXL);
+
+struct cxl_port *cxl_pci_find_port(struct pci_dev *pdev,
+				   struct cxl_dport **dport)
+{
+	return find_cxl_port(pdev->dev.parent, dport);
+}
+EXPORT_SYMBOL_NS_GPL(cxl_pci_find_port, CXL);
 
 struct cxl_port *cxl_mem_find_port(struct cxl_memdev *cxlmd,
 				   struct cxl_dport **dport)
@@ -1550,7 +1708,7 @@ static int cxl_decoder_init(struct cxl_port *port, struct cxl_decoder *cxld)
 	/* Pre initialize an "empty" decoder */
 	cxld->interleave_ways = 1;
 	cxld->interleave_granularity = PAGE_SIZE;
-	cxld->target_type = CXL_DECODER_EXPANDER;
+	cxld->target_type = CXL_DECODER_HOSTONLYMEM;
 	cxld->hpa_range = (struct range) {
 		.start = 0,
 		.end = -1,
@@ -1623,6 +1781,7 @@ struct cxl_root_decoder *cxl_root_decoder_alloc(struct cxl_port *port,
 	}
 
 	atomic_set(&cxlrd->region_id, rc);
+	cxlrd->qos_class = CXL_QOS_CLASS_INVALID;
 	return cxlrd;
 }
 EXPORT_SYMBOL_NS_GPL(cxl_root_decoder_alloc, CXL);
@@ -1994,3 +2153,4 @@ static void cxl_core_exit(void)
 subsys_initcall(cxl_core_init);
 module_exit(cxl_core_exit);
 MODULE_LICENSE("GPL v2");
+MODULE_IMPORT_NS(CXL);

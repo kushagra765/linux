@@ -5,12 +5,12 @@
 #include <linux/seq_file.h>
 #include <linux/shrinker.h>
 #include <linux/memcontrol.h>
-#include <linux/srcu.h>
+
+#include "internal.h"
 
 /* defined in vmscan.c */
 extern struct mutex shrinker_mutex;
 extern struct list_head shrinker_list;
-extern struct srcu_struct shrinker_srcu;
 
 static DEFINE_IDA(shrinker_debugfs_ida);
 static struct dentry *shrinker_debugfs_root;
@@ -51,13 +51,13 @@ static int shrinker_debugfs_count_show(struct seq_file *m, void *v)
 	struct mem_cgroup *memcg;
 	unsigned long total;
 	bool memcg_aware;
-	int ret = 0, nid, srcu_idx;
+	int ret = 0, nid;
 
 	count_per_node = kcalloc(nr_node_ids, sizeof(unsigned long), GFP_KERNEL);
 	if (!count_per_node)
 		return -ENOMEM;
 
-	srcu_idx = srcu_read_lock(&shrinker_srcu);
+	rcu_read_lock();
 
 	memcg_aware = shrinker->flags & SHRINKER_MEMCG_AWARE;
 
@@ -88,7 +88,7 @@ static int shrinker_debugfs_count_show(struct seq_file *m, void *v)
 		}
 	} while ((memcg = mem_cgroup_iter(NULL, memcg, NULL)) != NULL);
 
-	srcu_read_unlock(&shrinker_srcu, srcu_idx);
+	rcu_read_unlock();
 
 	kfree(count_per_node);
 	return ret;
@@ -111,7 +111,7 @@ static ssize_t shrinker_debugfs_scan_write(struct file *file,
 		.gfp_mask = GFP_KERNEL,
 	};
 	struct mem_cgroup *memcg = NULL;
-	int nid, srcu_idx;
+	int nid;
 	char kbuf[72];
 
 	read_len = size < (sizeof(kbuf) - 1) ? size : (sizeof(kbuf) - 1);
@@ -141,8 +141,6 @@ static ssize_t shrinker_debugfs_scan_write(struct file *file,
 		return -EINVAL;
 	}
 
-	srcu_idx = srcu_read_lock(&shrinker_srcu);
-
 	sc.nid = nid;
 	sc.memcg = memcg;
 	sc.nr_to_scan = nr_to_scan;
@@ -150,7 +148,6 @@ static ssize_t shrinker_debugfs_scan_write(struct file *file,
 
 	shrinker->scan_objects(shrinker, &sc);
 
-	srcu_read_unlock(&shrinker_srcu, srcu_idx);
 	mem_cgroup_put(memcg);
 
 	return size;
@@ -243,9 +240,6 @@ struct dentry *shrinker_debugfs_detach(struct shrinker *shrinker,
 	struct dentry *entry = shrinker->debugfs_entry;
 
 	lockdep_assert_held(&shrinker_mutex);
-
-	kfree_const(shrinker->name);
-	shrinker->name = NULL;
 
 	*debugfs_id = entry ? shrinker->debugfs_id : -1;
 	shrinker->debugfs_entry = NULL;

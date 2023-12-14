@@ -34,6 +34,8 @@
 #include "link.h"
 #include "dcn20_fpu.h"
 
+#define DC_LOGGER \
+	dc->ctx->logger
 #define DC_LOGGER_INIT(logger)
 
 #ifndef MAX
@@ -948,10 +950,8 @@ static enum dcn_zstate_support_state  decide_zstate_support(struct dc *dc, struc
 {
 	int plane_count;
 	int i;
-	unsigned int optimized_min_dst_y_next_start_us;
 
 	plane_count = 0;
-	optimized_min_dst_y_next_start_us = 0;
 	for (i = 0; i < dc->res_pool->pipe_count; i++) {
 		if (context->res_ctx.pipe_ctx[i].plane_state)
 			plane_count++;
@@ -977,23 +977,11 @@ static enum dcn_zstate_support_state  decide_zstate_support(struct dc *dc, struc
 		bool allow_z8 = context->bw_ctx.dml.vba.StutterPeriod > (double)minmum_z8_residency;
 		bool is_pwrseq0 = link->link_index == 0;
 
-		if (dc_extended_blank_supported(dc)) {
-			for (i = 0; i < dc->res_pool->pipe_count; i++) {
-				if (context->res_ctx.pipe_ctx[i].stream == context->streams[0]
-					&& context->res_ctx.pipe_ctx[i].stream->adjust.v_total_min == context->res_ctx.pipe_ctx[i].stream->adjust.v_total_max
-					&& context->res_ctx.pipe_ctx[i].stream->adjust.v_total_min > context->res_ctx.pipe_ctx[i].stream->timing.v_total) {
-						optimized_min_dst_y_next_start_us =
-							context->res_ctx.pipe_ctx[i].dlg_regs.optimized_min_dst_y_next_start_us;
-						break;
-				}
-			}
-		}
-
 		/* Don't support multi-plane configurations */
 		if (stream_status->plane_count > 1)
 			return DCN_ZSTATE_SUPPORT_DISALLOW;
 
-		if (is_pwrseq0 && (context->bw_ctx.dml.vba.StutterPeriod > 5000.0 || optimized_min_dst_y_next_start_us > 5000))
+		if (is_pwrseq0 && context->bw_ctx.dml.vba.StutterPeriod > 5000.0)
 			return DCN_ZSTATE_SUPPORT_ALLOW;
 		else if (is_pwrseq0 && link->psr_settings.psr_version == DC_PSR_VERSION_1 && !link->panel_config.psr.disable_psr)
 			return allow_z8 ? DCN_ZSTATE_SUPPORT_ALLOW_Z8_Z10_ONLY : DCN_ZSTATE_SUPPORT_ALLOW_Z10_ONLY;
@@ -1043,7 +1031,7 @@ void dcn20_calculate_dlg_params(struct dc *dc,
 				int pipe_cnt,
 				int vlevel)
 {
-	int i, pipe_idx;
+	int i, pipe_idx, active_hubp_count = 0;
 
 	dc_assert_fp_enabled();
 
@@ -1079,6 +1067,8 @@ void dcn20_calculate_dlg_params(struct dc *dc,
 	for (i = 0, pipe_idx = 0; i < dc->res_pool->pipe_count; i++) {
 		if (!context->res_ctx.pipe_ctx[i].stream)
 			continue;
+		if (context->res_ctx.pipe_ctx[i].plane_state)
+			active_hubp_count++;
 		pipes[pipe_idx].pipe.dest.vstartup_start = get_vstartup(&context->bw_ctx.dml, pipes, pipe_cnt, pipe_idx);
 		pipes[pipe_idx].pipe.dest.vupdate_offset = get_vupdate_offset(&context->bw_ctx.dml, pipes, pipe_cnt, pipe_idx);
 		pipes[pipe_idx].pipe.dest.vupdate_width = get_vupdate_width(&context->bw_ctx.dml, pipes, pipe_cnt, pipe_idx);
@@ -1098,12 +1088,17 @@ void dcn20_calculate_dlg_params(struct dc *dc,
 		context->res_ctx.pipe_ctx[i].plane_res.bw.dppclk_khz =
 						pipes[pipe_idx].clks_cfg.dppclk_mhz * 1000;
 		context->res_ctx.pipe_ctx[i].pipe_dlg_param = pipes[pipe_idx].pipe.dest;
-		if (context->res_ctx.pipe_ctx[i].stream->adaptive_sync_infopacket.valid)
+		if (dc->ctx->dce_version < DCN_VERSION_3_1 &&
+		    context->res_ctx.pipe_ctx[i].stream->adaptive_sync_infopacket.valid)
 			dcn20_adjust_freesync_v_startup(
 				&context->res_ctx.pipe_ctx[i].stream->timing,
 				&context->res_ctx.pipe_ctx[i].pipe_dlg_param.vstartup_start);
 
 		pipe_idx++;
+	}
+	/* If DCN isn't making memory requests we can allow pstate change */
+	if (!active_hubp_count) {
+		context->bw_ctx.bw.dcn.clk.p_state_change_support = true;
 	}
 	/*save a original dppclock copy*/
 	context->bw_ctx.bw.dcn.clk.bw_dppclk_khz = context->bw_ctx.bw.dcn.clk.dppclk_khz;
@@ -1304,11 +1299,11 @@ int dcn20_populate_dml_pipes_from_context(struct dc *dc,
 		pipes[pipe_cnt].dout.is_virtual = 0;
 		pipes[pipe_cnt].pipe.dest.vtotal_min = res_ctx->pipe_ctx[i].stream->adjust.v_total_min;
 		pipes[pipe_cnt].pipe.dest.vtotal_max = res_ctx->pipe_ctx[i].stream->adjust.v_total_max;
-		switch (get_num_odm_splits(&res_ctx->pipe_ctx[i])) {
-		case 1:
+		switch (resource_get_odm_slice_count(&res_ctx->pipe_ctx[i])) {
+		case 2:
 			pipes[pipe_cnt].pipe.dest.odm_combine = dm_odm_combine_mode_2to1;
 			break;
-		case 3:
+		case 4:
 			pipes[pipe_cnt].pipe.dest.odm_combine = dm_odm_combine_mode_4to1;
 			break;
 		default:
@@ -1885,6 +1880,17 @@ void dcn20_patch_bounding_box(struct dc *dc, struct _vcs_dpi_soc_bounding_box_st
 				dc->bb_overrides.sr_enter_plus_exit_time_ns / 1000.0;
 	}
 
+	if ((int)(bb->sr_exit_z8_time_us * 1000)
+				!= dc->bb_overrides.sr_exit_z8_time_ns
+			&& dc->bb_overrides.sr_exit_z8_time_ns) {
+		bb->sr_exit_z8_time_us = dc->bb_overrides.sr_exit_z8_time_ns / 1000.0;
+	}
+
+	if ((int)(bb->sr_enter_plus_exit_z8_time_us * 1000)
+				!= dc->bb_overrides.sr_enter_plus_exit_z8_time_ns
+			&& dc->bb_overrides.sr_enter_plus_exit_z8_time_ns) {
+		bb->sr_enter_plus_exit_z8_time_us = dc->bb_overrides.sr_enter_plus_exit_z8_time_ns / 1000.0;
+	}
 	if ((int)(bb->urgent_latency_us * 1000) != dc->bb_overrides.urgent_latency_ns
 			&& dc->bb_overrides.urgent_latency_ns) {
 		bb->urgent_latency_us = dc->bb_overrides.urgent_latency_ns / 1000.0;
@@ -1906,7 +1912,7 @@ void dcn20_patch_bounding_box(struct dc *dc, struct _vcs_dpi_soc_bounding_box_st
 }
 
 static bool dcn20_validate_bandwidth_internal(struct dc *dc, struct dc_state *context,
-		bool fast_validate)
+		bool fast_validate, display_e2e_pipe_params_st *pipes)
 {
 	bool out = false;
 
@@ -1915,7 +1921,6 @@ static bool dcn20_validate_bandwidth_internal(struct dc *dc, struct dc_state *co
 	int vlevel = 0;
 	int pipe_split_from[MAX_PIPES];
 	int pipe_cnt = 0;
-	display_e2e_pipe_params_st *pipes = kzalloc(dc->res_pool->pipe_count * sizeof(display_e2e_pipe_params_st), GFP_ATOMIC);
 	DC_LOGGER_INIT(dc->ctx->logger);
 
 	BW_VAL_TRACE_COUNT();
@@ -1950,16 +1955,14 @@ validate_fail:
 	out = false;
 
 validate_out:
-	kfree(pipes);
 
 	BW_VAL_TRACE_FINISH();
 
 	return out;
 }
 
-bool dcn20_validate_bandwidth_fp(struct dc *dc,
-				 struct dc_state *context,
-				 bool fast_validate)
+bool dcn20_validate_bandwidth_fp(struct dc *dc, struct dc_state *context,
+				 bool fast_validate, display_e2e_pipe_params_st *pipes)
 {
 	bool voltage_supported = false;
 	bool full_pstate_supported = false;
@@ -1978,11 +1981,11 @@ bool dcn20_validate_bandwidth_fp(struct dc *dc,
 	ASSERT(context != dc->current_state);
 
 	if (fast_validate) {
-		return dcn20_validate_bandwidth_internal(dc, context, true);
+		return dcn20_validate_bandwidth_internal(dc, context, true, pipes);
 	}
 
 	// Best case, we support full UCLK switch latency
-	voltage_supported = dcn20_validate_bandwidth_internal(dc, context, false);
+	voltage_supported = dcn20_validate_bandwidth_internal(dc, context, false, pipes);
 	full_pstate_supported = context->bw_ctx.bw.dcn.clk.p_state_change_support;
 
 	if (context->bw_ctx.dml.soc.dummy_pstate_latency_us == 0 ||
@@ -1994,7 +1997,8 @@ bool dcn20_validate_bandwidth_fp(struct dc *dc,
 	// Fallback: Try to only support G6 temperature read latency
 	context->bw_ctx.dml.soc.dram_clock_change_latency_us = context->bw_ctx.dml.soc.dummy_pstate_latency_us;
 
-	voltage_supported = dcn20_validate_bandwidth_internal(dc, context, false);
+	memset(pipes, 0, dc->res_pool->pipe_count * sizeof(display_e2e_pipe_params_st));
+	voltage_supported = dcn20_validate_bandwidth_internal(dc, context, false, pipes);
 	dummy_pstate_supported = context->bw_ctx.bw.dcn.clk.p_state_change_support;
 
 	if (voltage_supported && (dummy_pstate_supported || !(context->stream_count))) {
@@ -2199,9 +2203,8 @@ static void dcn21_calculate_wm(struct dc *dc, struct dc_state *context,
 						&context->bw_ctx.dml, pipes, pipe_cnt);
 }
 
-bool dcn21_validate_bandwidth_fp(struct dc *dc,
-				 struct dc_state *context,
-				 bool fast_validate)
+bool dcn21_validate_bandwidth_fp(struct dc *dc, struct dc_state *context,
+				 bool fast_validate, display_e2e_pipe_params_st *pipes)
 {
 	bool out = false;
 
@@ -2210,7 +2213,6 @@ bool dcn21_validate_bandwidth_fp(struct dc *dc,
 	int vlevel = 0;
 	int pipe_split_from[MAX_PIPES];
 	int pipe_cnt = 0;
-	display_e2e_pipe_params_st *pipes = kzalloc(dc->res_pool->pipe_count * sizeof(display_e2e_pipe_params_st), GFP_ATOMIC);
 	DC_LOGGER_INIT(dc->ctx->logger);
 
 	BW_VAL_TRACE_COUNT();
@@ -2250,7 +2252,6 @@ validate_fail:
 	out = false;
 
 validate_out:
-	kfree(pipes);
 
 	BW_VAL_TRACE_FINISH();
 

@@ -131,6 +131,7 @@ union stream_update_flags {
 		uint32_t dsc_changed : 1;
 		uint32_t mst_bw : 1;
 		uint32_t crtc_timing_adjust : 1;
+		uint32_t fams_changed : 1;
 	} bits;
 
 	uint32_t raw;
@@ -171,6 +172,10 @@ struct mall_temp_config {
 	bool is_phantom_plane[MAX_PIPES];
 };
 
+struct dc_stream_debug_options {
+	char force_odm_combine_segments;
+};
+
 struct dc_stream_state {
 	// sink is deprecated, new code should not reference
 	// this pointer
@@ -181,8 +186,8 @@ struct dc_stream_state {
 	 * a stream via the volatile dc_state rather than the static dc_link.
 	 */
 	struct link_encoder *link_enc;
+	struct dc_stream_debug_options debug;
 	struct dc_panel_patch sink_patches;
-	union display_content_support content_support;
 	struct dc_crtc_timing timing;
 	struct dc_crtc_timing_adjust adjust;
 	struct dc_info_packet vrr_infopacket;
@@ -206,6 +211,7 @@ struct dc_stream_state {
 	struct dc_csc_transform csc_color_matrix;
 
 	enum dc_color_space output_color_space;
+	enum display_content_type content_type;
 	enum dc_dither_option dither_option;
 
 	enum view_3d_format view_format;
@@ -227,6 +233,7 @@ struct dc_stream_state {
 	 */
 	bool vrr_active_variable;
 	bool freesync_on_desktop;
+	bool vrr_active_fixed;
 
 	bool converter_disable_audio;
 	uint8_t qs_bit;
@@ -320,6 +327,7 @@ struct dc_stream_update {
 	bool integer_scaling_update;
 	bool *allow_freesync;
 	bool *vrr_active_variable;
+	bool *vrr_active_fixed;
 
 	struct colorspace_transform *gamut_remap;
 	enum dc_color_space *output_color_space;
@@ -511,12 +519,6 @@ struct dc_stream_status *dc_stream_get_status_from_state(
 	struct dc_stream_state *stream);
 struct dc_stream_status *dc_stream_get_status(
 	struct dc_stream_state *dc_stream);
-
-#ifndef TRIM_FSFT
-bool dc_optimize_timing_for_fsft(
-	struct dc_stream_state *pStream,
-	unsigned int max_input_rate_in_khz);
-#endif
 
 /*******************************************************************************
  * Cursor interfaces - To manages the cursor within a stream

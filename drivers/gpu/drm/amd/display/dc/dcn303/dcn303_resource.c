@@ -2,6 +2,24 @@
 /*
  * Copyright (C) 2021 Advanced Micro Devices, Inc.
  *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS IN THE SOFTWARE.
+ *
  * Authors: AMD
  */
 
@@ -56,6 +74,8 @@
 
 #include "dml/dcn303/dcn303_fpu.h"
 
+#define DC_LOGGER \
+	dc->ctx->logger
 #define DC_LOGGER_INIT(logger)
 
 
@@ -65,7 +85,7 @@ static const struct dc_debug_options debug_defaults_drv = {
 		.timing_trace = false,
 		.clock_trace = true,
 		.disable_pplib_clock_request = true,
-		.pipe_split_policy = MPC_SPLIT_DYNAMIC,
+		.pipe_split_policy = MPC_SPLIT_AVOID,
 		.force_single_disp_pipe_split = false,
 		.disable_dcc = DCC_ENABLE,
 		.vsr_support = true,
@@ -79,29 +99,14 @@ static const struct dc_debug_options debug_defaults_drv = {
 		.dmub_command_table = true,
 		.exit_idle_opt_for_cursor_updates = true,
 		.disable_idle_power_optimizations = false,
-};
-
-static const struct dc_debug_options debug_defaults_diags = {
-		.disable_dmcu = true,
-		.force_abm_enable = false,
-		.timing_trace = true,
-		.clock_trace = true,
-		.disable_dpp_power_gate = true,
-		.disable_hubp_power_gate = true,
-		.disable_clock_gate = true,
-		.disable_pplib_clock_request = true,
-		.disable_pplib_wm_range = true,
-		.disable_stutter = false,
-		.scl_reset_length10 = true,
-		.dwb_fi_phase = -1, // -1 = disable
-		.dmub_command_table = true,
-		.enable_tri_buf = true,
+		.using_dml2 = false,
 };
 
 static const struct dc_panel_config panel_config_defaults = {
 		.psr = {
 			.disable_psr = false,
 			.disallow_psrsu = false,
+			.disallow_replay = false,
 		},
 };
 
@@ -881,13 +886,6 @@ static const struct resource_create_funcs res_create_funcs = {
 		.create_hwseq = dcn303_hwseq_create,
 };
 
-static const struct resource_create_funcs res_create_maximus_funcs = {
-		.read_dce_straps = NULL,
-		.create_audio = NULL,
-		.create_stream_encoder = NULL,
-		.create_hwseq = dcn303_hwseq_create,
-};
-
 static bool is_soc_bounding_box_valid(struct dc *dc)
 {
 	uint32_t hw_internal_rev = dc->ctx->asic_id.hw_internal_rev;
@@ -1085,7 +1083,8 @@ static struct resource_funcs dcn303_res_pool_funcs = {
 		.calculate_wm_and_dlg = dcn30_calculate_wm_and_dlg,
 		.update_soc_for_wm_a = dcn30_update_soc_for_wm_a,
 		.populate_dml_pipes = dcn30_populate_dml_pipes_from_context,
-		.acquire_idle_pipe_for_layer = dcn20_acquire_idle_pipe_for_layer,
+		.acquire_free_pipe_as_secondary_dpp_pipe = dcn20_acquire_free_pipe_for_layer,
+		.release_pipe = dcn20_release_pipe,
 		.add_stream_to_ctx = dcn30_add_stream_to_ctx,
 		.add_dsc_to_stream_resource = dcn20_add_dsc_to_stream_resource,
 		.remove_stream_from_ctx = dcn20_remove_stream_from_ctx,
@@ -1176,6 +1175,7 @@ static bool dcn303_resource_construct(
 	dc->caps.force_dp_tps4_for_cp2520 = true;
 	dc->caps.extended_aux_timeout_support = true;
 	dc->caps.dmcub_support = true;
+	dc->caps.max_v_total = (1 << 15) - 1;
 
 	/* Color pipeline capabilities */
 	dc->caps.color.dpp.dcn_arch = 1;
@@ -1213,6 +1213,7 @@ static bool dcn303_resource_construct(
 
 	dc->caps.dp_hdmi21_pcon_support = true;
 
+	dc->config.dc_mode_clk_limit_support = true;
 	/* read VBIOS LTTPR caps */
 	if (ctx->dc_bios->funcs->get_lttpr_caps) {
 		enum bp_result bp_query_result;
@@ -1232,8 +1233,6 @@ static bool dcn303_resource_construct(
 
 	if (dc->ctx->dce_environment == DCE_ENV_PRODUCTION_DRV)
 		dc->debug = debug_defaults_drv;
-	else
-		dc->debug = debug_defaults_diags;
 
 	// Init the vm_helper
 	if (dc->vm_helper)
@@ -1400,8 +1399,7 @@ static bool dcn303_resource_construct(
 
 	/* Audio, Stream Encoders including HPO and virtual, MPC 3D LUTs */
 	if (!resource_construct(num_virtual_links, dc, pool,
-			(!IS_FPGA_MAXIMUS_DC(dc->ctx->dce_environment) ?
-					&res_create_funcs : &res_create_maximus_funcs)))
+			&res_create_funcs))
 		goto create_fail;
 
 	/* HW Sequencer and Plane caps */

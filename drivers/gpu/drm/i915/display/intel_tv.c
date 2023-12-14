@@ -35,14 +35,15 @@
 #include <drm/drm_edid.h>
 
 #include "i915_drv.h"
-#include "i915_irq.h"
 #include "i915_reg.h"
 #include "intel_connector.h"
 #include "intel_crtc.h"
 #include "intel_de.h"
+#include "intel_display_irq.h"
 #include "intel_display_types.h"
 #include "intel_dpll.h"
 #include "intel_hotplug.h"
+#include "intel_load_detect.h"
 #include "intel_tv.h"
 #include "intel_tv_regs.h"
 
@@ -957,8 +958,14 @@ static enum drm_mode_status
 intel_tv_mode_valid(struct drm_connector *connector,
 		    struct drm_display_mode *mode)
 {
+	struct drm_i915_private *i915 = to_i915(connector->dev);
 	const struct tv_mode *tv_mode = intel_tv_mode_find(connector->state);
-	int max_dotclk = to_i915(connector->dev)->max_dotclk_freq;
+	int max_dotclk = i915->max_dotclk_freq;
+	enum drm_mode_status status;
+
+	status = intel_cpu_transcoder_mode_valid(i915, mode);
+	if (status != MODE_OK)
+		return status;
 
 	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
 		return MODE_NO_DBLESCAN;
@@ -1205,6 +1212,7 @@ intel_tv_compute_config(struct intel_encoder *encoder,
 	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLSCAN)
 		return -EINVAL;
 
+	pipe_config->sink_format = INTEL_OUTPUT_FORMAT_RGB;
 	pipe_config->output_format = INTEL_OUTPUT_FORMAT_RGB;
 
 	drm_dbg_kms(&dev_priv->drm, "forcing bpc to 8 for TV\n");
@@ -1718,25 +1726,25 @@ intel_tv_detect(struct drm_connector *connector,
 	drm_dbg_kms(&i915->drm, "[CONNECTOR:%d:%s] force=%d\n",
 		    connector->base.id, connector->name, force);
 
-	if (!INTEL_DISPLAY_ENABLED(i915))
+	if (!intel_display_device_enabled(i915))
 		return connector_status_disconnected;
 
 	if (force) {
-		struct intel_load_detect_pipe tmp;
-		int ret;
+		struct drm_atomic_state *state;
 
-		ret = intel_get_load_detect_pipe(connector, &tmp, ctx);
-		if (ret < 0)
-			return ret;
+		state = intel_load_detect_get_pipe(connector, ctx);
+		if (IS_ERR(state))
+			return PTR_ERR(state);
 
-		if (ret > 0) {
+		if (state) {
 			type = intel_tv_detect_type(intel_tv, connector);
-			intel_release_load_detect_pipe(connector, &tmp, ctx);
+			intel_load_detect_release_pipe(connector, state, ctx);
 			status = type < 0 ?
 				connector_status_disconnected :
 				connector_status_connected;
-		} else
+		} else {
 			status = connector_status_unknown;
+		}
 
 		if (status == connector_status_connected) {
 			intel_tv->type = type;

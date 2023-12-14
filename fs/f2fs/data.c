@@ -383,6 +383,17 @@ static void f2fs_write_end_io(struct bio *bio)
 	bio_put(bio);
 }
 
+#ifdef CONFIG_BLK_DEV_ZONED
+static void f2fs_zone_write_end_io(struct bio *bio)
+{
+	struct f2fs_bio_info *io = (struct f2fs_bio_info *)bio->bi_private;
+
+	bio->bi_private = io->bi_private;
+	complete(&io->zone_wait);
+	f2fs_write_end_io(bio);
+}
+#endif
+
 struct block_device *f2fs_target_device(struct f2fs_sb_info *sbi,
 		block_t blk_addr, sector_t *sector)
 {
@@ -639,6 +650,11 @@ int f2fs_init_write_merge_io(struct f2fs_sb_info *sbi)
 			INIT_LIST_HEAD(&sbi->write_io[i][j].io_list);
 			INIT_LIST_HEAD(&sbi->write_io[i][j].bio_list);
 			init_f2fs_rwsem(&sbi->write_io[i][j].bio_list_lock);
+#ifdef CONFIG_BLK_DEV_ZONED
+			init_completion(&sbi->write_io[i][j].zone_wait);
+			sbi->write_io[i][j].zone_pending_bio = NULL;
+			sbi->write_io[i][j].bi_private = NULL;
+#endif
 		}
 	}
 
@@ -965,6 +981,26 @@ alloc_new:
 	return 0;
 }
 
+#ifdef CONFIG_BLK_DEV_ZONED
+static bool is_end_zone_blkaddr(struct f2fs_sb_info *sbi, block_t blkaddr)
+{
+	int devi = 0;
+
+	if (f2fs_is_multi_device(sbi)) {
+		devi = f2fs_target_device_index(sbi, blkaddr);
+		if (blkaddr < FDEV(devi).start_blk ||
+		    blkaddr > FDEV(devi).end_blk) {
+			f2fs_err(sbi, "Invalid block %x", blkaddr);
+			return false;
+		}
+		blkaddr -= FDEV(devi).start_blk;
+	}
+	return bdev_zoned_model(FDEV(devi).bdev) == BLK_ZONED_HM &&
+		f2fs_blkz_is_seq(sbi, devi, blkaddr) &&
+		(blkaddr % sbi->blocks_per_blkz == sbi->blocks_per_blkz - 1);
+}
+#endif
+
 void f2fs_submit_page_write(struct f2fs_io_info *fio)
 {
 	struct f2fs_sb_info *sbi = fio->sbi;
@@ -975,6 +1011,16 @@ void f2fs_submit_page_write(struct f2fs_io_info *fio)
 	f2fs_bug_on(sbi, is_read_io(fio->op));
 
 	f2fs_down_write(&io->io_rwsem);
+
+#ifdef CONFIG_BLK_DEV_ZONED
+	if (f2fs_sb_has_blkzoned(sbi) && btype < META && io->zone_pending_bio) {
+		wait_for_completion_io(&io->zone_wait);
+		bio_put(io->zone_pending_bio);
+		io->zone_pending_bio = NULL;
+		io->bi_private = NULL;
+	}
+#endif
+
 next:
 	if (fio->in_list) {
 		spin_lock(&io->io_lock);
@@ -1038,6 +1084,18 @@ skip:
 	if (fio->in_list)
 		goto next;
 out:
+#ifdef CONFIG_BLK_DEV_ZONED
+	if (f2fs_sb_has_blkzoned(sbi) && btype < META &&
+			is_end_zone_blkaddr(sbi, fio->new_blkaddr)) {
+		bio_get(io->bio);
+		reinit_completion(&io->zone_wait);
+		io->bi_private = io->bio->bi_private;
+		io->bio->bi_private = io;
+		io->bio->bi_end_io = f2fs_zone_write_end_io;
+		io->zone_pending_bio = io->bio;
+		__submit_merged_bio(io);
+	}
+#endif
 	if (is_sbi_flag_set(sbi, SBI_IS_SHUTDOWN) ||
 				!f2fs_is_checkpoint_ready(sbi))
 		__submit_merged_bio(io);
@@ -1109,6 +1167,9 @@ static int f2fs_submit_page_read(struct inode *inode, struct page *page,
 	f2fs_wait_on_block_writeback(inode, blkaddr);
 
 	if (bio_add_page(bio, page, PAGE_SIZE, 0) < PAGE_SIZE) {
+		iostat_update_and_unbind_ctx(bio);
+		if (bio->bi_private)
+			mempool_free(bio->bi_private, bio_post_read_ctx_pool);
 		bio_put(bio);
 		return -EFAULT;
 	}
@@ -1331,18 +1392,14 @@ struct page *f2fs_get_lock_data_page(struct inode *inode, pgoff_t index,
 {
 	struct address_space *mapping = inode->i_mapping;
 	struct page *page;
-repeat:
+
 	page = f2fs_get_read_data_page(inode, index, 0, for_write, NULL);
 	if (IS_ERR(page))
 		return page;
 
 	/* wait for read completion */
 	lock_page(page);
-	if (unlikely(page->mapping != mapping)) {
-		f2fs_put_page(page, 1);
-		goto repeat;
-	}
-	if (unlikely(!PageUptodate(page))) {
+	if (unlikely(page->mapping != mapping || !PageUptodate(page))) {
 		f2fs_put_page(page, 1);
 		return ERR_PTR(-EIO);
 	}
@@ -1633,9 +1690,7 @@ next_block:
 			map->m_flags |= F2FS_MAP_NEW;
 	} else if (is_hole) {
 		if (f2fs_compressed_file(inode) &&
-		    f2fs_sanity_check_cluster(&dn) &&
-		    (flag != F2FS_GET_BLOCK_FIEMAP ||
-		     IS_ENABLED(CONFIG_F2FS_CHECK_FS))) {
+		    f2fs_sanity_check_cluster(&dn)) {
 			err = -EFSCORRUPTED;
 			f2fs_handle_error(sbi,
 					ERROR_CORRUPTED_CLUSTER);
@@ -2173,7 +2228,6 @@ submit_and_realloc:
 	f2fs_update_iostat(F2FS_I_SB(inode), NULL, FS_DATA_READ_IO,
 							F2FS_BLKSIZE);
 	*last_block_in_bio = block_nr;
-	goto out;
 out:
 	*bio_ret = bio;
 	return ret;
@@ -2288,8 +2342,10 @@ skip_reading_dnode:
 		f2fs_wait_on_block_writeback(inode, blkaddr);
 
 		if (f2fs_load_compressed_page(sbi, page, blkaddr)) {
-			if (atomic_dec_and_test(&dic->remaining_pages))
+			if (atomic_dec_and_test(&dic->remaining_pages)) {
 				f2fs_decompress_cluster(dic, true);
+				break;
+			}
 			continue;
 		}
 
@@ -2609,6 +2665,11 @@ bool f2fs_should_update_outplace(struct inode *inode, struct f2fs_io_info *fio)
 		return true;
 	if (f2fs_is_atomic_file(inode))
 		return true;
+	/* rewrite low ratio compress data w/ OPU mode to avoid fragmentation */
+	if (f2fs_compressed_file(inode) &&
+		F2FS_OPTION(sbi).compress_mode == COMPR_MODE_USER &&
+		is_inode_flag_set(inode, FI_ENABLE_COMPRESS))
+		return true;
 
 	/* swap file is migrating in aligned write mode */
 	if (is_inode_flag_set(inode, FI_ALIGNED_WRITE))
@@ -2775,6 +2836,7 @@ int f2fs_write_single_data_page(struct page *page, int *submitted,
 	loff_t psize = (loff_t)(page->index + 1) << PAGE_SHIFT;
 	unsigned offset = 0;
 	bool need_balance_fs = false;
+	bool quota_inode = IS_NOQUOTA(inode);
 	int err = 0;
 	struct f2fs_io_info fio = {
 		.sbi = sbi,
@@ -2807,6 +2869,10 @@ int f2fs_write_single_data_page(struct page *page, int *submitted,
 		if (S_ISDIR(inode->i_mode) &&
 				!is_sbi_flag_set(sbi, SBI_IS_CLOSE))
 			goto redirty_out;
+
+		/* keep data pages in remount-ro mode */
+		if (F2FS_OPTION(sbi).errors == MOUNT_ERRORS_READONLY)
+			goto redirty_out;
 		goto out;
 	}
 
@@ -2832,19 +2898,19 @@ write:
 		goto out;
 
 	/* Dentry/quota blocks are controlled by checkpoint */
-	if (S_ISDIR(inode->i_mode) || IS_NOQUOTA(inode)) {
+	if (S_ISDIR(inode->i_mode) || quota_inode) {
 		/*
 		 * We need to wait for node_write to avoid block allocation during
 		 * checkpoint. This can only happen to quota writes which can cause
 		 * the below discard race condition.
 		 */
-		if (IS_NOQUOTA(inode))
+		if (quota_inode)
 			f2fs_down_read(&sbi->node_write);
 
 		fio.need_lock = LOCK_DONE;
 		err = f2fs_do_write_data_page(&fio);
 
-		if (IS_NOQUOTA(inode))
+		if (quota_inode)
 			f2fs_up_read(&sbi->node_write);
 
 		goto done;
@@ -2962,7 +3028,8 @@ static int f2fs_write_cache_pages(struct address_space *mapping,
 {
 	int ret = 0;
 	int done = 0, retry = 0;
-	struct page *pages[F2FS_ONSTACK_PAGES];
+	struct page *pages_local[F2FS_ONSTACK_PAGES];
+	struct page **pages = pages_local;
 	struct folio_batch fbatch;
 	struct f2fs_sb_info *sbi = F2FS_M_SB(mapping);
 	struct bio *bio = NULL;
@@ -2986,6 +3053,7 @@ static int f2fs_write_cache_pages(struct address_space *mapping,
 #endif
 	int nr_folios, p, idx;
 	int nr_pages;
+	unsigned int max_pages = F2FS_ONSTACK_PAGES;
 	pgoff_t index;
 	pgoff_t end;		/* Inclusive */
 	pgoff_t done_index;
@@ -2994,6 +3062,15 @@ static int f2fs_write_cache_pages(struct address_space *mapping,
 	int nwritten = 0;
 	int submitted = 0;
 	int i;
+
+#ifdef CONFIG_F2FS_FS_COMPRESSION
+	if (f2fs_compressed_file(inode) &&
+		1 << cc.log_cluster_size > F2FS_ONSTACK_PAGES) {
+		pages = f2fs_kzalloc(sbi, sizeof(struct page *) <<
+				cc.log_cluster_size, GFP_NOFS | __GFP_NOFAIL);
+		max_pages = 1 << cc.log_cluster_size;
+	}
+#endif
 
 	folio_batch_init(&fbatch);
 
@@ -3040,7 +3117,7 @@ again:
 add_more:
 			pages[nr_pages] = folio_page(folio, idx);
 			folio_get(folio);
-			if (++nr_pages == F2FS_ONSTACK_PAGES) {
+			if (++nr_pages == max_pages) {
 				index = folio->index + idx + 1;
 				folio_batch_release(&fbatch);
 				goto write;
@@ -3174,8 +3251,7 @@ result:
 					}
 					goto next;
 				}
-				done_index = folio->index +
-					folio_nr_pages(folio);
+				done_index = folio_next_index(folio);
 				done = 1;
 				break;
 			}
@@ -3222,6 +3298,11 @@ next:
 	/* submit cached bio of IPU write */
 	if (bio)
 		f2fs_submit_merged_ipu_write(sbi, &bio, NULL);
+
+#ifdef CONFIG_F2FS_FS_COMPRESSION
+	if (pages != pages_local)
+		kfree(pages);
+#endif
 
 	return ret;
 }
@@ -3995,7 +4076,7 @@ next:
 	sis->highest_bit = cur_lblock - 1;
 out:
 	if (not_aligned)
-		f2fs_warn(sbi, "Swapfile (%u) is not align to section: 1) creat(), 2) ioctl(F2FS_IOC_SET_PIN_FILE), 3) fallocate(%u * N)",
+		f2fs_warn(sbi, "Swapfile (%u) is not align to section: 1) creat(), 2) ioctl(F2FS_IOC_SET_PIN_FILE), 3) fallocate(%lu * N)",
 			  not_aligned, blks_per_sec * F2FS_BLKSIZE);
 	return ret;
 }
@@ -4067,7 +4148,6 @@ const struct address_space_operations f2fs_dblock_aops = {
 	.migrate_folio	= filemap_migrate_folio,
 	.invalidate_folio = f2fs_invalidate_folio,
 	.release_folio	= f2fs_release_folio,
-	.direct_IO	= noop_direct_IO,
 	.bmap		= f2fs_bmap,
 	.swap_activate  = f2fs_swap_activate,
 	.swap_deactivate = f2fs_swap_deactivate,

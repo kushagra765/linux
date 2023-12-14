@@ -96,12 +96,7 @@ static void ice_gnss_read(struct kthread_work *work)
 	int err = 0;
 
 	pf = gnss->back;
-	if (!pf) {
-		err = -EFAULT;
-		goto exit;
-	}
-
-	if (!test_bit(ICE_FLAG_GNSS, pf->flags))
+	if (!pf || !test_bit(ICE_FLAG_GNSS, pf->flags))
 		return;
 
 	hw = &pf->hw;
@@ -159,7 +154,6 @@ free_buf:
 	free_page((unsigned long)buf);
 requeue:
 	kthread_queue_delayed_work(gnss->kworker, &gnss->read_work, delay);
-exit:
 	if (err)
 		dev_dbg(ice_pf_to_dev(pf), "GNSS failed to read err=%d\n", err);
 }
@@ -393,6 +387,9 @@ void ice_gnss_exit(struct ice_pf *pf)
 bool ice_gnss_is_gps_present(struct ice_hw *hw)
 {
 	if (!hw->func_caps.ts_func_info.src_tmr_owned)
+		return false;
+
+	if (!ice_is_gps_in_netlist(hw))
 		return false;
 
 #if IS_ENABLED(CONFIG_PTP_1588_CLOCK)

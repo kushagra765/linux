@@ -95,6 +95,7 @@ static const struct x86_i2c_client_info lenovo_yb1_x90_i2c_clients[] __initconst
 			.index = 56,
 			.trigger = ACPI_EDGE_SENSITIVE,
 			.polarity = ACPI_ACTIVE_LOW,
+			.con_id = "goodix_ts_irq",
 		},
 	}, {
 		/* Wacom Digitizer in keyboard half */
@@ -111,6 +112,7 @@ static const struct x86_i2c_client_info lenovo_yb1_x90_i2c_clients[] __initconst
 			.index = 49,
 			.trigger = ACPI_LEVEL_SENSITIVE,
 			.polarity = ACPI_ACTIVE_LOW,
+			.con_id = "wacom_irq",
 		},
 	}, {
 		/* LP8557 Backlight controller */
@@ -136,6 +138,7 @@ static const struct x86_i2c_client_info lenovo_yb1_x90_i2c_clients[] __initconst
 			.index = 77,
 			.trigger = ACPI_LEVEL_SENSITIVE,
 			.polarity = ACPI_ACTIVE_LOW,
+			.con_id = "hideep_ts_irq",
 		},
 	},
 };
@@ -145,6 +148,32 @@ static const struct platform_device_info lenovo_yb1_x90_pdevs[] __initconst = {
 		.name = "yogabook-touch-kbd-digitizer-switch",
 		.id = PLATFORM_DEVID_NONE,
 	},
+};
+
+/*
+ * DSDT says UART path is "\\_SB.PCIO.URT1" with a letter 'O' instead of
+ * the number '0' add the link manually.
+ */
+static const struct x86_serdev_info lenovo_yb1_x90_serdevs[] __initconst = {
+	{
+		.ctrl_hid = "8086228A",
+		.ctrl_uid = "1",
+		.ctrl_devname = "serial0",
+		.serdev_hid = "BCM2E1A",
+	},
+};
+
+static const struct x86_gpio_button lenovo_yb1_x90_lid __initconst = {
+	.button = {
+		.code = SW_LID,
+		.active_low = true,
+		.desc = "lid_sw",
+		.type = EV_SW,
+		.wakeup = true,
+		.debounce_interval = 50,
+	},
+	.chip = "INT33FF:02",
+	.pin = 19,
 };
 
 static struct gpiod_lookup_table lenovo_yb1_x90_goodix_gpios = {
@@ -203,6 +232,10 @@ const struct x86_dev_info lenovo_yogabook_x90_info __initconst = {
 	.i2c_client_count = ARRAY_SIZE(lenovo_yb1_x90_i2c_clients),
 	.pdev_info = lenovo_yb1_x90_pdevs,
 	.pdev_count = ARRAY_SIZE(lenovo_yb1_x90_pdevs),
+	.serdev_info = lenovo_yb1_x90_serdevs,
+	.serdev_count = ARRAY_SIZE(lenovo_yb1_x90_serdevs),
+	.gpio_button = &lenovo_yb1_x90_lid,
+	.gpio_button_count = 1,
 	.gpiod_lookup_tables = lenovo_yb1_x90_gpios,
 	.init = lenovo_yb1_x90_init,
 };
@@ -239,7 +272,7 @@ static const struct software_node lenovo_yoga_tab2_830_1050_bq24190_node = {
 	.properties = lenovo_yoga_tab2_830_1050_bq24190_props,
 };
 
-static struct x86_gpio_button lenovo_yoga_tab2_830_1050_lid = {
+static const struct x86_gpio_button lenovo_yoga_tab2_830_1050_lid __initconst = {
 	.button = {
 		.code = SW_LID,
 		.active_low = true,
@@ -268,6 +301,14 @@ static struct x86_i2c_client_info lenovo_yoga_tab2_830_1050_i2c_clients[] __init
 		},
 		.adapter_path = "\\_SB_.I2C5",
 	}, {
+		/* AL3320A ambient light sensor */
+		.board_info = {
+			.type = "al3320a",
+			.addr = 0x1c,
+			.dev_name = "al3320a",
+		},
+		.adapter_path = "\\_SB_.I2C5",
+	}, {
 		/* bq24292i battery charger */
 		.board_info = {
 			.type = "bq24190",
@@ -283,6 +324,7 @@ static struct x86_i2c_client_info lenovo_yoga_tab2_830_1050_i2c_clients[] __init
 			.index = 2,
 			.trigger = ACPI_EDGE_SENSITIVE,
 			.polarity = ACPI_ACTIVE_HIGH,
+			.con_id = "bq24292i_irq",
 		},
 	}, {
 		/* BQ27541 fuel-gauge */
@@ -357,6 +399,7 @@ const struct x86_dev_info lenovo_yoga_tab2_830_1050_info __initconst = {
 	.pdev_info = int3496_pdevs,
 	.pdev_count = 1,
 	.gpio_button = &lenovo_yoga_tab2_830_1050_lid,
+	.gpio_button_count = 1,
 	.gpiod_lookup_tables = lenovo_yoga_tab2_830_1050_gpios,
 	.bat_swnode = &generic_lipo_hv_4v35_battery_node,
 	.modules = bq24190_modules,
@@ -392,7 +435,8 @@ static int __init lenovo_yoga_tab2_830_1050_init_touchscreen(void)
 	int ret;
 
 	/* Use PMIC GPIO 10 bootstrap pin to differentiate 830 vs 1050 */
-	ret = x86_android_tablet_get_gpiod("gpio_crystalcove", 10, &gpiod);
+	ret = x86_android_tablet_get_gpiod("gpio_crystalcove", 10, "yoga_bootstrap",
+					   false, GPIOD_ASIS, &gpiod);
 	if (ret)
 		return ret;
 
@@ -521,7 +565,6 @@ static const struct software_node fg_bq25890_1_supply_node = {
 /* bq25892 charger settings for the flat lipo battery behind the screen */
 static const struct property_entry lenovo_yt3_bq25892_0_props[] = {
 	PROPERTY_ENTRY_STRING_ARRAY("supplied-from", lenovo_yt3_bq25892_0_suppliers),
-	PROPERTY_ENTRY_STRING("linux,power-supply-name", "bq25892-second-chrg"),
 	PROPERTY_ENTRY_U32("linux,iinlim-percentage", 40),
 	PROPERTY_ENTRY_BOOL("linux,skip-reset"),
 	/* Values taken from Android Factory Image */
@@ -576,6 +619,7 @@ static const struct x86_i2c_client_info lenovo_yt3_i2c_clients[] __initconst = {
 			.index = 5,
 			.trigger = ACPI_EDGE_SENSITIVE,
 			.polarity = ACPI_ACTIVE_LOW,
+			.con_id = "bq25892_0_irq",
 		},
 	}, {
 		/* bq27500 fuel-gauge for the round li-ion cells in the hinge */
@@ -601,6 +645,7 @@ static const struct x86_i2c_client_info lenovo_yt3_i2c_clients[] __initconst = {
 			.index = 77,
 			.trigger = ACPI_LEVEL_SENSITIVE,
 			.polarity = ACPI_ACTIVE_LOW,
+			.con_id = "hideep_ts_irq",
 		},
 	}, {
 		/* LP8557 Backlight controller */
@@ -616,7 +661,6 @@ static const struct x86_i2c_client_info lenovo_yt3_i2c_clients[] __initconst = {
 
 static int __init lenovo_yt3_init(void)
 {
-	struct gpio_desc *gpiod;
 	int ret;
 
 	/*
@@ -626,30 +670,22 @@ static int __init lenovo_yt3_init(void)
 	 *
 	 * The bq25890_charger driver controls these through I2C, but this only
 	 * works if not overridden by the pins. Set these pins here:
-	 * 1. Set /CE to 0 to allow charging.
+	 * 1. Set /CE to 1 to allow charging.
 	 * 2. Set OTG to 0 disable V5 boost output since the 5V boost output of
 	 *    the main "bq25892_1" charger is used when necessary.
 	 */
 
 	/* /CE pin */
-	ret = x86_android_tablet_get_gpiod("INT33FF:02", 22, &gpiod);
+	ret = x86_android_tablet_get_gpiod("INT33FF:02", 22, "bq25892_0_ce",
+					   true, GPIOD_OUT_HIGH, NULL);
 	if (ret < 0)
 		return ret;
-
-	/*
-	 * The gpio_desc returned by x86_android_tablet_get_gpiod() is a "raw"
-	 * gpio_desc, that is there is no way to pass lookup-flags like
-	 * GPIO_ACTIVE_LOW. Set the GPIO to 0 here to enable charging since
-	 * the /CE pin is active-low, but not marked as such in the gpio_desc.
-	 */
-	gpiod_set_value(gpiod, 0);
 
 	/* OTG pin */
-	ret = x86_android_tablet_get_gpiod("INT33FF:03", 19, &gpiod);
+	ret = x86_android_tablet_get_gpiod("INT33FF:03", 19, "bq25892_0_otg",
+					   false, GPIOD_OUT_LOW, NULL);
 	if (ret < 0)
 		return ret;
-
-	gpiod_set_value(gpiod, 0);
 
 	/* Enable the regulators used by the touchscreen */
 	intel_soc_pmic_exec_mipi_pmic_seq_element(0x6e, 0x9b, 0x02, 0xff);

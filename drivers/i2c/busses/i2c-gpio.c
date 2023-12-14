@@ -263,15 +263,10 @@ static void i2c_gpio_fault_injector_init(struct platform_device *pdev)
 	 * 'fault-injector' dir there. Until then, we have a global dir with
 	 * all adapters as subdirs.
 	 */
-	if (!i2c_gpio_debug_dir) {
+	if (!i2c_gpio_debug_dir)
 		i2c_gpio_debug_dir = debugfs_create_dir("i2c-fault-injector", NULL);
-		if (!i2c_gpio_debug_dir)
-			return;
-	}
 
 	priv->debug_dir = debugfs_create_dir(pdev->name, i2c_gpio_debug_dir);
-	if (!priv->debug_dir)
-		return;
 
 	init_completion(&priv->scl_irq_completion);
 
@@ -475,7 +470,7 @@ static int i2c_gpio_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int i2c_gpio_remove(struct platform_device *pdev)
+static void i2c_gpio_remove(struct platform_device *pdev)
 {
 	struct i2c_gpio_private_data *priv;
 	struct i2c_adapter *adap;
@@ -486,8 +481,6 @@ static int i2c_gpio_remove(struct platform_device *pdev)
 	adap = &priv->adap;
 
 	i2c_del_adapter(adap);
-
-	return 0;
 }
 
 static const struct of_device_id i2c_gpio_dt_ids[] = {
@@ -510,7 +503,7 @@ static struct platform_driver i2c_gpio_driver = {
 		.acpi_match_table = i2c_gpio_acpi_match,
 	},
 	.probe		= i2c_gpio_probe,
-	.remove		= i2c_gpio_remove,
+	.remove_new	= i2c_gpio_remove,
 };
 
 static int __init i2c_gpio_init(void)
