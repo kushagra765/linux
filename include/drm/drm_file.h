@@ -45,6 +45,8 @@ struct drm_printer;
 struct device;
 struct file;
 
+extern struct xarray drm_minors_xa;
+
 /*
  * FIXME: Not sure we want to have drm_minor here in the end, but to avoid
  * header include loops we need it here for now.
@@ -227,6 +229,18 @@ struct drm_file {
 	bool is_master;
 
 	/**
+	 * @supports_virtualized_cursor_plane:
+	 *
+	 * This client is capable of handling the cursor plane with the
+	 * restrictions imposed on it by the virtualized drivers.
+	 *
+	 * This implies that the cursor plane has to behave like a cursor
+	 * i.e. track cursor movement. It also requires setting of the
+	 * hotspot properties by the client on the cursor plane.
+	 */
+	bool supports_virtualized_cursor_plane;
+
+	/**
 	 * @master:
 	 *
 	 * Master this node is currently associated with. Protected by struct
@@ -375,10 +389,17 @@ struct drm_file {
 	 */
 	struct drm_prime_file_private prime;
 
-	/* private: */
-#if IS_ENABLED(CONFIG_DRM_LEGACY)
-	unsigned long lock_count; /* DRI1 legacy lock count */
-#endif
+	/**
+	 * @client_name:
+	 *
+	 * Userspace-provided name; useful for accounting and debugging.
+	 */
+	const char *client_name;
+
+	/**
+	 * @client_name_lock: Protects @client_name.
+	 */
+	struct mutex client_name_lock;
 };
 
 /**
@@ -426,6 +447,9 @@ static inline bool drm_is_accel_client(const struct drm_file *file_priv)
 }
 
 void drm_file_update_pid(struct drm_file *);
+
+struct drm_minor *drm_minor_acquire(struct xarray *minors_xa, unsigned int minor_id);
+void drm_minor_release(struct drm_minor *minor);
 
 int drm_open(struct inode *inode, struct file *filp);
 int drm_open_helper(struct file *filp, struct drm_minor *minor);

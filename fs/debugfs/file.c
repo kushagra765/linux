@@ -100,8 +100,16 @@ int debugfs_file_get(struct dentry *dentry)
 		if (!fsd)
 			return -ENOMEM;
 
-		fsd->real_fops = (void *)((unsigned long)d_fsd &
-					~DEBUGFS_FSDATA_IS_REAL_FOPS_BIT);
+		if ((unsigned long)d_fsd & DEBUGFS_FSDATA_IS_SHORT_FOPS_BIT) {
+			fsd->real_fops = NULL;
+			fsd->short_fops = (void *)((unsigned long)d_fsd &
+						~(DEBUGFS_FSDATA_IS_REAL_FOPS_BIT |
+						  DEBUGFS_FSDATA_IS_SHORT_FOPS_BIT));
+		} else {
+			fsd->real_fops = (void *)((unsigned long)d_fsd &
+						~DEBUGFS_FSDATA_IS_REAL_FOPS_BIT);
+			fsd->short_fops = NULL;
+		}
 		refcount_set(&fsd->active_users, 1);
 		init_completion(&fsd->active_users_drained);
 		INIT_LIST_HEAD(&fsd->cancellations);
@@ -241,9 +249,10 @@ static int debugfs_locked_down(struct inode *inode,
 {
 	if ((inode->i_mode & 07777 & ~0444) == 0 &&
 	    !(filp->f_mode & FMODE_WRITE) &&
-	    !real_fops->unlocked_ioctl &&
-	    !real_fops->compat_ioctl &&
-	    !real_fops->mmap)
+	    (!real_fops ||
+	     (!real_fops->unlocked_ioctl &&
+	      !real_fops->compat_ioctl &&
+	      !real_fops->mmap)))
 		return 0;
 
 	if (security_locked_down(LOCKDOWN_DEBUGFS))
@@ -316,19 +325,38 @@ static ret_type full_proxy_ ## name(proto)				\
 	return r;							\
 }
 
-FULL_PROXY_FUNC(llseek, loff_t, filp,
-		PROTO(struct file *filp, loff_t offset, int whence),
-		ARGS(filp, offset, whence));
+#define FULL_PROXY_FUNC_BOTH(name, ret_type, filp, proto, args)		\
+static ret_type full_proxy_ ## name(proto)				\
+{									\
+	struct dentry *dentry = F_DENTRY(filp);				\
+	struct debugfs_fsdata *fsd;					\
+	ret_type r;							\
+									\
+	r = debugfs_file_get(dentry);					\
+	if (unlikely(r))						\
+		return r;						\
+	fsd = dentry->d_fsdata;						\
+	if (fsd->real_fops)						\
+		r = fsd->real_fops->name(args);				\
+	else								\
+		r = fsd->short_fops->name(args);			\
+	debugfs_file_put(dentry);					\
+	return r;							\
+}
 
-FULL_PROXY_FUNC(read, ssize_t, filp,
-		PROTO(struct file *filp, char __user *buf, size_t size,
-			loff_t *ppos),
-		ARGS(filp, buf, size, ppos));
+FULL_PROXY_FUNC_BOTH(llseek, loff_t, filp,
+		     PROTO(struct file *filp, loff_t offset, int whence),
+		     ARGS(filp, offset, whence));
 
-FULL_PROXY_FUNC(write, ssize_t, filp,
-		PROTO(struct file *filp, const char __user *buf, size_t size,
-			loff_t *ppos),
-		ARGS(filp, buf, size, ppos));
+FULL_PROXY_FUNC_BOTH(read, ssize_t, filp,
+		     PROTO(struct file *filp, char __user *buf, size_t size,
+			   loff_t *ppos),
+		     ARGS(filp, buf, size, ppos));
+
+FULL_PROXY_FUNC_BOTH(write, ssize_t, filp,
+		     PROTO(struct file *filp, const char __user *buf,
+			   size_t size, loff_t *ppos),
+		     ARGS(filp, buf, size, ppos));
 
 FULL_PROXY_FUNC(unlocked_ioctl, long, filp,
 		PROTO(struct file *filp, unsigned int cmd, unsigned long arg),
@@ -363,7 +391,7 @@ static int full_proxy_release(struct inode *inode, struct file *filp)
 	 * not to leak any resources. Releasers must not assume that
 	 * ->i_private is still being meaningful here.
 	 */
-	if (real_fops->release)
+	if (real_fops && real_fops->release)
 		r = real_fops->release(inode, filp);
 
 	replace_fops(filp, d_inode(dentry)->i_fop);
@@ -373,39 +401,48 @@ static int full_proxy_release(struct inode *inode, struct file *filp)
 }
 
 static void __full_proxy_fops_init(struct file_operations *proxy_fops,
-				const struct file_operations *real_fops)
+				   struct debugfs_fsdata *fsd)
 {
 	proxy_fops->release = full_proxy_release;
-	if (real_fops->llseek)
+
+	if ((fsd->real_fops && fsd->real_fops->llseek) ||
+	    (fsd->short_fops && fsd->short_fops->llseek))
 		proxy_fops->llseek = full_proxy_llseek;
-	if (real_fops->read)
+
+	if ((fsd->real_fops && fsd->real_fops->read) ||
+	    (fsd->short_fops && fsd->short_fops->read))
 		proxy_fops->read = full_proxy_read;
-	if (real_fops->write)
+
+	if ((fsd->real_fops && fsd->real_fops->write) ||
+	    (fsd->short_fops && fsd->short_fops->write))
 		proxy_fops->write = full_proxy_write;
-	if (real_fops->poll)
+
+	if (fsd->real_fops && fsd->real_fops->poll)
 		proxy_fops->poll = full_proxy_poll;
-	if (real_fops->unlocked_ioctl)
+
+	if (fsd->real_fops && fsd->real_fops->unlocked_ioctl)
 		proxy_fops->unlocked_ioctl = full_proxy_unlocked_ioctl;
 }
 
 static int full_proxy_open(struct inode *inode, struct file *filp)
 {
 	struct dentry *dentry = F_DENTRY(filp);
-	const struct file_operations *real_fops = NULL;
+	const struct file_operations *real_fops;
 	struct file_operations *proxy_fops = NULL;
+	struct debugfs_fsdata *fsd;
 	int r;
 
 	r = debugfs_file_get(dentry);
 	if (r)
 		return r == -EIO ? -ENOENT : r;
 
-	real_fops = debugfs_real_fops(filp);
-
+	fsd = dentry->d_fsdata;
+	real_fops = fsd->real_fops;
 	r = debugfs_locked_down(inode, filp, real_fops);
 	if (r)
 		goto out;
 
-	if (!fops_get(real_fops)) {
+	if (real_fops && !fops_get(real_fops)) {
 #ifdef CONFIG_MODULES
 		if (real_fops->owner &&
 		    real_fops->owner->state == MODULE_STATE_GOING) {
@@ -426,11 +463,14 @@ static int full_proxy_open(struct inode *inode, struct file *filp)
 		r = -ENOMEM;
 		goto free_proxy;
 	}
-	__full_proxy_fops_init(proxy_fops, real_fops);
+	__full_proxy_fops_init(proxy_fops, fsd);
 	replace_fops(filp, proxy_fops);
 
-	if (real_fops->open) {
-		r = real_fops->open(inode, filp);
+	if (!real_fops || real_fops->open) {
+		if (real_fops)
+			r = real_fops->open(inode, filp);
+		else
+			r = simple_open(inode, filp);
 		if (r) {
 			replace_fops(filp, d_inode(dentry)->i_fop);
 			goto free_proxy;
@@ -1100,17 +1140,35 @@ static ssize_t read_file_blob(struct file *file, char __user *user_buf,
 	return r;
 }
 
+static ssize_t write_file_blob(struct file *file, const char __user *user_buf,
+			       size_t count, loff_t *ppos)
+{
+	struct debugfs_blob_wrapper *blob = file->private_data;
+	struct dentry *dentry = F_DENTRY(file);
+	ssize_t r;
+
+	r = debugfs_file_get(dentry);
+	if (unlikely(r))
+		return r;
+	r = simple_write_to_buffer(blob->data, blob->size, ppos, user_buf,
+				   count);
+
+	debugfs_file_put(dentry);
+	return r;
+}
+
 static const struct file_operations fops_blob = {
 	.read =		read_file_blob,
+	.write =	write_file_blob,
 	.open =		simple_open,
 	.llseek =	default_llseek,
 };
 
 /**
- * debugfs_create_blob - create a debugfs file that is used to read a binary blob
+ * debugfs_create_blob - create a debugfs file that is used to read and write
+ * a binary blob
  * @name: a pointer to a string containing the name of the file to create.
- * @mode: the read permission that the file should have (other permissions are
- *	  masked out)
+ * @mode: the permission that the file should have
  * @parent: a pointer to the parent dentry for this file.  This should be a
  *          directory dentry if set.  If this parameter is %NULL, then the
  *          file will be created in the root of the debugfs filesystem.
@@ -1119,7 +1177,7 @@ static const struct file_operations fops_blob = {
  *
  * This function creates a file in debugfs with the given name that exports
  * @blob->data as a binary blob. If the @mode variable is so set it can be
- * read from. Writing is not supported.
+ * read from and written to.
  *
  * This function will return a pointer to a dentry if it succeeds.  This
  * pointer must be passed to the debugfs_remove() function when the file is
@@ -1134,7 +1192,7 @@ struct dentry *debugfs_create_blob(const char *name, umode_t mode,
 				   struct dentry *parent,
 				   struct debugfs_blob_wrapper *blob)
 {
-	return debugfs_create_file_unsafe(name, mode & 0444, parent, blob, &fops_blob);
+	return debugfs_create_file_unsafe(name, mode & 0644, parent, blob, &fops_blob);
 }
 EXPORT_SYMBOL_GPL(debugfs_create_blob);
 
@@ -1200,7 +1258,6 @@ static const struct file_operations u32_array_fops = {
 	.open	 = u32_array_open,
 	.release = u32_array_release,
 	.read	 = u32_array_read,
-	.llseek  = no_llseek,
 };
 
 /**

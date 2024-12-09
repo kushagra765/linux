@@ -196,7 +196,7 @@ static int int0002_probe(struct platform_device *pdev)
 	 * IRQs into gpiolib.
 	 */
 	ret = devm_request_irq(dev, irq, int0002_irq,
-			       IRQF_SHARED, "INT0002", chip);
+			       IRQF_ONESHOT | IRQF_SHARED, "INT0002", chip);
 	if (ret) {
 		dev_err(dev, "Error requesting IRQ %d: %d\n", irq, ret);
 		return ret;
@@ -266,13 +266,13 @@ static const struct acpi_device_id int0002_acpi_ids[] = {
 MODULE_DEVICE_TABLE(acpi, int0002_acpi_ids);
 
 static struct platform_driver int0002_driver = {
-	.driver = {
+	.driver	= {
 		.name			= DRV_NAME,
 		.acpi_match_table	= int0002_acpi_ids,
 		.pm			= &int0002_pm_ops,
 	},
 	.probe	= int0002_probe,
-	.remove_new = int0002_remove,
+	.remove	= int0002_remove,
 };
 
 module_platform_driver(int0002_driver);

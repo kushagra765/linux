@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause */
 /*
- * Copyright (C) 2005-2014, 2018-2023 Intel Corporation
+ * Copyright (C) 2005-2014, 2018-2024 Intel Corporation
  * Copyright (C) 2013-2014 Intel Mobile Communications GmbH
  * Copyright (C) 2016 Intel Deutschland GmbH
  */
@@ -304,9 +304,7 @@
 #define CSR_HW_RFID_IS_CDB(_val)       (((_val) & 0x10000000) >> 28)
 #define CSR_HW_RFID_IS_JACKET(_val)    (((_val) & 0x20000000) >> 29)
 
-/**
- *  hw_rev values
- */
+/* hw_rev values */
 enum {
 	SILICON_A_STEP = 0,
 	SILICON_B_STEP,
@@ -354,6 +352,8 @@ enum {
 #define CSR_HW_RF_ID_TYPE_GF		(0x0010D000)
 #define CSR_HW_RF_ID_TYPE_GF4		(0x0010E000)
 #define CSR_HW_RF_ID_TYPE_MS		(0x00111000)
+#define CSR_HW_RF_ID_TYPE_FM		(0x00112000)
+#define CSR_HW_RF_ID_TYPE_WP		(0x00113000)
 
 /* HW_RF CHIP STEP  */
 #define CSR_HW_RF_STEP(_val) (((_val) >> 8) & 0xF)

@@ -3,6 +3,7 @@
 #include "bcachefs.h"
 #include "btree_key_cache.h"
 #include "btree_update.h"
+#include "btree_write_buffer.h"
 #include "buckets.h"
 #include "errcode.h"
 #include "error.h"
@@ -50,17 +51,23 @@ unsigned bch2_journal_dev_buckets_available(struct journal *j,
 	return available;
 }
 
-static inline void journal_set_watermark(struct journal *j, bool low_on_space)
+void bch2_journal_set_watermark(struct journal *j)
 {
-	unsigned watermark = BCH_WATERMARK_stripe;
+	struct bch_fs *c = container_of(j, struct bch_fs, journal);
+	bool low_on_space = j->space[journal_space_clean].total * 4 <=
+		j->space[journal_space_total].total;
+	bool low_on_pin = fifo_free(&j->pin) < j->pin.size / 4;
+	bool low_on_wb = bch2_btree_write_buffer_must_wait(c);
+	unsigned watermark = low_on_space || low_on_pin || low_on_wb
+		? BCH_WATERMARK_reclaim
+		: BCH_WATERMARK_stripe;
 
-	if (low_on_space)
-		watermark = max_t(unsigned, watermark, BCH_WATERMARK_reclaim);
-	if (fifo_free(&j->pin) < j->pin.size / 4)
-		watermark = max_t(unsigned, watermark, BCH_WATERMARK_reclaim);
+	if (track_event_change(&c->times[BCH_TIME_blocked_journal_low_on_space], low_on_space) ||
+	    track_event_change(&c->times[BCH_TIME_blocked_journal_low_on_pin], low_on_pin) ||
+	    track_event_change(&c->times[BCH_TIME_blocked_write_buffer_full], low_on_wb))
+		trace_and_count(c, journal_full, c);
 
-	if (watermark == j->watermark)
-		return;
+	mod_bit(JOURNAL_space_low, &j->flags, low_on_space || low_on_pin);
 
 	swap(watermark, j->watermark);
 	if (watermark > j->watermark)
@@ -128,15 +135,13 @@ static struct journal_space __journal_space_available(struct journal *j, unsigne
 			    enum journal_space_from from)
 {
 	struct bch_fs *c = container_of(j, struct bch_fs, journal);
-	struct bch_dev *ca;
-	unsigned i, pos, nr_devs = 0;
+	unsigned pos, nr_devs = 0;
 	struct journal_space space, dev_space[BCH_SB_MEMBERS_MAX];
 
 	BUG_ON(nr_devs_want > ARRAY_SIZE(dev_space));
 
 	rcu_read_lock();
-	for_each_member_device_rcu(ca, c, i,
-				   &c->rw_devs[BCH_DATA_journal]) {
+	for_each_member_device_rcu(c, ca, &c->rw_devs[BCH_DATA_journal]) {
 		if (!ca->journal.nr)
 			continue;
 
@@ -165,19 +170,17 @@ static struct journal_space __journal_space_available(struct journal *j, unsigne
 void bch2_journal_space_available(struct journal *j)
 {
 	struct bch_fs *c = container_of(j, struct bch_fs, journal);
-	struct bch_dev *ca;
 	unsigned clean, clean_ondisk, total;
 	unsigned max_entry_size	 = min(j->buf[0].buf_size >> 9,
 				       j->buf[1].buf_size >> 9);
-	unsigned i, nr_online = 0, nr_devs_want;
+	unsigned nr_online = 0, nr_devs_want;
 	bool can_discard = false;
 	int ret = 0;
 
 	lockdep_assert_held(&j->lock);
 
 	rcu_read_lock();
-	for_each_member_device_rcu(ca, c, i,
-				   &c->rw_devs[BCH_DATA_journal]) {
+	for_each_member_device_rcu(c, ca, &c->rw_devs[BCH_DATA_journal]) {
 		struct journal_device *ja = &ca->journal;
 
 		if (!ja->nr)
@@ -201,14 +204,26 @@ void bch2_journal_space_available(struct journal *j)
 
 	j->can_discard = can_discard;
 
-	if (nr_online < c->opts.metadata_replicas_required) {
+	if (nr_online < metadata_replicas_required(c)) {
+		struct printbuf buf = PRINTBUF;
+		buf.atomic++;
+		prt_printf(&buf, "insufficient writeable journal devices available: have %u, need %u\n"
+			   "rw journal devs:", nr_online, metadata_replicas_required(c));
+
+		rcu_read_lock();
+		for_each_member_device_rcu(c, ca, &c->rw_devs[BCH_DATA_journal])
+			prt_printf(&buf, " %s", ca->name);
+		rcu_read_unlock();
+
+		bch_err(c, "%s", buf.buf);
+		printbuf_exit(&buf);
 		ret = JOURNAL_ERR_insufficient_devices;
 		goto out;
 	}
 
 	nr_devs_want = min_t(unsigned, nr_online, c->opts.metadata_replicas);
 
-	for (i = 0; i < journal_space_nr; i++)
+	for (unsigned i = 0; i < journal_space_nr; i++)
 		j->space[i] = __journal_space_available(j, nr_devs_want, i);
 
 	clean_ondisk	= j->space[journal_space_clean_ondisk].total;
@@ -222,11 +237,11 @@ void bch2_journal_space_available(struct journal *j)
 	     j->space[journal_space_clean_ondisk].total) &&
 	    (clean - clean_ondisk <= total / 8) &&
 	    (clean_ondisk * 2 > clean))
-		set_bit(JOURNAL_MAY_SKIP_FLUSH, &j->flags);
+		set_bit(JOURNAL_may_skip_flush, &j->flags);
 	else
-		clear_bit(JOURNAL_MAY_SKIP_FLUSH, &j->flags);
+		clear_bit(JOURNAL_may_skip_flush, &j->flags);
 
-	journal_set_watermark(j, clean * 4 <= total);
+	bch2_journal_set_watermark(j);
 out:
 	j->cur_entry_sectors	= !ret ? j->space[journal_space_discarded].next_entry : 0;
 	j->cur_entry_error	= ret;
@@ -255,12 +270,10 @@ static bool should_discard_bucket(struct journal *j, struct journal_device *ja)
 void bch2_journal_do_discards(struct journal *j)
 {
 	struct bch_fs *c = container_of(j, struct bch_fs, journal);
-	struct bch_dev *ca;
-	unsigned iter;
 
 	mutex_lock(&j->discard_lock);
 
-	for_each_rw_member(ca, c, iter) {
+	for_each_rw_member(c, ca) {
 		struct journal_device *ja = &ca->journal;
 
 		while (should_discard_bucket(j, ja)) {
@@ -299,6 +312,7 @@ void bch2_journal_reclaim_fast(struct journal *j)
 	 * all btree nodes got written out
 	 */
 	while (!fifo_empty(&j->pin) &&
+	       j->pin.front <= j->seq_ondisk &&
 	       !atomic_read(&fifo_peek_front(&j->pin).count)) {
 		j->pin.front++;
 		popped = true;
@@ -367,14 +381,33 @@ static enum journal_pin_type journal_pin_type(journal_pin_flush_fn fn)
 		return JOURNAL_PIN_other;
 }
 
-void bch2_journal_pin_set(struct journal *j, u64 seq,
+static inline void bch2_journal_pin_set_locked(struct journal *j, u64 seq,
 			  struct journal_entry_pin *pin,
-			  journal_pin_flush_fn flush_fn)
+			  journal_pin_flush_fn flush_fn,
+			  enum journal_pin_type type)
 {
-	struct journal_entry_pin_list *pin_list;
-	bool reclaim;
+	struct journal_entry_pin_list *pin_list = journal_seq_pin(j, seq);
 
+	/*
+	 * flush_fn is how we identify journal pins in debugfs, so must always
+	 * exist, even if it doesn't do anything:
+	 */
+	BUG_ON(!flush_fn);
+
+	atomic_inc(&pin_list->count);
+	pin->seq	= seq;
+	pin->flush	= flush_fn;
+	list_add(&pin->list, &pin_list->list[type]);
+}
+
+void bch2_journal_pin_copy(struct journal *j,
+			   struct journal_entry_pin *dst,
+			   struct journal_entry_pin *src,
+			   journal_pin_flush_fn flush_fn)
+{
 	spin_lock(&j->lock);
+
+	u64 seq = READ_ONCE(src->seq);
 
 	if (seq < journal_last_seq(j)) {
 		/*
@@ -387,28 +420,44 @@ void bch2_journal_pin_set(struct journal *j, u64 seq,
 		return;
 	}
 
-	pin_list = journal_seq_pin(j, seq);
+	bool reclaim = __journal_pin_drop(j, dst);
 
-	reclaim = __journal_pin_drop(j, pin);
-
-	atomic_inc(&pin_list->count);
-	pin->seq	= seq;
-	pin->flush	= flush_fn;
-
-	if (flush_fn)
-		list_add(&pin->list, &pin_list->list[journal_pin_type(flush_fn)]);
-	else
-		list_add(&pin->list, &pin_list->flushed);
+	bch2_journal_pin_set_locked(j, seq, dst, flush_fn, journal_pin_type(flush_fn));
 
 	if (reclaim)
 		bch2_journal_reclaim_fast(j);
-	spin_unlock(&j->lock);
 
 	/*
 	 * If the journal is currently full,  we might want to call flush_fn
 	 * immediately:
 	 */
-	journal_wake(j);
+	if (seq == journal_last_seq(j))
+		journal_wake(j);
+	spin_unlock(&j->lock);
+}
+
+void bch2_journal_pin_set(struct journal *j, u64 seq,
+			  struct journal_entry_pin *pin,
+			  journal_pin_flush_fn flush_fn)
+{
+	spin_lock(&j->lock);
+
+	BUG_ON(seq < journal_last_seq(j));
+
+	bool reclaim = __journal_pin_drop(j, pin);
+
+	bch2_journal_pin_set_locked(j, seq, pin, flush_fn, journal_pin_type(flush_fn));
+
+	if (reclaim)
+		bch2_journal_reclaim_fast(j);
+	/*
+	 * If the journal is currently full,  we might want to call flush_fn
+	 * immediately:
+	 */
+	if (seq == journal_last_seq(j))
+		journal_wake(j);
+
+	spin_unlock(&j->lock);
 }
 
 /**
@@ -537,13 +586,11 @@ static size_t journal_flush_pins(struct journal *j,
 static u64 journal_seq_to_flush(struct journal *j)
 {
 	struct bch_fs *c = container_of(j, struct bch_fs, journal);
-	struct bch_dev *ca;
 	u64 seq_to_flush = 0;
-	unsigned iter;
 
 	spin_lock(&j->lock);
 
-	for_each_rw_member(ca, c, iter) {
+	for_each_rw_member(c, ca) {
 		struct journal_device *ja = &ca->journal;
 		unsigned nr_buckets, bucket_to_flush;
 
@@ -594,6 +641,7 @@ static u64 journal_seq_to_flush(struct journal *j)
 static int __bch2_journal_reclaim(struct journal *j, bool direct, bool kicked)
 {
 	struct bch_fs *c = container_of(j, struct bch_fs, journal);
+	struct btree_cache *bc = &c->btree_cache;
 	bool kthread = (current->flags & PF_KTHREAD) != 0;
 	u64 seq_to_flush;
 	size_t min_nr, min_key_cache, nr_flushed;
@@ -634,7 +682,8 @@ static int __bch2_journal_reclaim(struct journal *j, bool direct, bool kicked)
 		if (j->watermark != BCH_WATERMARK_stripe)
 			min_nr = 1;
 
-		if (atomic_read(&c->btree_cache.dirty) * 2 > c->btree_cache.used)
+		size_t btree_cache_live = bc->live[0].nr + bc->live[1].nr;
+		if (atomic_long_read(&bc->nr_dirty) * 2 > btree_cache_live)
 			min_nr = 1;
 
 		min_key_cache = min(bch2_nr_btree_keys_need_flush(c), (size_t) 128);
@@ -642,8 +691,7 @@ static int __bch2_journal_reclaim(struct journal *j, bool direct, bool kicked)
 		trace_and_count(c, journal_reclaim_start, c,
 				direct, kicked,
 				min_nr, min_key_cache,
-				atomic_read(&c->btree_cache.dirty),
-				c->btree_cache.used,
+				atomic_long_read(&bc->nr_dirty), btree_cache_live,
 				atomic_long_read(&c->btree_key_cache.nr_dirty),
 				atomic_long_read(&c->btree_key_cache.nr_keys));
 
@@ -747,10 +795,9 @@ int bch2_journal_reclaim_start(struct journal *j)
 	p = kthread_create(bch2_journal_reclaim_thread, j,
 			   "bch-reclaim/%s", c->name);
 	ret = PTR_ERR_OR_ZERO(p);
-	if (ret) {
-		bch_err_msg(c, ret, "creating journal reclaim thread");
+	bch_err_msg(c, ret, "creating journal reclaim thread");
+	if (ret)
 		return ret;
-	}
 
 	get_task_struct(p);
 	j->reclaim_thread = p;
@@ -784,7 +831,7 @@ static int journal_flush_done(struct journal *j, u64 seq_to_flush,
 	 * If journal replay hasn't completed, the unreplayed journal entries
 	 * hold refs on their corresponding sequence numbers
 	 */
-	ret = !test_bit(JOURNAL_REPLAY_DONE, &j->flags) ||
+	ret = !test_bit(JOURNAL_replay_done, &j->flags) ||
 		journal_last_seq(j) > seq_to_flush ||
 		!fifo_used(&j->pin);
 
@@ -796,9 +843,10 @@ static int journal_flush_done(struct journal *j, u64 seq_to_flush,
 
 bool bch2_journal_flush_pins(struct journal *j, u64 seq_to_flush)
 {
+	/* time_stats this */
 	bool did_work = false;
 
-	if (!test_bit(JOURNAL_STARTED, &j->flags))
+	if (!test_bit(JOURNAL_running, &j->flags))
 		return false;
 
 	closure_wait_event(&j->async_wait,
@@ -854,9 +902,11 @@ int bch2_journal_flush_device_pins(struct journal *j, int dev_idx)
 					 journal_seq_pin(j, seq)->devs);
 		seq++;
 
-		spin_unlock(&j->lock);
-		ret = bch2_mark_replicas(c, &replicas.e);
-		spin_lock(&j->lock);
+		if (replicas.e.nr_devs) {
+			spin_unlock(&j->lock);
+			ret = bch2_mark_replicas(c, &replicas.e);
+			spin_lock(&j->lock);
+		}
 	}
 	spin_unlock(&j->lock);
 err:

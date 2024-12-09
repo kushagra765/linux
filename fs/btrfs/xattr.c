@@ -24,7 +24,7 @@
 #include "accessors.h"
 #include "dir-item.h"
 
-int btrfs_getxattr(struct inode *inode, const char *name,
+int btrfs_getxattr(const struct inode *inode, const char *name,
 				void *buffer, size_t size)
 {
 	struct btrfs_dir_item *di;
@@ -85,7 +85,6 @@ int btrfs_setxattr(struct btrfs_trans_handle *trans, struct inode *inode,
 {
 	struct btrfs_dir_item *di = NULL;
 	struct btrfs_root *root = BTRFS_I(inode)->root;
-	struct btrfs_fs_info *fs_info = root->fs_info;
 	struct btrfs_path *path;
 	size_t name_len = strlen(name);
 	int ret = 0;
@@ -120,7 +119,7 @@ int btrfs_setxattr(struct btrfs_trans_handle *trans, struct inode *inode,
 	 * locks the inode's i_mutex before calling setxattr or removexattr.
 	 */
 	if (flags & XATTR_REPLACE) {
-		ASSERT(inode_is_locked(inode));
+		btrfs_assert_inode_locked(BTRFS_I(inode));
 		di = btrfs_lookup_xattr(NULL, root, path,
 				btrfs_ino(BTRFS_I(inode)), name, name_len, 0);
 		if (!di)
@@ -143,14 +142,14 @@ int btrfs_setxattr(struct btrfs_trans_handle *trans, struct inode *inode,
 		 */
 		ret = 0;
 		btrfs_assert_tree_write_locked(path->nodes[0]);
-		di = btrfs_match_dir_item_name(fs_info, path, name, name_len);
+		di = btrfs_match_dir_item_name(path, name, name_len);
 		if (!di && !(flags & XATTR_REPLACE)) {
 			ret = -ENOSPC;
 			goto out;
 		}
 	} else if (ret == -EEXIST) {
 		ret = 0;
-		di = btrfs_match_dir_item_name(fs_info, path, name, name_len);
+		di = btrfs_match_dir_item_name(path, name, name_len);
 		ASSERT(di); /* logic error */
 	} else if (ret) {
 		goto out;
@@ -382,6 +381,53 @@ static int btrfs_xattr_handler_set(const struct xattr_handler *handler,
 	return btrfs_setxattr_trans(inode, name, buffer, size, flags);
 }
 
+static int btrfs_xattr_handler_get_security(const struct xattr_handler *handler,
+					    struct dentry *unused,
+					    struct inode *inode,
+					    const char *name, void *buffer,
+					    size_t size)
+{
+	int ret;
+	bool is_cap = false;
+
+	name = xattr_full_name(handler, name);
+
+	/*
+	 * security.capability doesn't cache the results, so calls into us
+	 * constantly to see if there's a capability xattr.  Cache the result
+	 * here in order to avoid wasting time doing lookups for xattrs we know
+	 * don't exist.
+	 */
+	if (strcmp(name, XATTR_NAME_CAPS) == 0) {
+		is_cap = true;
+		if (test_bit(BTRFS_INODE_NO_CAP_XATTR, &BTRFS_I(inode)->runtime_flags))
+			return -ENODATA;
+	}
+
+	ret = btrfs_getxattr(inode, name, buffer, size);
+	if (ret == -ENODATA && is_cap)
+		set_bit(BTRFS_INODE_NO_CAP_XATTR, &BTRFS_I(inode)->runtime_flags);
+	return ret;
+}
+
+static int btrfs_xattr_handler_set_security(const struct xattr_handler *handler,
+					    struct mnt_idmap *idmap,
+					    struct dentry *unused,
+					    struct inode *inode,
+					    const char *name,
+					    const void *buffer,
+					    size_t size, int flags)
+{
+	if (btrfs_root_readonly(BTRFS_I(inode)->root))
+		return -EROFS;
+
+	name = xattr_full_name(handler, name);
+	if (strcmp(name, XATTR_NAME_CAPS) == 0)
+		clear_bit(BTRFS_INODE_NO_CAP_XATTR, &BTRFS_I(inode)->runtime_flags);
+
+	return btrfs_setxattr_trans(inode, name, buffer, size, flags);
+}
+
 static int btrfs_xattr_handler_set_prop(const struct xattr_handler *handler,
 					struct mnt_idmap *idmap,
 					struct dentry *unused, struct inode *inode,
@@ -404,7 +450,7 @@ static int btrfs_xattr_handler_set_prop(const struct xattr_handler *handler,
 	if (IS_ERR(trans))
 		return PTR_ERR(trans);
 
-	ret = btrfs_set_prop(trans, inode, name, value, size, flags);
+	ret = btrfs_set_prop(trans, BTRFS_I(inode), name, value, size, flags);
 	if (!ret) {
 		inode_inc_iversion(inode);
 		inode_set_ctime_current(inode);
@@ -420,8 +466,8 @@ static int btrfs_xattr_handler_set_prop(const struct xattr_handler *handler,
 
 static const struct xattr_handler btrfs_security_xattr_handler = {
 	.prefix = XATTR_SECURITY_PREFIX,
-	.get = btrfs_xattr_handler_get,
-	.set = btrfs_xattr_handler_set,
+	.get = btrfs_xattr_handler_get_security,
+	.set = btrfs_xattr_handler_set_security,
 };
 
 static const struct xattr_handler btrfs_trusted_xattr_handler = {
@@ -457,7 +503,7 @@ static int btrfs_initxattrs(struct inode *inode,
 	const struct xattr *xattr;
 	unsigned int nofs_flag;
 	char *name;
-	int err = 0;
+	int ret = 0;
 
 	/*
 	 * We're holding a transaction handle, so use a NOFS memory allocation
@@ -468,19 +514,23 @@ static int btrfs_initxattrs(struct inode *inode,
 		name = kmalloc(XATTR_SECURITY_PREFIX_LEN +
 			       strlen(xattr->name) + 1, GFP_KERNEL);
 		if (!name) {
-			err = -ENOMEM;
+			ret = -ENOMEM;
 			break;
 		}
 		strcpy(name, XATTR_SECURITY_PREFIX);
 		strcpy(name + XATTR_SECURITY_PREFIX_LEN, xattr->name);
-		err = btrfs_setxattr(trans, inode, name, xattr->value,
+
+		if (strcmp(name, XATTR_NAME_CAPS) == 0)
+			clear_bit(BTRFS_INODE_NO_CAP_XATTR, &BTRFS_I(inode)->runtime_flags);
+
+		ret = btrfs_setxattr(trans, inode, name, xattr->value,
 				     xattr->value_len, 0);
 		kfree(name);
-		if (err < 0)
+		if (ret < 0)
 			break;
 	}
 	memalloc_nofs_restore(nofs_flag);
-	return err;
+	return ret;
 }
 
 int btrfs_xattr_security_init(struct btrfs_trans_handle *trans,

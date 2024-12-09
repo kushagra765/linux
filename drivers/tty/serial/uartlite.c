@@ -24,8 +24,13 @@
 #include <linux/pm_runtime.h>
 
 #define ULITE_NAME		"ttyUL"
+#if CONFIG_SERIAL_UARTLITE_NR_UARTS > 4
+#define ULITE_MAJOR             0       /* use dynamic node allocation */
+#define ULITE_MINOR             0
+#else
 #define ULITE_MAJOR		204
 #define ULITE_MINOR		187
+#endif
 #define ULITE_NR_UARTS		CONFIG_SERIAL_UARTLITE_NR_UARTS
 
 /* ---------------------------------------------------------------------
@@ -62,11 +67,11 @@ static struct uart_port *console_port;
 #endif
 
 /**
- * struct uartlite_data: Driver private data
- * reg_ops: Functions to read/write registers
- * clk: Our parent clock, if present
- * baud: The baud rate configured when this device was synthesized
- * cflags: The cflags for parity and data bits
+ * struct uartlite_data - Driver private data
+ * @reg_ops: Functions to read/write registers
+ * @clk: Our parent clock, if present
+ * @baud: The baud rate configured when this device was synthesized
+ * @cflags: The cflags for parity and data bits
  */
 struct uartlite_data {
 	const struct uartlite_reg_ops *reg_ops;
@@ -184,7 +189,8 @@ static int ulite_receive(struct uart_port *port, int stat)
 
 static int ulite_transmit(struct uart_port *port, int stat)
 {
-	struct circ_buf *xmit  = &port->state->xmit;
+	struct tty_port *tport = &port->state->port;
+	unsigned char ch;
 
 	if (stat & ULITE_STATUS_TXFULL)
 		return 0;
@@ -196,14 +202,16 @@ static int ulite_transmit(struct uart_port *port, int stat)
 		return 1;
 	}
 
-	if (uart_circ_empty(xmit) || uart_tx_stopped(port))
+	if (uart_tx_stopped(port))
 		return 0;
 
-	uart_out32(xmit->buf[xmit->tail], ULITE_TX, port);
-	uart_xmit_advance(port, 1);
+	if (!uart_fifo_get(port, &ch))
+		return 0;
+
+	uart_out32(ch, ULITE_TX, port);
 
 	/* wake up */
-	if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
+	if (kfifo_len(&tport->xmit_fifo) < WAKEUP_CHARS)
 		uart_write_wakeup(port);
 
 	return 1;
@@ -890,7 +898,7 @@ of_err:
 	return ret;
 }
 
-static int ulite_remove(struct platform_device *pdev)
+static void ulite_remove(struct platform_device *pdev)
 {
 	struct uart_port *port = dev_get_drvdata(&pdev->dev);
 	struct uartlite_data *pdata = port->private_data;
@@ -900,7 +908,6 @@ static int ulite_remove(struct platform_device *pdev)
 	pm_runtime_disable(&pdev->dev);
 	pm_runtime_set_suspended(&pdev->dev);
 	pm_runtime_dont_use_autosuspend(&pdev->dev);
-	return 0;
 }
 
 /* work with hotplug and coldplug */

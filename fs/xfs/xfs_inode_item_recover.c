@@ -175,7 +175,7 @@ xfs_log_dinode_to_disk(
 	to->di_mode = cpu_to_be16(from->di_mode);
 	to->di_version = from->di_version;
 	to->di_format = from->di_format;
-	to->di_onlink = 0;
+	to->di_metatype = cpu_to_be16(from->di_metatype);
 	to->di_uid = cpu_to_be32(from->di_uid);
 	to->di_gid = cpu_to_be32(from->di_gid);
 	to->di_nlink = cpu_to_be32(from->di_nlink);
@@ -291,7 +291,8 @@ xlog_recover_inode_commit_pass2(
 	if (item->ri_buf[0].i_len == sizeof(struct xfs_inode_log_format)) {
 		in_f = item->ri_buf[0].i_addr;
 	} else {
-		in_f = kmem_alloc(sizeof(struct xfs_inode_log_format), 0);
+		in_f = kmalloc(sizeof(struct xfs_inode_log_format),
+				GFP_KERNEL | __GFP_NOFAIL);
 		need_free = 1;
 		error = xfs_inode_item_format_convert(&item->ri_buf[0], in_f);
 		if (error)
@@ -553,7 +554,7 @@ out_release:
 	xfs_buf_relse(bp);
 error:
 	if (need_free)
-		kmem_free(in_f);
+		kfree(in_f);
 	return error;
 }
 

@@ -4,6 +4,8 @@
 
 #include <linux/iopoll.h>
 
+#include <drm/drm_managed.h>
+
 #include "dpu_hw_mdss.h"
 #include "dpu_hwio.h"
 #include "dpu_hw_catalog.h"
@@ -281,12 +283,23 @@ static int dpu_hw_pp_setup_dsc(struct dpu_hw_pingpong *pp)
 	return 0;
 }
 
-struct dpu_hw_pingpong *dpu_hw_pingpong_init(const struct dpu_pingpong_cfg *cfg,
-		void __iomem *addr, const struct dpu_mdss_version *mdss_rev)
+/**
+ * dpu_hw_pingpong_init() - initializes the pingpong driver for the passed
+ * pingpong catalog entry.
+ * @dev:  Corresponding device for devres management
+ * @cfg:  Pingpong catalog entry for which driver object is required
+ * @addr: Mapped register io address of MDP
+ * @mdss_rev: dpu core's major and minor versions
+ * Return: Error code or allocated dpu_hw_pingpong context
+ */
+struct dpu_hw_pingpong *dpu_hw_pingpong_init(struct drm_device *dev,
+					     const struct dpu_pingpong_cfg *cfg,
+					     void __iomem *addr,
+					     const struct dpu_mdss_version *mdss_rev)
 {
 	struct dpu_hw_pingpong *c;
 
-	c = kzalloc(sizeof(*c), GFP_KERNEL);
+	c = drmm_kzalloc(dev, sizeof(*c), GFP_KERNEL);
 	if (!c)
 		return ERR_PTR(-ENOMEM);
 
@@ -316,9 +329,4 @@ struct dpu_hw_pingpong *dpu_hw_pingpong_init(const struct dpu_pingpong_cfg *cfg,
 		c->ops.setup_dither = dpu_hw_pp_setup_dither;
 
 	return c;
-}
-
-void dpu_hw_pingpong_destroy(struct dpu_hw_pingpong *pp)
-{
-	kfree(pp);
 }

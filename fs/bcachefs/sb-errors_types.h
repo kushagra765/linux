@@ -13,4 +13,3 @@ struct bch_sb_error_entry_cpu {
 typedef DARRAY(struct bch_sb_error_entry_cpu) bch_sb_errors_cpu;
 
 #endif /* _BCACHEFS_SB_ERRORS_TYPES_H */
-

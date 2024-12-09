@@ -189,14 +189,12 @@ devlink_trap_group_stats_put(struct sk_buff *msg,
 	if (!attr)
 		return -EMSGSIZE;
 
-	if (nla_put_u64_64bit(msg, DEVLINK_ATTR_STATS_RX_PACKETS,
-			      u64_stats_read(&stats.rx_packets),
-			      DEVLINK_ATTR_PAD))
+	if (devlink_nl_put_u64(msg, DEVLINK_ATTR_STATS_RX_PACKETS,
+			       u64_stats_read(&stats.rx_packets)))
 		goto nla_put_failure;
 
-	if (nla_put_u64_64bit(msg, DEVLINK_ATTR_STATS_RX_BYTES,
-			      u64_stats_read(&stats.rx_bytes),
-			      DEVLINK_ATTR_PAD))
+	if (devlink_nl_put_u64(msg, DEVLINK_ATTR_STATS_RX_BYTES,
+			       u64_stats_read(&stats.rx_bytes)))
 		goto nla_put_failure;
 
 	nla_nest_end(msg, attr);
@@ -231,18 +229,15 @@ static int devlink_trap_stats_put(struct sk_buff *msg, struct devlink *devlink,
 		return -EMSGSIZE;
 
 	if (devlink->ops->trap_drop_counter_get &&
-	    nla_put_u64_64bit(msg, DEVLINK_ATTR_STATS_RX_DROPPED, drops,
-			      DEVLINK_ATTR_PAD))
+	    devlink_nl_put_u64(msg, DEVLINK_ATTR_STATS_RX_DROPPED, drops))
 		goto nla_put_failure;
 
-	if (nla_put_u64_64bit(msg, DEVLINK_ATTR_STATS_RX_PACKETS,
-			      u64_stats_read(&stats.rx_packets),
-			      DEVLINK_ATTR_PAD))
+	if (devlink_nl_put_u64(msg, DEVLINK_ATTR_STATS_RX_PACKETS,
+			       u64_stats_read(&stats.rx_packets)))
 		goto nla_put_failure;
 
-	if (nla_put_u64_64bit(msg, DEVLINK_ATTR_STATS_RX_BYTES,
-			      u64_stats_read(&stats.rx_bytes),
-			      DEVLINK_ATTR_PAD))
+	if (devlink_nl_put_u64(msg, DEVLINK_ATTR_STATS_RX_BYTES,
+			       u64_stats_read(&stats.rx_bytes)))
 		goto nla_put_failure;
 
 	nla_nest_end(msg, attr);
@@ -750,8 +745,7 @@ devlink_trap_policer_stats_put(struct sk_buff *msg, struct devlink *devlink,
 	if (!attr)
 		return -EMSGSIZE;
 
-	if (nla_put_u64_64bit(msg, DEVLINK_ATTR_STATS_RX_DROPPED, drops,
-			      DEVLINK_ATTR_PAD))
+	if (devlink_nl_put_u64(msg, DEVLINK_ATTR_STATS_RX_DROPPED, drops))
 		goto nla_put_failure;
 
 	nla_nest_end(msg, attr);
@@ -783,12 +777,12 @@ devlink_nl_trap_policer_fill(struct sk_buff *msg, struct devlink *devlink,
 			policer_item->policer->id))
 		goto nla_put_failure;
 
-	if (nla_put_u64_64bit(msg, DEVLINK_ATTR_TRAP_POLICER_RATE,
-			      policer_item->rate, DEVLINK_ATTR_PAD))
+	if (devlink_nl_put_u64(msg, DEVLINK_ATTR_TRAP_POLICER_RATE,
+			       policer_item->rate))
 		goto nla_put_failure;
 
-	if (nla_put_u64_64bit(msg, DEVLINK_ATTR_TRAP_POLICER_BURST,
-			      policer_item->burst, DEVLINK_ATTR_PAD))
+	if (devlink_nl_put_u64(msg, DEVLINK_ATTR_TRAP_POLICER_BURST,
+			       policer_item->burst))
 		goto nla_put_failure;
 
 	err = devlink_trap_policer_stats_put(msg, devlink,
@@ -1173,7 +1167,8 @@ devlink_trap_group_notify(struct devlink *devlink,
 
 	WARN_ON_ONCE(cmd != DEVLINK_CMD_TRAP_GROUP_NEW &&
 		     cmd != DEVLINK_CMD_TRAP_GROUP_DEL);
-	if (!xa_get_mark(&devlinks, devlink->index, DEVLINK_REGISTERED))
+
+	if (!devl_is_registered(devlink) || !devlink_nl_notify_need(devlink))
 		return;
 
 	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
@@ -1187,8 +1182,7 @@ devlink_trap_group_notify(struct devlink *devlink,
 		return;
 	}
 
-	genlmsg_multicast_netns(&devlink_nl_family, devlink_net(devlink),
-				msg, 0, DEVLINK_MCGRP_CONFIG, GFP_KERNEL);
+	devlink_nl_notify_send(devlink, msg);
 }
 
 void devlink_trap_groups_notify_register(struct devlink *devlink)
@@ -1234,7 +1228,8 @@ static void devlink_trap_notify(struct devlink *devlink,
 
 	WARN_ON_ONCE(cmd != DEVLINK_CMD_TRAP_NEW &&
 		     cmd != DEVLINK_CMD_TRAP_DEL);
-	if (!xa_get_mark(&devlinks, devlink->index, DEVLINK_REGISTERED))
+
+	if (!devl_is_registered(devlink) || !devlink_nl_notify_need(devlink))
 		return;
 
 	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
@@ -1247,8 +1242,7 @@ static void devlink_trap_notify(struct devlink *devlink,
 		return;
 	}
 
-	genlmsg_multicast_netns(&devlink_nl_family, devlink_net(devlink),
-				msg, 0, DEVLINK_MCGRP_CONFIG, GFP_KERNEL);
+	devlink_nl_notify_send(devlink, msg);
 }
 
 void devlink_traps_notify_register(struct devlink *devlink)
@@ -1710,7 +1704,8 @@ devlink_trap_policer_notify(struct devlink *devlink,
 
 	WARN_ON_ONCE(cmd != DEVLINK_CMD_TRAP_POLICER_NEW &&
 		     cmd != DEVLINK_CMD_TRAP_POLICER_DEL);
-	if (!xa_get_mark(&devlinks, devlink->index, DEVLINK_REGISTERED))
+
+	if (!devl_is_registered(devlink) || !devlink_nl_notify_need(devlink))
 		return;
 
 	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
@@ -1724,8 +1719,7 @@ devlink_trap_policer_notify(struct devlink *devlink,
 		return;
 	}
 
-	genlmsg_multicast_netns(&devlink_nl_family, devlink_net(devlink),
-				msg, 0, DEVLINK_MCGRP_CONFIG, GFP_KERNEL);
+	devlink_nl_notify_send(devlink, msg);
 }
 
 void devlink_trap_policers_notify_register(struct devlink *devlink)

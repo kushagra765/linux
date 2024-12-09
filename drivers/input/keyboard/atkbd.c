@@ -639,7 +639,7 @@ static void atkbd_event_work(struct work_struct *work)
 {
 	struct atkbd *atkbd = container_of(work, struct atkbd, event_work.work);
 
-	mutex_lock(&atkbd->mutex);
+	guard(mutex)(&atkbd->mutex);
 
 	if (!atkbd->enabled) {
 		/*
@@ -657,8 +657,6 @@ static void atkbd_event_work(struct work_struct *work)
 		if (test_and_clear_bit(ATKBD_REP_EVENT_BIT, &atkbd->event_mask))
 			atkbd_set_repeat_rate(atkbd);
 	}
-
-	mutex_unlock(&atkbd->mutex);
 }
 
 /*
@@ -715,9 +713,9 @@ static int atkbd_event(struct input_dev *dev,
 
 static inline void atkbd_enable(struct atkbd *atkbd)
 {
-	serio_pause_rx(atkbd->ps2dev.serio);
+	guard(serio_pause_rx)(atkbd->ps2dev.serio);
+
 	atkbd->enabled = true;
-	serio_continue_rx(atkbd->ps2dev.serio);
 }
 
 /*
@@ -727,9 +725,9 @@ static inline void atkbd_enable(struct atkbd *atkbd)
 
 static inline void atkbd_disable(struct atkbd *atkbd)
 {
-	serio_pause_rx(atkbd->ps2dev.serio);
+	guard(serio_pause_rx)(atkbd->ps2dev.serio);
+
 	atkbd->enabled = false;
-	serio_continue_rx(atkbd->ps2dev.serio);
 }
 
 static int atkbd_activate(struct atkbd *atkbd)
@@ -791,9 +789,9 @@ static bool atkbd_is_portable_device(void)
  * not work. So in this case simply assume a keyboard is connected to avoid
  * confusing some laptop keyboards.
  *
- * Skipping ATKBD_CMD_GETID ends up using a fake keyboard id. Using a fake id is
- * ok in translated mode, only atkbd_select_set() checks atkbd->id and in
- * translated mode that is a no-op.
+ * Skipping ATKBD_CMD_GETID ends up using a fake keyboard id. Using the standard
+ * 0xab83 id is ok in translated mode, only atkbd_select_set() checks atkbd->id
+ * and in translated mode that is a no-op.
  */
 static bool atkbd_skip_getid(struct atkbd *atkbd)
 {
@@ -824,6 +822,11 @@ static int atkbd_probe(struct atkbd *atkbd)
 				 "keyboard reset failed on %s\n",
 				 ps2dev->serio->phys);
 
+	if (atkbd_skip_getid(atkbd)) {
+		atkbd->id = 0xab83;
+		goto deactivate_kbd;
+	}
+
 /*
  * Then we check the keyboard ID. We should get 0xab83 under normal conditions.
  * Some keyboards report different values, but the first byte is always 0xab or
@@ -832,10 +835,10 @@ static int atkbd_probe(struct atkbd *atkbd)
  */
 
 	param[0] = param[1] = 0xa5;	/* initialize with invalid values */
-	if (atkbd_skip_getid(atkbd) || ps2_command(ps2dev, param, ATKBD_CMD_GETID)) {
+	if (ps2_command(ps2dev, param, ATKBD_CMD_GETID)) {
 
 /*
- * If the get ID command was skipped or failed, we check if we can at least set
+ * If the get ID command failed, we check if we can at least set
  * the LEDs on the keyboard. This should work on every keyboard out there.
  * It also turns the LEDs off, which we want anyway.
  */
@@ -858,6 +861,7 @@ static int atkbd_probe(struct atkbd *atkbd)
 		return -1;
 	}
 
+deactivate_kbd:
 /*
  * Make sure nothing is coming from the keyboard and disturbs our
  * internal state.
@@ -1273,7 +1277,7 @@ static int atkbd_connect(struct serio *serio, struct serio_driver *drv)
 	struct input_dev *dev;
 	int err = -ENOMEM;
 
-	atkbd = kzalloc(sizeof(struct atkbd), GFP_KERNEL);
+	atkbd = kzalloc(sizeof(*atkbd), GFP_KERNEL);
 	dev = input_allocate_device();
 	if (!atkbd || !dev)
 		goto fail1;
@@ -1355,7 +1359,7 @@ static int atkbd_reconnect(struct serio *serio)
 {
 	struct atkbd *atkbd = atkbd_from_serio(serio);
 	struct serio_driver *drv = serio->drv;
-	int retval = -1;
+	int error;
 
 	if (!atkbd || !drv) {
 		dev_dbg(&serio->dev,
@@ -1363,16 +1367,17 @@ static int atkbd_reconnect(struct serio *serio)
 		return -1;
 	}
 
-	mutex_lock(&atkbd->mutex);
+	guard(mutex)(&atkbd->mutex);
 
 	atkbd_disable(atkbd);
 
 	if (atkbd->write) {
-		if (atkbd_probe(atkbd))
-			goto out;
+		error = atkbd_probe(atkbd);
+		if (error)
+			return error;
 
 		if (atkbd->set != atkbd_select_set(atkbd, atkbd->set, atkbd->extra))
-			goto out;
+			return -EIO;
 
 		/*
 		 * Restore LED state and repeat rate. While input core
@@ -1398,11 +1403,7 @@ static int atkbd_reconnect(struct serio *serio)
 	if (atkbd->write)
 		atkbd_activate(atkbd);
 
-	retval = 0;
-
- out:
-	mutex_unlock(&atkbd->mutex);
-	return retval;
+	return 0;
 }
 
 static const struct serio_device_id atkbd_serio_ids[] = {
@@ -1459,17 +1460,15 @@ static ssize_t atkbd_attr_set_helper(struct device *dev, const char *buf, size_t
 	struct atkbd *atkbd = atkbd_from_serio(serio);
 	int retval;
 
-	retval = mutex_lock_interruptible(&atkbd->mutex);
-	if (retval)
+	scoped_guard(mutex_intr, &atkbd->mutex) {
+		atkbd_disable(atkbd);
+		retval = handler(atkbd, buf, count);
+		atkbd_enable(atkbd);
+
 		return retval;
+	}
 
-	atkbd_disable(atkbd);
-	retval = handler(atkbd, buf, count);
-	atkbd_enable(atkbd);
-
-	mutex_unlock(&atkbd->mutex);
-
-	return retval;
+	return -EINTR;
 }
 
 static ssize_t atkbd_show_extra(struct atkbd *atkbd, char *buf)

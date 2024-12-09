@@ -3,11 +3,10 @@
 //! Kernel types.
 
 use crate::init::{self, PinInit};
-use alloc::boxed::Box;
 use core::{
     cell::UnsafeCell,
     marker::{PhantomData, PhantomPinned},
-    mem::MaybeUninit,
+    mem::{ManuallyDrop, MaybeUninit},
     ops::{Deref, DerefMut},
     ptr::NonNull,
 };
@@ -26,8 +25,11 @@ pub trait ForeignOwnable: Sized {
 
     /// Converts a Rust-owned object to a foreign-owned one.
     ///
-    /// The foreign representation is a pointer to void.
-    fn into_foreign(self) -> *const core::ffi::c_void;
+    /// The foreign representation is a pointer to void. There are no guarantees for this pointer.
+    /// For example, it might be invalid, dangling or pointing to uninitialized memory. Using it in
+    /// any way except for [`ForeignOwnable::from_foreign`], [`ForeignOwnable::borrow`],
+    /// [`ForeignOwnable::try_from_foreign`] can result in undefined behavior.
+    fn into_foreign(self) -> *const crate::ffi::c_void;
 
     /// Borrows a foreign-owned object.
     ///
@@ -35,7 +37,7 @@ pub trait ForeignOwnable: Sized {
     ///
     /// `ptr` must have been returned by a previous call to [`ForeignOwnable::into_foreign`] for
     /// which a previous matching [`ForeignOwnable::from_foreign`] hasn't been called yet.
-    unsafe fn borrow<'a>(ptr: *const core::ffi::c_void) -> Self::Borrowed<'a>;
+    unsafe fn borrow<'a>(ptr: *const crate::ffi::c_void) -> Self::Borrowed<'a>;
 
     /// Converts a foreign-owned object back to a Rust-owned one.
     ///
@@ -45,41 +47,38 @@ pub trait ForeignOwnable: Sized {
     /// which a previous matching [`ForeignOwnable::from_foreign`] hasn't been called yet.
     /// Additionally, all instances (if any) of values returned by [`ForeignOwnable::borrow`] for
     /// this object must have been dropped.
-    unsafe fn from_foreign(ptr: *const core::ffi::c_void) -> Self;
-}
+    unsafe fn from_foreign(ptr: *const crate::ffi::c_void) -> Self;
 
-impl<T: 'static> ForeignOwnable for Box<T> {
-    type Borrowed<'a> = &'a T;
-
-    fn into_foreign(self) -> *const core::ffi::c_void {
-        Box::into_raw(self) as _
-    }
-
-    unsafe fn borrow<'a>(ptr: *const core::ffi::c_void) -> &'a T {
-        // SAFETY: The safety requirements for this function ensure that the object is still alive,
-        // so it is safe to dereference the raw pointer.
-        // The safety requirements of `from_foreign` also ensure that the object remains alive for
-        // the lifetime of the returned value.
-        unsafe { &*ptr.cast() }
-    }
-
-    unsafe fn from_foreign(ptr: *const core::ffi::c_void) -> Self {
-        // SAFETY: The safety requirements of this function ensure that `ptr` comes from a previous
-        // call to `Self::into_foreign`.
-        unsafe { Box::from_raw(ptr as _) }
+    /// Tries to convert a foreign-owned object back to a Rust-owned one.
+    ///
+    /// A convenience wrapper over [`ForeignOwnable::from_foreign`] that returns [`None`] if `ptr`
+    /// is null.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must either be null or satisfy the safety requirements for
+    /// [`ForeignOwnable::from_foreign`].
+    unsafe fn try_from_foreign(ptr: *const crate::ffi::c_void) -> Option<Self> {
+        if ptr.is_null() {
+            None
+        } else {
+            // SAFETY: Since `ptr` is not null here, then `ptr` satisfies the safety requirements
+            // of `from_foreign` given the safety requirements of this function.
+            unsafe { Some(Self::from_foreign(ptr)) }
+        }
     }
 }
 
 impl ForeignOwnable for () {
     type Borrowed<'a> = ();
 
-    fn into_foreign(self) -> *const core::ffi::c_void {
+    fn into_foreign(self) -> *const crate::ffi::c_void {
         core::ptr::NonNull::dangling().as_ptr()
     }
 
-    unsafe fn borrow<'a>(_: *const core::ffi::c_void) -> Self::Borrowed<'a> {}
+    unsafe fn borrow<'a>(_: *const crate::ffi::c_void) -> Self::Borrowed<'a> {}
 
-    unsafe fn from_foreign(_: *const core::ffi::c_void) -> Self {}
+    unsafe fn from_foreign(_: *const crate::ffi::c_void) -> Self {}
 }
 
 /// Runs a cleanup function/closure when dropped.
@@ -90,6 +89,7 @@ impl ForeignOwnable for () {
 ///
 /// In the example below, we have multiple exit paths and we want to log regardless of which one is
 /// taken:
+///
 /// ```
 /// # use kernel::types::ScopeGuard;
 /// fn example1(arg: bool) {
@@ -108,6 +108,7 @@ impl ForeignOwnable for () {
 ///
 /// In the example below, we want to log the same message on all early exits but a different one on
 /// the main exit path:
+///
 /// ```
 /// # use kernel::types::ScopeGuard;
 /// fn example2(arg: bool) {
@@ -129,17 +130,18 @@ impl ForeignOwnable for () {
 ///
 /// In the example below, we need a mutable object (the vector) to be accessible within the log
 /// function, so we wrap it in the [`ScopeGuard`]:
+///
 /// ```
 /// # use kernel::types::ScopeGuard;
 /// fn example3(arg: bool) -> Result {
 ///     let mut vec =
-///         ScopeGuard::new_with_data(Vec::new(), |v| pr_info!("vec had {} elements\n", v.len()));
+///         ScopeGuard::new_with_data(KVec::new(), |v| pr_info!("vec had {} elements\n", v.len()));
 ///
-///     vec.try_push(10u8)?;
+///     vec.push(10u8, GFP_KERNEL)?;
 ///     if arg {
 ///         return Ok(());
 ///     }
-///     vec.try_push(20u8)?;
+///     vec.push(20u8, GFP_KERNEL)?;
 ///     Ok(())
 /// }
 ///
@@ -173,7 +175,7 @@ impl<T, F: FnOnce(T)> ScopeGuard<T, F> {
 impl ScopeGuard<(), fn(())> {
     /// Creates a new guarded object with the given cleanup function.
     pub fn new(cleanup: impl FnOnce()) -> ScopeGuard<(), impl FnOnce(())> {
-        ScopeGuard::new_with_data((), move |_| cleanup())
+        ScopeGuard::new_with_data((), move |()| cleanup())
     }
 }
 
@@ -204,7 +206,58 @@ impl<T, F: FnOnce(T)> Drop for ScopeGuard<T, F> {
 
 /// Stores an opaque value.
 ///
-/// This is meant to be used with FFI objects that are never interpreted by Rust code.
+/// `Opaque<T>` is meant to be used with FFI objects that are never interpreted by Rust code.
+///
+/// It is used to wrap structs from the C side, like for example `Opaque<bindings::mutex>`.
+/// It gets rid of all the usual assumptions that Rust has for a value:
+///
+/// * The value is allowed to be uninitialized (for example have invalid bit patterns: `3` for a
+///   [`bool`]).
+/// * The value is allowed to be mutated, when a `&Opaque<T>` exists on the Rust side.
+/// * No uniqueness for mutable references: it is fine to have multiple `&mut Opaque<T>` point to
+///   the same value.
+/// * The value is not allowed to be shared with other threads (i.e. it is `!Sync`).
+///
+/// This has to be used for all values that the C side has access to, because it can't be ensured
+/// that the C side is adhering to the usual constraints that Rust needs.
+///
+/// Using `Opaque<T>` allows to continue to use references on the Rust side even for values shared
+/// with C.
+///
+/// # Examples
+///
+/// ```
+/// # #![expect(unreachable_pub, clippy::disallowed_names)]
+/// use kernel::types::Opaque;
+/// # // Emulate a C struct binding which is from C, maybe uninitialized or not, only the C side
+/// # // knows.
+/// # mod bindings {
+/// #     pub struct Foo {
+/// #         pub val: u8,
+/// #     }
+/// # }
+///
+/// // `foo.val` is assumed to be handled on the C side, so we use `Opaque` to wrap it.
+/// pub struct Foo {
+///     foo: Opaque<bindings::Foo>,
+/// }
+///
+/// impl Foo {
+///     pub fn get_val(&self) -> u8 {
+///         let ptr = Opaque::get(&self.foo);
+///
+///         // SAFETY: `Self` is valid from C side.
+///         unsafe { (*ptr).val }
+///     }
+/// }
+///
+/// // Create an instance of `Foo` with the `Opaque` wrapper.
+/// let foo = Foo {
+///     foo: Opaque::new(bindings::Foo { val: 0xdb }),
+/// };
+///
+/// assert_eq!(foo.get_val(), 0xdb);
+/// ```
 #[repr(transparent)]
 pub struct Opaque<T> {
     value: UnsafeCell<MaybeUninit<T>>,
@@ -247,8 +300,24 @@ impl<T> Opaque<T> {
         }
     }
 
+    /// Creates a fallible pin-initializer from the given initializer closure.
+    ///
+    /// The returned initializer calls the given closure with the pointer to the inner `T` of this
+    /// `Opaque`. Since this memory is uninitialized, the closure is not allowed to read from it.
+    ///
+    /// This function is safe, because the `T` inside of an `Opaque` is allowed to be
+    /// uninitialized. Additionally, access to the inner `T` requires `unsafe`, so the caller needs
+    /// to verify at that point that the inner value is valid.
+    pub fn try_ffi_init<E>(
+        init_func: impl FnOnce(*mut T) -> Result<(), E>,
+    ) -> impl PinInit<Self, E> {
+        // SAFETY: We contain a `MaybeUninit`, so it is OK for the `init_func` to not fully
+        // initialize the `T`.
+        unsafe { init::pin_init_from_closure::<_, E>(move |slot| init_func(Self::raw_get(slot))) }
+    }
+
     /// Returns a raw pointer to the opaque data.
-    pub fn get(&self) -> *mut T {
+    pub const fn get(&self) -> *mut T {
         UnsafeCell::get(&self.value).cast::<T>()
     }
 
@@ -344,6 +413,37 @@ impl<T: AlwaysRefCounted> ARef<T> {
             _p: PhantomData,
         }
     }
+
+    /// Consumes the `ARef`, returning a raw pointer.
+    ///
+    /// This function does not change the refcount. After calling this function, the caller is
+    /// responsible for the refcount previously managed by the `ARef`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use core::ptr::NonNull;
+    /// use kernel::types::{ARef, AlwaysRefCounted};
+    ///
+    /// struct Empty {}
+    ///
+    /// # // SAFETY: TODO.
+    /// unsafe impl AlwaysRefCounted for Empty {
+    ///     fn inc_ref(&self) {}
+    ///     unsafe fn dec_ref(_obj: NonNull<Self>) {}
+    /// }
+    ///
+    /// let mut data = Empty {};
+    /// let ptr = NonNull::<Empty>::new(&mut data as *mut _).unwrap();
+    /// # // SAFETY: TODO.
+    /// let data_ref: ARef<Empty> = unsafe { ARef::from_raw(ptr) };
+    /// let raw_ptr: NonNull<Empty> = ARef::into_raw(data_ref);
+    ///
+    /// assert_eq!(ptr, raw_ptr);
+    /// ```
+    pub fn into_raw(me: Self) -> NonNull<T> {
+        ManuallyDrop::new(me).ptr
+    }
 }
 
 impl<T: AlwaysRefCounted> Clone for ARef<T> {
@@ -380,6 +480,15 @@ impl<T: AlwaysRefCounted> Drop for ARef<T> {
 }
 
 /// A sum type that always holds either a value of type `L` or `R`.
+///
+/// # Examples
+///
+/// ```
+/// use kernel::types::Either;
+///
+/// let left_value: Either<i32, &str> = Either::Left(7);
+/// let right_value: Either<i32, &str> = Either::Right("right value");
+/// ```
 pub enum Either<L, R> {
     /// Constructs an instance of [`Either`] containing a value of type `L`.
     Left(L),
@@ -387,3 +496,24 @@ pub enum Either<L, R> {
     /// Constructs an instance of [`Either`] containing a value of type `R`.
     Right(R),
 }
+
+/// Zero-sized type to mark types not [`Send`].
+///
+/// Add this type as a field to your struct if your type should not be sent to a different task.
+/// Since [`Send`] is an auto trait, adding a single field that is `!Send` will ensure that the
+/// whole type is `!Send`.
+///
+/// If a type is `!Send` it is impossible to give control over an instance of the type to another
+/// task. This is useful to include in types that store or reference task-local information. A file
+/// descriptor is an example of such task-local information.
+///
+/// This type also makes the type `!Sync`, which prevents immutable access to the value from
+/// several threads in parallel.
+pub type NotThreadSafe = PhantomData<*mut ()>;
+
+/// Used to construct instances of type [`NotThreadSafe`] similar to how `PhantomData` is
+/// constructed.
+///
+/// [`NotThreadSafe`]: type@NotThreadSafe
+#[allow(non_upper_case_globals)]
+pub const NotThreadSafe: NotThreadSafe = PhantomData;

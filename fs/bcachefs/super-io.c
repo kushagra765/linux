@@ -2,17 +2,18 @@
 
 #include "bcachefs.h"
 #include "checksum.h"
-#include "counters.h"
 #include "disk_groups.h"
 #include "ec.h"
 #include "error.h"
 #include "journal.h"
 #include "journal_sb.h"
 #include "journal_seq_blacklist.h"
-#include "recovery.h"
+#include "recovery_passes.h"
 #include "replicas.h"
 #include "quota.h"
 #include "sb-clean.h"
+#include "sb-counters.h"
+#include "sb-downgrade.h"
 #include "sb-errors.h"
 #include "sb-members.h"
 #include "super-io.h"
@@ -29,14 +30,12 @@ static const struct blk_holder_ops bch2_sb_handle_bdev_ops = {
 struct bch2_metadata_version {
 	u16		version;
 	const char	*name;
-	u64		recovery_passes;
 };
 
 static const struct bch2_metadata_version bch2_metadata_versions[] = {
-#define x(n, v, _recovery_passes) {		\
+#define x(n, v) {		\
 	.version = v,				\
 	.name = #n,				\
-	.recovery_passes = _recovery_passes,	\
 },
 	BCH_METADATA_VERSIONS()
 #undef x
@@ -69,24 +68,6 @@ unsigned bch2_latest_compatible_version(unsigned v)
 	return v;
 }
 
-u64 bch2_upgrade_recovery_passes(struct bch_fs *c,
-				 unsigned old_version,
-				 unsigned new_version)
-{
-	u64 ret = 0;
-
-	for (const struct bch2_metadata_version *i = bch2_metadata_versions;
-	     i < bch2_metadata_versions + ARRAY_SIZE(bch2_metadata_versions);
-	     i++)
-		if (i->version > old_version && i->version <= new_version) {
-			if (i->recovery_passes & RECOVERY_PASS_ALL_FSCK)
-				ret |= bch2_fsck_recovery_passes();
-			ret |= i->recovery_passes;
-		}
-
-	return ret &= ~RECOVERY_PASS_ALL_FSCK;
-}
-
 const char * const bch2_sb_fields[] = {
 #define x(name, nr)	#name,
 	BCH_SB_FIELDS()
@@ -95,13 +76,11 @@ const char * const bch2_sb_fields[] = {
 };
 
 static int bch2_sb_field_validate(struct bch_sb *, struct bch_sb_field *,
-				  struct printbuf *);
+				  enum bch_validate_flags, struct printbuf *);
 
 struct bch_sb_field *bch2_sb_field_get_id(struct bch_sb *sb,
 				      enum bch_sb_field_type type)
 {
-	struct bch_sb_field *f;
-
 	/* XXX: need locking around superblock to access optional fields */
 
 	vstruct_for_each(sb, f)
@@ -163,8 +142,8 @@ void bch2_sb_field_delete(struct bch_sb_handle *sb,
 void bch2_free_super(struct bch_sb_handle *sb)
 {
 	kfree(sb->bio);
-	if (!IS_ERR_OR_NULL(sb->bdev))
-		blkdev_put(sb->bdev, sb->holder);
+	if (!IS_ERR_OR_NULL(sb->s_bdev_file))
+		bdev_fput(sb->s_bdev_file);
 	kfree(sb->holder);
 	kfree(sb->sb_name);
 
@@ -191,8 +170,12 @@ int bch2_sb_realloc(struct bch_sb_handle *sb, unsigned u64s)
 		u64 max_bytes = 512 << sb->sb->layout.sb_max_size_bits;
 
 		if (new_bytes > max_bytes) {
-			pr_err("%pg: superblock too big: want %zu but have %llu",
-			       sb->bdev, new_bytes, max_bytes);
+			struct printbuf buf = PRINTBUF;
+
+			prt_bdevname(&buf, sb->bdev);
+			prt_printf(&buf, ": superblock too big: want %zu but have %llu", new_bytes, max_bytes);
+			pr_err("%s", buf.buf);
+			printbuf_exit(&buf);
 			return -BCH_ERR_ENOSPC_sb;
 		}
 	}
@@ -240,18 +223,16 @@ struct bch_sb_field *bch2_sb_field_resize_id(struct bch_sb_handle *sb,
 
 	if (sb->fs_sb) {
 		struct bch_fs *c = container_of(sb, struct bch_fs, disk_sb);
-		struct bch_dev *ca;
-		unsigned i;
 
 		lockdep_assert_held(&c->sb_lock);
 
 		/* XXX: we're not checking that offline device have enough space */
 
-		for_each_online_member(ca, c, i) {
+		for_each_online_member(c, ca) {
 			struct bch_sb_handle *dev_sb = &ca->disk_sb;
 
 			if (bch2_sb_realloc(dev_sb, le32_to_cpu(dev_sb->sb->u64s) + d)) {
-				percpu_ref_put(&ca->ref);
+				percpu_ref_put(&ca->io_ref);
 				return NULL;
 			}
 		}
@@ -261,6 +242,17 @@ struct bch_sb_field *bch2_sb_field_resize_id(struct bch_sb_handle *sb,
 	f = __bch2_sb_field_resize(sb, f, u64s);
 	if (f)
 		f->type = cpu_to_le32(type);
+	return f;
+}
+
+struct bch_sb_field *bch2_sb_field_get_minsize_id(struct bch_sb_handle *sb,
+						  enum bch_sb_field_type type,
+						  unsigned u64s)
+{
+	struct bch_sb_field *f = bch2_sb_field_get_id(sb->sb, type);
+
+	if (!f || le32_to_cpu(f->u64s) < u64s)
+		f = bch2_sb_field_resize_id(sb, type, u64s);
 	return f;
 }
 
@@ -293,6 +285,11 @@ static int validate_sb_layout(struct bch_sb_layout *layout, struct printbuf *out
 	if (layout->nr_superblocks > ARRAY_SIZE(layout->sb_offset)) {
 		prt_printf(out, "Invalid superblock layout: too many superblocks");
 		return -BCH_ERR_invalid_sb_layout_nr_superblocks;
+	}
+
+	if (layout->sb_max_size_bits > BCH_SB_LAYOUT_SIZE_BITS_MAX) {
+		prt_printf(out, "Invalid superblock layout: max_size_bits too high");
+		return -BCH_ERR_invalid_sb_layout_sb_max_size_bits;
 	}
 
 	max_sectors = 1 << layout->sb_max_size_bits;
@@ -352,11 +349,10 @@ static int bch2_sb_compatible(struct bch_sb *sb, struct printbuf *out)
 	return 0;
 }
 
-static int bch2_sb_validate(struct bch_sb_handle *disk_sb, struct printbuf *out,
-			    int rw)
+static int bch2_sb_validate(struct bch_sb_handle *disk_sb,
+			    enum bch_validate_flags flags, struct printbuf *out)
 {
 	struct bch_sb *sb = disk_sb->sb;
-	struct bch_sb_field *f;
 	struct bch_sb_field_members_v1 *mi;
 	enum bch_opt_id opt_id;
 	u16 block_size;
@@ -410,7 +406,7 @@ static int bch2_sb_validate(struct bch_sb_handle *disk_sb, struct printbuf *out,
 		return -BCH_ERR_invalid_sb_time_precision;
 	}
 
-	if (rw == READ) {
+	if (!flags) {
 		/*
 		 * Been seeing a bug where these are getting inexplicably
 		 * zeroed, so we're now validating them, but we have to be
@@ -423,6 +419,13 @@ static int bch2_sb_validate(struct bch_sb_handle *disk_sb, struct printbuf *out,
 
 		if (!BCH_SB_VERSION_UPGRADE_COMPLETE(sb))
 			SET_BCH_SB_VERSION_UPGRADE_COMPLETE(sb, le16_to_cpu(sb->version));
+
+		if (le16_to_cpu(sb->version) <= bcachefs_metadata_version_disk_accounting_v2 &&
+		    !BCH_SB_ALLOCATOR_STUCK_TIMEOUT(sb))
+			SET_BCH_SB_ALLOCATOR_STUCK_TIMEOUT(sb, 30);
+
+		if (le16_to_cpu(sb->version) <= bcachefs_metadata_version_disk_accounting_v2)
+			SET_BCH_SB_PROMOTE_WHOLE_EXTENTS(sb, true);
 	}
 
 	for (opt_id = 0; opt_id < bch2_opts_nr; opt_id++) {
@@ -466,7 +469,7 @@ static int bch2_sb_validate(struct bch_sb_handle *disk_sb, struct printbuf *out,
 		return -BCH_ERR_invalid_sb_members_missing;
 	}
 
-	ret = bch2_sb_field_validate(sb, &mi->field, out);
+	ret = bch2_sb_field_validate(sb, &mi->field, flags, out);
 	if (ret)
 		return ret;
 
@@ -474,9 +477,17 @@ static int bch2_sb_validate(struct bch_sb_handle *disk_sb, struct printbuf *out,
 		if (le32_to_cpu(f->type) == BCH_SB_FIELD_members_v1)
 			continue;
 
-		ret = bch2_sb_field_validate(sb, f, out);
+		ret = bch2_sb_field_validate(sb, f, flags, out);
 		if (ret)
 			return ret;
+	}
+
+	if ((flags & BCH_VALIDATE_write) &&
+	    bch2_sb_member_get(sb, sb->dev_idx).seq != sb->seq) {
+		prt_printf(out, "Invalid superblock: member seq %llu != sb seq %llu",
+			   le64_to_cpu(bch2_sb_member_get(sb, sb->dev_idx).seq),
+			   le64_to_cpu(sb->seq));
+		return -BCH_ERR_invalid_sb_members_missing;
 	}
 
 	return 0;
@@ -484,11 +495,24 @@ static int bch2_sb_validate(struct bch_sb_handle *disk_sb, struct printbuf *out,
 
 /* device open: */
 
+static unsigned long le_ulong_to_cpu(unsigned long v)
+{
+	return sizeof(unsigned long) == 8
+		? le64_to_cpu(v)
+		: le32_to_cpu(v);
+}
+
+static void le_bitvector_to_cpu(unsigned long *dst, unsigned long *src, unsigned nr)
+{
+	BUG_ON(nr & (BITS_PER_TYPE(long) - 1));
+
+	for (unsigned i = 0; i < BITS_TO_LONGS(nr); i++)
+		dst[i] = le_ulong_to_cpu(src[i]);
+}
+
 static void bch2_sb_update(struct bch_fs *c)
 {
 	struct bch_sb *src = c->disk_sb.sb;
-	struct bch_dev *ca;
-	unsigned i;
 
 	lockdep_assert_held(&c->sb_lock);
 
@@ -512,8 +536,17 @@ static void bch2_sb_update(struct bch_fs *c)
 	c->sb.features		= le64_to_cpu(src->features[0]);
 	c->sb.compat		= le64_to_cpu(src->compat[0]);
 
-	for_each_member_device(ca, c, i) {
-		struct bch_member m = bch2_sb_member_get(src, i);
+	memset(c->sb.errors_silent, 0, sizeof(c->sb.errors_silent));
+
+	struct bch_sb_field_ext *ext = bch2_sb_field_get(src, ext);
+	if (ext) {
+		le_bitvector_to_cpu(c->sb.errors_silent, (void *) ext->errors_silent,
+				    sizeof(c->sb.errors_silent) * 8);
+		c->sb.btrees_lost_data = le64_to_cpu(ext->btrees_lost_data);
+	}
+
+	for_each_member_device(c, ca) {
+		struct bch_member m = bch2_sb_member_get(src, ca->dev_idx);
 		ca->mi = bch2_mi_to_cpu(&m);
 	}
 }
@@ -537,6 +570,7 @@ static int __copy_super(struct bch_sb_handle *dst_handle, struct bch_sb *src)
 	dst->time_base_lo	= src->time_base_lo;
 	dst->time_base_hi	= src->time_base_hi;
 	dst->time_precision	= src->time_precision;
+	dst->write_time		= src->write_time;
 
 	memcpy(dst->flags,	src->flags,	sizeof(dst->flags));
 	memcpy(dst->features,	src->features,	sizeof(dst->features));
@@ -600,7 +634,6 @@ int bch2_sb_from_fs(struct bch_fs *c, struct bch_dev *ca)
 
 static int read_one_super(struct bch_sb_handle *sb, u64 offset, struct printbuf *err)
 {
-	struct bch_csum csum;
 	size_t bytes;
 	int ret;
 reread:
@@ -616,7 +649,9 @@ reread:
 
 	if (!uuid_equal(&sb->sb->magic, &BCACHE_MAGIC) &&
 	    !uuid_equal(&sb->sb->magic, &BCHFS_MAGIC)) {
-		prt_printf(err, "Not a bcachefs superblock");
+		prt_str(err, "Not a bcachefs superblock (got magic ");
+		pr_uuid(err, sb->sb->magic.b);
+		prt_str(err, ")");
 		return -BCH_ERR_invalid_sb_magic;
 	}
 
@@ -626,9 +661,10 @@ reread:
 
 	bytes = vstruct_bytes(sb->sb);
 
-	if (bytes > 512 << sb->sb->layout.sb_max_size_bits) {
-		prt_printf(err, "Invalid superblock: too big (got %zu bytes, layout max %lu)",
-		       bytes, 512UL << sb->sb->layout.sb_max_size_bits);
+	u64 sb_size = 512ULL << min(BCH_SB_LAYOUT_SIZE_BITS_MAX, sb->sb->layout.sb_max_size_bits);
+	if (bytes > sb_size) {
+		prt_printf(err, "Invalid superblock: too big (got %zu bytes, layout max %llu)",
+			   bytes, sb_size);
 		return -BCH_ERR_invalid_sb_too_big;
 	}
 
@@ -639,17 +675,16 @@ reread:
 		goto reread;
 	}
 
-	if (BCH_SB_CSUM_TYPE(sb->sb) >= BCH_CSUM_NR) {
+	enum bch_csum_type csum_type = BCH_SB_CSUM_TYPE(sb->sb);
+	if (csum_type >= BCH_CSUM_NR) {
 		prt_printf(err, "unknown checksum type %llu", BCH_SB_CSUM_TYPE(sb->sb));
 		return -BCH_ERR_invalid_sb_csum_type;
 	}
 
 	/* XXX: verify MACs */
-	csum = csum_vstruct(NULL, BCH_SB_CSUM_TYPE(sb->sb),
-			    null_nonce(), sb->sb);
-
+	struct bch_csum csum = csum_vstruct(NULL, csum_type, null_nonce(), sb->sb);
 	if (bch2_crc_cmp(csum, sb->sb->csum)) {
-		prt_printf(err, "bad checksum");
+		bch2_csum_err_msg(err, csum_type, sb->sb->csum, csum);
 		return -BCH_ERR_invalid_sb_csum;
 	}
 
@@ -658,12 +693,13 @@ reread:
 	return 0;
 }
 
-int bch2_read_super(const char *path, struct bch_opts *opts,
-		    struct bch_sb_handle *sb)
+static int __bch2_read_super(const char *path, struct bch_opts *opts,
+		    struct bch_sb_handle *sb, bool ignore_notbchfs_msg)
 {
 	u64 offset = opt_get(*opts, sb);
 	struct bch_sb_layout layout;
 	struct printbuf err = PRINTBUF;
+	struct printbuf err2 = PRINTBUF;
 	__le64 *i;
 	int ret;
 #ifndef __KERNEL__
@@ -677,8 +713,11 @@ retry:
 		return -ENOMEM;
 
 	sb->sb_name = kstrdup(path, GFP_KERNEL);
-	if (!sb->sb_name)
-		return -ENOMEM;
+	if (!sb->sb_name) {
+		ret = -ENOMEM;
+		prt_printf(&err, "error allocating memory for sb_name");
+		goto err;
+	}
 
 #ifndef __KERNEL__
 	if (opt_get(*opts, direct_io) == false)
@@ -691,21 +730,23 @@ retry:
 	if (!opt_get(*opts, nochanges))
 		sb->mode |= BLK_OPEN_WRITE;
 
-	sb->bdev = blkdev_get_by_path(path, sb->mode, sb->holder, &bch2_sb_handle_bdev_ops);
-	if (IS_ERR(sb->bdev) &&
-	    PTR_ERR(sb->bdev) == -EACCES &&
+	sb->s_bdev_file = bdev_file_open_by_path(path, sb->mode, sb->holder, &bch2_sb_handle_bdev_ops);
+	if (IS_ERR(sb->s_bdev_file) &&
+	    PTR_ERR(sb->s_bdev_file) == -EACCES &&
 	    opt_get(*opts, read_only)) {
 		sb->mode &= ~BLK_OPEN_WRITE;
 
-		sb->bdev = blkdev_get_by_path(path, sb->mode, sb->holder, &bch2_sb_handle_bdev_ops);
-		if (!IS_ERR(sb->bdev))
+		sb->s_bdev_file = bdev_file_open_by_path(path, sb->mode, sb->holder, &bch2_sb_handle_bdev_ops);
+		if (!IS_ERR(sb->s_bdev_file))
 			opt_set(*opts, nochanges, true);
 	}
 
-	if (IS_ERR(sb->bdev)) {
-		ret = PTR_ERR(sb->bdev);
-		goto out;
+	if (IS_ERR(sb->s_bdev_file)) {
+		ret = PTR_ERR(sb->s_bdev_file);
+		prt_printf(&err, "error opening %s: %s", path, bch2_err_str(ret));
+		goto err;
 	}
+	sb->bdev = file_bdev(sb->s_bdev_file);
 
 	ret = bch2_sb_realloc(sb, 0);
 	if (ret) {
@@ -726,8 +767,14 @@ retry:
 	if (opt_defined(*opts, sb))
 		goto err;
 
-	printk(KERN_ERR "bcachefs (%s): error reading default superblock: %s\n",
+	prt_printf(&err2, "bcachefs (%s): error reading default superblock: %s\n",
 	       path, err.buf);
+	if (ret == -BCH_ERR_invalid_sb_magic && ignore_notbchfs_msg)
+		bch2_print_opts(opts, KERN_INFO "%s", err2.buf);
+	else
+		bch2_print_opts(opts, KERN_ERR "%s", err2.buf);
+
+	printbuf_exit(&err2);
 	printbuf_reset(&err);
 
 	/*
@@ -757,8 +804,10 @@ retry:
 	     i < layout.sb_offset + layout.nr_superblocks; i++) {
 		offset = le64_to_cpu(*i);
 
-		if (offset == opt_get(*opts, sb))
+		if (offset == opt_get(*opts, sb)) {
+			ret = -BCH_ERR_invalid;
 			continue;
+		}
 
 		ret = read_one_super(sb, offset, &err);
 		if (!ret)
@@ -783,24 +832,37 @@ got_super:
 		goto err;
 	}
 
-	ret = 0;
 	sb->have_layout = true;
 
-	ret = bch2_sb_validate(sb, &err, READ);
+	ret = bch2_sb_validate(sb, 0, &err);
 	if (ret) {
-		printk(KERN_ERR "bcachefs (%s): error validating superblock: %s\n",
-		       path, err.buf);
+		bch2_print_opts(opts, KERN_ERR "bcachefs (%s): error validating superblock: %s\n",
+				path, err.buf);
 		goto err_no_print;
 	}
 out:
 	printbuf_exit(&err);
 	return ret;
 err:
-	printk(KERN_ERR "bcachefs (%s): error reading superblock: %s\n",
-	       path, err.buf);
+	bch2_print_opts(opts, KERN_ERR "bcachefs (%s): error reading superblock: %s\n",
+			path, err.buf);
 err_no_print:
 	bch2_free_super(sb);
 	goto out;
+}
+
+int bch2_read_super(const char *path, struct bch_opts *opts,
+		    struct bch_sb_handle *sb)
+{
+	return __bch2_read_super(path, opts, sb, false);
+}
+
+/* provide a silenced version for mount.bcachefs */
+
+int bch2_read_super_silent(const char *path, struct bch_opts *opts,
+		    struct bch_sb_handle *sb)
+{
+	return __bch2_read_super(path, opts, sb, true);
 }
 
 /* write superblock: */
@@ -871,12 +933,12 @@ static void write_one_super(struct bch_fs *c, struct bch_dev *ca, unsigned idx)
 int bch2_write_super(struct bch_fs *c)
 {
 	struct closure *cl = &c->sb_write;
-	struct bch_dev *ca;
 	struct printbuf err = PRINTBUF;
-	unsigned i, sb = 0, nr_wrote;
+	unsigned sb = 0, nr_wrote;
 	struct bch_devs_mask sb_written;
 	bool wrote, can_mount_without_written, can_mount_with_written;
 	unsigned degraded_flags = BCH_FORCE_IF_DEGRADED;
+	DARRAY(struct bch_dev *) online_devices = {};
 	int ret = 0;
 
 	trace_and_count(c, write_super, c, _RET_IP_);
@@ -889,15 +951,29 @@ int bch2_write_super(struct bch_fs *c)
 	closure_init_stack(cl);
 	memset(&sb_written, 0, sizeof(sb_written));
 
+	for_each_online_member(c, ca) {
+		ret = darray_push(&online_devices, ca);
+		if (bch2_fs_fatal_err_on(ret, c, "%s: error allocating online devices", __func__)) {
+			percpu_ref_put(&ca->io_ref);
+			goto out;
+		}
+		percpu_ref_get(&ca->io_ref);
+	}
+
 	/* Make sure we're using the new magic numbers: */
 	c->disk_sb.sb->magic = BCHFS_MAGIC;
 	c->disk_sb.sb->layout.magic = BCHFS_MAGIC;
 
 	le64_add_cpu(&c->disk_sb.sb->seq, 1);
 
-	if (test_bit(BCH_FS_ERROR, &c->flags))
+	struct bch_sb_field_members_v2 *mi = bch2_sb_field_get(c->disk_sb.sb, members_v2);
+	darray_for_each(online_devices, ca)
+		__bch2_members_v2_get_mut(mi, (*ca)->dev_idx)->seq = c->disk_sb.sb->seq;
+	c->disk_sb.sb->write_time = cpu_to_le64(ktime_get_real_seconds());
+
+	if (test_bit(BCH_FS_error, &c->flags))
 		SET_BCH_SB_HAS_ERRORS(c->disk_sb.sb, 1);
-	if (test_bit(BCH_FS_TOPOLOGY_ERROR, &c->flags))
+	if (test_bit(BCH_FS_topology_error, &c->flags))
 		SET_BCH_SB_HAS_TOPOLOGY_ERRORS(c->disk_sb.sb, 1);
 
 	SET_BCH_SB_BIG_ENDIAN(c->disk_sb.sb, CPU_BIG_ENDIAN);
@@ -906,17 +982,17 @@ int bch2_write_super(struct bch_fs *c)
 	bch2_sb_members_from_cpu(c);
 	bch2_sb_members_cpy_v2_v1(&c->disk_sb);
 	bch2_sb_errors_from_cpu(c);
+	bch2_sb_downgrade_update(c);
 
-	for_each_online_member(ca, c, i)
-		bch2_sb_from_fs(c, ca);
+	darray_for_each(online_devices, ca)
+		bch2_sb_from_fs(c, (*ca));
 
-	for_each_online_member(ca, c, i) {
+	darray_for_each(online_devices, ca) {
 		printbuf_reset(&err);
 
-		ret = bch2_sb_validate(&ca->disk_sb, &err, WRITE);
+		ret = bch2_sb_validate(&(*ca)->disk_sb, BCH_VALIDATE_write, &err);
 		if (ret) {
 			bch2_fs_inconsistent(c, "sb invalid before write: %s", err.buf);
-			percpu_ref_put(&ca->io_ref);
 			goto out;
 		}
 	}
@@ -931,53 +1007,79 @@ int bch2_write_super(struct bch_fs *c)
 	if (!BCH_SB_INITIALIZED(c->disk_sb.sb))
 		goto out;
 
-	for_each_online_member(ca, c, i) {
-		__set_bit(ca->dev_idx, sb_written.d);
-		ca->sb_write_error = 0;
+	if (le16_to_cpu(c->disk_sb.sb->version) > bcachefs_metadata_version_current) {
+		struct printbuf buf = PRINTBUF;
+		prt_printf(&buf, "attempting to write superblock that wasn't version downgraded (");
+		bch2_version_to_text(&buf, le16_to_cpu(c->disk_sb.sb->version));
+		prt_str(&buf, " > ");
+		bch2_version_to_text(&buf, bcachefs_metadata_version_current);
+		prt_str(&buf, ")");
+		bch2_fs_fatal_error(c, ": %s", buf.buf);
+		printbuf_exit(&buf);
+		return -BCH_ERR_sb_not_downgraded;
 	}
 
-	for_each_online_member(ca, c, i)
-		read_back_super(c, ca);
+	darray_for_each(online_devices, ca) {
+		__set_bit((*ca)->dev_idx, sb_written.d);
+		(*ca)->sb_write_error = 0;
+	}
+
+	darray_for_each(online_devices, ca)
+		read_back_super(c, *ca);
 	closure_sync(cl);
 
-	for_each_online_member(ca, c, i) {
+	darray_for_each(online_devices, cap) {
+		struct bch_dev *ca = *cap;
+
 		if (ca->sb_write_error)
 			continue;
 
 		if (le64_to_cpu(ca->sb_read_scratch->seq) < ca->disk_sb.seq) {
-			bch2_fs_fatal_error(c,
-				"Superblock write was silently dropped! (seq %llu expected %llu)",
+			struct printbuf buf = PRINTBUF;
+			prt_char(&buf, ' ');
+			prt_bdevname(&buf, ca->disk_sb.bdev);
+			prt_printf(&buf,
+				": Superblock write was silently dropped! (seq %llu expected %llu)",
 				le64_to_cpu(ca->sb_read_scratch->seq),
 				ca->disk_sb.seq);
-			percpu_ref_put(&ca->io_ref);
+			bch2_fs_fatal_error(c, "%s", buf.buf);
+			printbuf_exit(&buf);
 			ret = -BCH_ERR_erofs_sb_err;
-			goto out;
 		}
 
 		if (le64_to_cpu(ca->sb_read_scratch->seq) > ca->disk_sb.seq) {
-			bch2_fs_fatal_error(c,
-				"Superblock modified by another process (seq %llu expected %llu)",
+			struct printbuf buf = PRINTBUF;
+			prt_char(&buf, ' ');
+			prt_bdevname(&buf, ca->disk_sb.bdev);
+			prt_printf(&buf,
+				": Superblock modified by another process (seq %llu expected %llu)",
 				le64_to_cpu(ca->sb_read_scratch->seq),
 				ca->disk_sb.seq);
-			percpu_ref_put(&ca->io_ref);
+			bch2_fs_fatal_error(c, "%s", buf.buf);
+			printbuf_exit(&buf);
 			ret = -BCH_ERR_erofs_sb_err;
-			goto out;
 		}
 	}
 
+	if (ret)
+		goto out;
+
 	do {
 		wrote = false;
-		for_each_online_member(ca, c, i)
+		darray_for_each(online_devices, cap) {
+			struct bch_dev *ca = *cap;
 			if (!ca->sb_write_error &&
 			    sb < ca->disk_sb.sb->layout.nr_superblocks) {
 				write_one_super(c, ca, sb);
 				wrote = true;
 			}
+		}
 		closure_sync(cl);
 		sb++;
 	} while (wrote);
 
-	for_each_online_member(ca, c, i) {
+	darray_for_each(online_devices, cap) {
+		struct bch_dev *ca = *cap;
 		if (ca->sb_write_error)
 			__clear_bit(ca->dev_idx, sb_written.d);
 		else
@@ -989,7 +1091,7 @@ int bch2_write_super(struct bch_fs *c)
 	can_mount_with_written =
 		bch2_have_enough_devs(c, sb_written, degraded_flags, false);
 
-	for (i = 0; i < ARRAY_SIZE(sb_written.d); i++)
+	for (unsigned i = 0; i < ARRAY_SIZE(sb_written.d); i++)
 		sb_written.d[i] = ~sb_written.d[i];
 
 	can_mount_without_written =
@@ -1007,12 +1109,15 @@ int bch2_write_super(struct bch_fs *c)
 				 !can_mount_with_written ||
 				 (can_mount_without_written &&
 				  !can_mount_with_written), c,
-		"Unable to write superblock to sufficient devices (from %ps)",
+		": Unable to write superblock to sufficient devices (from %ps)",
 		(void *) _RET_IP_))
 		ret = -1;
 out:
 	/* Make new options visible after they're persistent: */
 	bch2_sb_update(c);
+	darray_for_each(online_devices, ca)
+		percpu_ref_put(&(*ca)->io_ref);
+	darray_exit(&online_devices);
 	printbuf_exit(&err);
 	return ret;
 }
@@ -1029,13 +1134,18 @@ void __bch2_check_set_feature(struct bch_fs *c, unsigned feat)
 }
 
 /* Downgrade if superblock is at a higher version than currently supported: */
-void bch2_sb_maybe_downgrade(struct bch_fs *c)
+bool bch2_check_version_downgrade(struct bch_fs *c)
 {
+	bool ret = bcachefs_metadata_version_current < c->sb.version;
+
 	lockdep_assert_held(&c->sb_lock);
 
 	/*
 	 * Downgrade, if superblock is at a higher version than currently
 	 * supported:
+	 *
+	 * c->sb will be checked before we write the superblock, so update it as
+	 * well:
 	 */
 	if (BCH_SB_VERSION_UPGRADE_COMPLETE(c->disk_sb.sb) > bcachefs_metadata_version_current)
 		SET_BCH_SB_VERSION_UPGRADE_COMPLETE(c->disk_sb.sb, bcachefs_metadata_version_current);
@@ -1044,15 +1154,63 @@ void bch2_sb_maybe_downgrade(struct bch_fs *c)
 	if (c->sb.version_min > bcachefs_metadata_version_current)
 		c->disk_sb.sb->version_min = cpu_to_le16(bcachefs_metadata_version_current);
 	c->disk_sb.sb->compat[0] &= cpu_to_le64((1ULL << BCH_COMPAT_NR) - 1);
+	return ret;
 }
 
 void bch2_sb_upgrade(struct bch_fs *c, unsigned new_version)
 {
 	lockdep_assert_held(&c->sb_lock);
 
+	if (BCH_VERSION_MAJOR(new_version) >
+	    BCH_VERSION_MAJOR(le16_to_cpu(c->disk_sb.sb->version)))
+		bch2_sb_field_resize(&c->disk_sb, downgrade, 0);
+
 	c->disk_sb.sb->version = cpu_to_le16(new_version);
 	c->disk_sb.sb->features[0] |= cpu_to_le64(BCH_SB_FEATURES_ALL);
 }
+
+static int bch2_sb_ext_validate(struct bch_sb *sb, struct bch_sb_field *f,
+				enum bch_validate_flags flags, struct printbuf *err)
+{
+	if (vstruct_bytes(f) < 88) {
+		prt_printf(err, "field too small (%zu < %u)", vstruct_bytes(f), 88);
+		return -BCH_ERR_invalid_sb_ext;
+	}
+
+	return 0;
+}
+
+static void bch2_sb_ext_to_text(struct printbuf *out, struct bch_sb *sb,
+				struct bch_sb_field *f)
+{
+	struct bch_sb_field_ext *e = field_to_type(f, ext);
+
+	prt_printf(out, "Recovery passes required:\t");
+	prt_bitflags(out, bch2_recovery_passes,
+		     bch2_recovery_passes_from_stable(le64_to_cpu(e->recovery_passes_required[0])));
+	prt_newline(out);
+
+	unsigned long *errors_silent = kmalloc(sizeof(e->errors_silent), GFP_KERNEL);
+	if (errors_silent) {
+		le_bitvector_to_cpu(errors_silent, (void *) e->errors_silent, sizeof(e->errors_silent) * 8);
+
+		prt_printf(out, "Errors to silently fix:\t");
+		prt_bitflags_vector(out, bch2_sb_error_strs, errors_silent,
+				    min(BCH_FSCK_ERR_MAX, sizeof(e->errors_silent) * 8));
+		prt_newline(out);
+
+		kfree(errors_silent);
+	}
+
+	prt_printf(out, "Btrees with missing data:\t");
+	prt_bitflags(out, __bch2_btree_ids, le64_to_cpu(e->btrees_lost_data));
+	prt_newline(out);
+}
+
+static const struct bch_sb_field_ops bch_sb_field_ops_ext = {
+	.validate	= bch2_sb_ext_validate,
+	.to_text	= bch2_sb_ext_to_text,
+};
 
 static const struct bch_sb_field_ops *bch2_sb_field_ops[] = {
 #define x(f, nr)					\
@@ -1071,14 +1229,14 @@ static const struct bch_sb_field_ops *bch2_sb_field_type_ops(unsigned type)
 }
 
 static int bch2_sb_field_validate(struct bch_sb *sb, struct bch_sb_field *f,
-				  struct printbuf *err)
+				  enum bch_validate_flags flags, struct printbuf *err)
 {
 	unsigned type = le32_to_cpu(f->type);
 	struct printbuf field_err = PRINTBUF;
 	const struct bch_sb_field_ops *ops = bch2_sb_field_type_ops(type);
 	int ret;
 
-	ret = ops->validate ? ops->validate(sb, f, &field_err) : 0;
+	ret = ops->validate ? ops->validate(sb, f, flags, &field_err) : 0;
 	if (ret) {
 		prt_printf(err, "Invalid superblock section %s: %s",
 			   bch2_sb_fields[type], field_err.buf);
@@ -1090,14 +1248,23 @@ static int bch2_sb_field_validate(struct bch_sb *sb, struct bch_sb_field *f,
 	return ret;
 }
 
-void bch2_sb_field_to_text(struct printbuf *out, struct bch_sb *sb,
-			   struct bch_sb_field *f)
+void __bch2_sb_field_to_text(struct printbuf *out, struct bch_sb *sb,
+			     struct bch_sb_field *f)
 {
 	unsigned type = le32_to_cpu(f->type);
 	const struct bch_sb_field_ops *ops = bch2_sb_field_type_ops(type);
 
 	if (!out->nr_tabstops)
 		printbuf_tabstop_push(out, 32);
+
+	if (ops->to_text)
+		ops->to_text(out, sb, f);
+}
+
+void bch2_sb_field_to_text(struct printbuf *out, struct bch_sb *sb,
+			   struct bch_sb_field *f)
+{
+	unsigned type = le32_to_cpu(f->type);
 
 	if (type < BCH_SB_FIELD_NR)
 		prt_printf(out, "%s", bch2_sb_fields[type]);
@@ -1107,11 +1274,7 @@ void bch2_sb_field_to_text(struct printbuf *out, struct bch_sb *sb,
 	prt_printf(out, " (size %zu):", vstruct_bytes(f));
 	prt_newline(out);
 
-	if (ops->to_text) {
-		printbuf_indent_add(out, 2);
-		ops->to_text(out, sb, f);
-		printbuf_indent_sub(out, 2);
-	}
+	__bch2_sb_field_to_text(out, sb, f);
 }
 
 void bch2_sb_layout_to_text(struct printbuf *out, struct bch_sb_layout *l)
@@ -1140,93 +1303,78 @@ void bch2_sb_layout_to_text(struct printbuf *out, struct bch_sb_layout *l)
 void bch2_sb_to_text(struct printbuf *out, struct bch_sb *sb,
 		     bool print_layout, unsigned fields)
 {
-	struct bch_sb_field *f;
-	u64 fields_have = 0;
-	unsigned nr_devices = 0;
-
 	if (!out->nr_tabstops)
 		printbuf_tabstop_push(out, 44);
 
-	for (int i = 0; i < sb->nr_devices; i++)
-		nr_devices += bch2_dev_exists(sb, i);
-
-	prt_printf(out, "External UUID:");
-	prt_tab(out);
+	prt_printf(out, "External UUID:\t");
 	pr_uuid(out, sb->user_uuid.b);
 	prt_newline(out);
 
-	prt_printf(out, "Internal UUID:");
-	prt_tab(out);
+	prt_printf(out, "Internal UUID:\t");
 	pr_uuid(out, sb->uuid.b);
 	prt_newline(out);
 
-	prt_str(out, "Device index:");
-	prt_tab(out);
-	prt_printf(out, "%u", sb->dev_idx);
+	prt_printf(out, "Magic number:\t");
+	pr_uuid(out, sb->magic.b);
 	prt_newline(out);
 
-	prt_str(out, "Label:");
-	prt_tab(out);
-	prt_printf(out, "%.*s", (int) sizeof(sb->label), sb->label);
+	prt_printf(out, "Device index:\t%u\n", sb->dev_idx);
+
+	prt_printf(out, "Label:\t");
+	if (!strlen(sb->label))
+		prt_printf(out, "(none)");
+	else
+		prt_printf(out, "%.*s", (int) sizeof(sb->label), sb->label);
 	prt_newline(out);
 
-	prt_str(out, "Version:");
-	prt_tab(out);
+	prt_printf(out, "Version:\t");
 	bch2_version_to_text(out, le16_to_cpu(sb->version));
 	prt_newline(out);
 
-	prt_str(out, "Version upgrade complete:");
-	prt_tab(out);
+	prt_printf(out, "Version upgrade complete:\t");
 	bch2_version_to_text(out, BCH_SB_VERSION_UPGRADE_COMPLETE(sb));
 	prt_newline(out);
 
-	prt_printf(out, "Oldest version on disk:");
-	prt_tab(out);
+	prt_printf(out, "Oldest version on disk:\t");
 	bch2_version_to_text(out, le16_to_cpu(sb->version_min));
 	prt_newline(out);
 
-	prt_printf(out, "Created:");
-	prt_tab(out);
+	prt_printf(out, "Created:\t");
 	if (sb->time_base_lo)
 		bch2_prt_datetime(out, div_u64(le64_to_cpu(sb->time_base_lo), NSEC_PER_SEC));
 	else
 		prt_printf(out, "(not set)");
 	prt_newline(out);
 
-	prt_printf(out, "Sequence number:");
-	prt_tab(out);
+	prt_printf(out, "Sequence number:\t");
 	prt_printf(out, "%llu", le64_to_cpu(sb->seq));
 	prt_newline(out);
 
-	prt_printf(out, "Superblock size:");
-	prt_tab(out);
-	prt_printf(out, "%zu", vstruct_bytes(sb));
+	prt_printf(out, "Time of last write:\t");
+	bch2_prt_datetime(out, le64_to_cpu(sb->write_time));
 	prt_newline(out);
 
-	prt_printf(out, "Clean:");
-	prt_tab(out);
-	prt_printf(out, "%llu", BCH_SB_CLEAN(sb));
+	prt_printf(out, "Superblock size:\t");
+	prt_units_u64(out, vstruct_bytes(sb));
+	prt_str(out, "/");
+	prt_units_u64(out, 512ULL << sb->layout.sb_max_size_bits);
 	prt_newline(out);
 
-	prt_printf(out, "Devices:");
-	prt_tab(out);
-	prt_printf(out, "%u", nr_devices);
-	prt_newline(out);
+	prt_printf(out, "Clean:\t%llu\n", BCH_SB_CLEAN(sb));
+	prt_printf(out, "Devices:\t%u\n", bch2_sb_nr_devices(sb));
 
-	prt_printf(out, "Sections:");
+	prt_printf(out, "Sections:\t");
+	u64 fields_have = 0;
 	vstruct_for_each(sb, f)
 		fields_have |= 1 << le32_to_cpu(f->type);
-	prt_tab(out);
 	prt_bitflags(out, bch2_sb_fields, fields_have);
 	prt_newline(out);
 
-	prt_printf(out, "Features:");
-	prt_tab(out);
+	prt_printf(out, "Features:\t");
 	prt_bitflags(out, bch2_sb_features, le64_to_cpu(sb->features[0]));
 	prt_newline(out);
 
-	prt_printf(out, "Compat features:");
-	prt_tab(out);
+	prt_printf(out, "Compat features:\t");
 	prt_bitflags(out, bch2_sb_compat, le64_to_cpu(sb->compat[0]));
 	prt_newline(out);
 
@@ -1243,8 +1391,7 @@ void bch2_sb_to_text(struct printbuf *out, struct bch_sb *sb,
 			if (opt->get_sb != BCH2_NO_SB_OPT) {
 				u64 v = bch2_opt_from_sb(sb, id);
 
-				prt_printf(out, "%s:", opt->attr.name);
-				prt_tab(out);
+				prt_printf(out, "%s:\t", opt->attr.name);
 				bch2_opt_to_text(out, NULL, sb, opt, v,
 						 OPT_HUMAN_READABLE|OPT_SHOW_FULL_LIST);
 				prt_newline(out);

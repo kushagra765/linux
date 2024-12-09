@@ -84,12 +84,10 @@ config EFI_ZBOOT
 	help
 	  Create the bootable image as an EFI application that carries the
 	  actual kernel image in compressed form, and decompresses it into
-	  memory before executing it via LoadImage/StartImage EFI boot service
-	  calls. For compatibility with non-EFI loaders, the payload can be
-	  decompressed and executed by the loader as well, provided that the
-	  loader implements the decompression algorithm and that non-EFI boot
-	  is supported by the encapsulated image. (The compression algorithm
-	  used is described in the zboot image header)
+	  memory before executing it. For compatibility with non-EFI loaders,
+	  the payload can be decompressed and executed by the loader as well,
+	  provided that the loader implements the decompression algorithm.
+	  (The compression algorithm used is described in the zboot header)
 
 config EFI_ARMSTUB_DTB_LOADER
 	bool "Enable the DTB loader"
@@ -301,3 +299,18 @@ config UEFI_CPER_X86
 	bool
 	depends on UEFI_CPER && X86
 	default y
+
+config TEE_STMM_EFI
+	tristate "TEE-based EFI runtime variable service driver"
+	depends on EFI && OPTEE
+	help
+	  Select this config option if TEE is compiled to include StandAloneMM
+	  as a separate secure partition. It has the ability to check and store
+	  EFI variables on an RPMB or any other non-volatile medium used by
+	  StandAloneMM.
+
+	  Enabling this will change the EFI runtime services from the firmware
+	  provided functions to TEE calls.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called tee_stmm_efi.

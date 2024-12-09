@@ -283,7 +283,7 @@ static void ab8500_btemp_periodic_work(struct work_struct *work)
 			dev_warn(di->dev, "failed to identify the battery\n");
 	}
 
-	/* Failover if a reading is erroneous, use last meausurement */
+	/* Failover if a reading is erroneous, use last measurement */
 	ret = thermal_zone_get_temp(di->tz, &bat_temp);
 	if (ret) {
 		dev_err(di->dev, "error reading temperature\n");
@@ -617,8 +617,7 @@ static int ab8500_btemp_get_ext_psy_data(struct device *dev, void *data)
  */
 static void ab8500_btemp_external_power_changed(struct power_supply *psy)
 {
-	class_for_each_device(power_supply_class, NULL, psy,
-			      ab8500_btemp_get_ext_psy_data);
+	power_supply_for_each_device(psy, ab8500_btemp_get_ext_psy_data);
 }
 
 /* ab8500 btemp driver interrupts and their respective isr */
@@ -819,7 +818,7 @@ MODULE_DEVICE_TABLE(of, ab8500_btemp_match);
 
 struct platform_driver ab8500_btemp_driver = {
 	.probe = ab8500_btemp_probe,
-	.remove_new = ab8500_btemp_remove,
+	.remove = ab8500_btemp_remove,
 	.driver = {
 		.name = "ab8500-btemp",
 		.of_match_table = ab8500_btemp_match,

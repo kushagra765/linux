@@ -176,8 +176,7 @@ __csi2tx_get_pad_format(struct v4l2_subdev *subdev,
 	struct csi2tx_priv *csi2tx = v4l2_subdev_to_csi2tx(subdev);
 
 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY)
-		return v4l2_subdev_get_try_format(subdev, sd_state,
-						  fmt->pad);
+		return v4l2_subdev_state_get_format(sd_state, fmt->pad);
 
 	return &csi2tx->pad_fmts[fmt->pad];
 }
@@ -645,7 +644,7 @@ static void csi2tx_remove(struct platform_device *pdev)
 
 static struct platform_driver csi2tx_driver = {
 	.probe	= csi2tx_probe,
-	.remove_new = csi2tx_remove,
+	.remove = csi2tx_remove,
 
 	.driver	= {
 		.name		= "cdns-csi2tx",

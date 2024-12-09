@@ -67,8 +67,6 @@ struct net {
 						 */
 	spinlock_t		rules_mod_lock;
 
-	atomic_t		dev_unreg_count;
-
 	unsigned int		dev_base_seq;	/* protected by rtnl_mutex */
 	u32			ifindex;
 
@@ -189,6 +187,10 @@ struct net {
 	struct sock		*diag_nlsk;
 #if IS_ENABLED(CONFIG_SMC)
 	struct netns_smc	smc;
+#endif
+#ifdef CONFIG_DEBUG_NET_SMALL_RTNL
+	/* Move to a better place when the config guard is removed. */
+	struct mutex		rtnl_mutex;
 #endif
 } __randomize_layout;
 
@@ -323,6 +325,11 @@ static inline int check_net(const struct net *net)
 #define net_drop_ns NULL
 #endif
 
+/* Returns true if the netns initialization is completed successfully */
+static inline bool net_initialized(const struct net *net)
+{
+	return READ_ONCE(net->list.next);
+}
 
 static inline void __netns_tracker_alloc(struct net *net,
 					 netns_tracker *tracker,
@@ -450,8 +457,11 @@ struct pernet_operations {
 	void (*pre_exit)(struct net *net);
 	void (*exit)(struct net *net);
 	void (*exit_batch)(struct list_head *net_exit_list);
-	unsigned int *id;
-	size_t size;
+	/* Following method is called with RTNL held. */
+	void (*exit_batch_rtnl)(struct list_head *net_exit_list,
+				struct list_head *dev_kill_list);
+	unsigned int * const id;
+	const size_t size;
 };
 
 /*

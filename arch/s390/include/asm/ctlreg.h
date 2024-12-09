@@ -141,22 +141,26 @@ static __always_inline void local_ctl_store(unsigned int cr, struct ctlreg *reg)
 		: [cr] "i" (cr));
 }
 
-static __always_inline void local_ctl_set_bit(unsigned int cr, unsigned int bit)
+static __always_inline struct ctlreg local_ctl_set_bit(unsigned int cr, unsigned int bit)
 {
-	struct ctlreg reg;
+	struct ctlreg new, old;
 
-	local_ctl_store(cr, &reg);
-	reg.val |= 1UL << bit;
-	local_ctl_load(cr, &reg);
+	local_ctl_store(cr, &old);
+	new = old;
+	new.val |= 1UL << bit;
+	local_ctl_load(cr, &new);
+	return old;
 }
 
-static __always_inline void local_ctl_clear_bit(unsigned int cr, unsigned int bit)
+static __always_inline struct ctlreg local_ctl_clear_bit(unsigned int cr, unsigned int bit)
 {
-	struct ctlreg reg;
+	struct ctlreg new, old;
 
-	local_ctl_store(cr, &reg);
-	reg.val &= ~(1UL << bit);
-	local_ctl_load(cr, &reg);
+	local_ctl_store(cr, &old);
+	new = old;
+	new.val &= ~(1UL << bit);
+	local_ctl_load(cr, &new);
+	return old;
 }
 
 struct lowcore;
@@ -198,8 +202,9 @@ union ctlreg0 {
 		unsigned long	   : 3;
 		unsigned long ccc  : 1; /* Cryptography counter control */
 		unsigned long pec  : 1; /* PAI extension control */
-		unsigned long	   : 17;
-		unsigned long	   : 3;
+		unsigned long	   : 15;
+		unsigned long wti  : 1; /* Warning-track */
+		unsigned long	   : 4;
 		unsigned long lap  : 1; /* Low-address-protection control */
 		unsigned long	   : 4;
 		unsigned long edat : 1; /* Enhanced-DAT-enablement control */

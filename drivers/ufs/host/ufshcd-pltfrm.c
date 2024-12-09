@@ -31,8 +31,7 @@ static int ufshcd_parse_clock_info(struct ufs_hba *hba)
 	const char *name;
 	u32 *clkfreq = NULL;
 	struct ufs_clk_info *clki;
-	int len = 0;
-	size_t sz = 0;
+	ssize_t sz = 0;
 
 	if (!np)
 		goto out;
@@ -50,15 +49,12 @@ static int ufshcd_parse_clock_info(struct ufs_hba *hba)
 	if (cnt <= 0)
 		goto out;
 
-	if (!of_get_property(np, "freq-table-hz", &len)) {
+	sz = of_property_count_u32_elems(np, "freq-table-hz");
+	if (sz <= 0) {
 		dev_info(dev, "freq-table-hz property not specified\n");
 		goto out;
 	}
 
-	if (len <= 0)
-		goto out;
-
-	sz = len / sizeof(*clkfreq);
 	if (sz != 2 * cnt) {
 		dev_err(dev, "%s len mismatch\n", "freq-table-hz");
 		ret = -EINVAL;
@@ -272,10 +268,10 @@ static int ufshcd_parse_operating_points(struct ufs_hba *hba)
 	const char **clk_names;
 	int cnt, i, ret;
 
-	if (!of_find_property(np, "operating-points-v2", NULL))
+	if (!of_property_present(np, "operating-points-v2"))
 		return 0;
 
-	if (of_find_property(np, "freq-table-hz", NULL)) {
+	if (of_property_present(np, "freq-table-hz")) {
 		dev_err(dev, "%s: operating-points and freq-table-hz are incompatible\n",
 			 __func__);
 		return -EINVAL;
@@ -339,61 +335,60 @@ static int ufshcd_parse_operating_points(struct ufs_hba *hba)
 }
 
 /**
- * ufshcd_get_pwr_dev_param - get finally agreed attributes for
- *                            power mode change
- * @pltfrm_param: pointer to platform parameters
+ * ufshcd_negotiate_pwr_params - find power mode settings that are supported by
+ *				 both the controller and the device
+ * @host_params: pointer to host parameters
  * @dev_max: pointer to device attributes
  * @agreed_pwr: returned agreed attributes
  *
  * Return: 0 on success, non-zero value on failure.
  */
-int ufshcd_get_pwr_dev_param(const struct ufs_dev_params *pltfrm_param,
-			     const struct ufs_pa_layer_attr *dev_max,
-			     struct ufs_pa_layer_attr *agreed_pwr)
+int ufshcd_negotiate_pwr_params(const struct ufs_host_params *host_params,
+				const struct ufs_pa_layer_attr *dev_max,
+				struct ufs_pa_layer_attr *agreed_pwr)
 {
-	int min_pltfrm_gear;
+	int min_host_gear;
 	int min_dev_gear;
 	bool is_dev_sup_hs = false;
-	bool is_pltfrm_max_hs = false;
+	bool is_host_max_hs = false;
 
 	if (dev_max->pwr_rx == FAST_MODE)
 		is_dev_sup_hs = true;
 
-	if (pltfrm_param->desired_working_mode == UFS_HS_MODE) {
-		is_pltfrm_max_hs = true;
-		min_pltfrm_gear = min_t(u32, pltfrm_param->hs_rx_gear,
-					pltfrm_param->hs_tx_gear);
+	if (host_params->desired_working_mode == UFS_HS_MODE) {
+		is_host_max_hs = true;
+		min_host_gear = min_t(u32, host_params->hs_rx_gear,
+					host_params->hs_tx_gear);
 	} else {
-		min_pltfrm_gear = min_t(u32, pltfrm_param->pwm_rx_gear,
-					pltfrm_param->pwm_tx_gear);
+		min_host_gear = min_t(u32, host_params->pwm_rx_gear,
+					host_params->pwm_tx_gear);
 	}
 
 	/*
-	 * device doesn't support HS but
-	 * pltfrm_param->desired_working_mode is HS,
-	 * thus device and pltfrm_param don't agree
+	 * device doesn't support HS but host_params->desired_working_mode is HS,
+	 * thus device and host_params don't agree
 	 */
-	if (!is_dev_sup_hs && is_pltfrm_max_hs) {
+	if (!is_dev_sup_hs && is_host_max_hs) {
 		pr_info("%s: device doesn't support HS\n",
 			__func__);
 		return -ENOTSUPP;
-	} else if (is_dev_sup_hs && is_pltfrm_max_hs) {
+	} else if (is_dev_sup_hs && is_host_max_hs) {
 		/*
 		 * since device supports HS, it supports FAST_MODE.
-		 * since pltfrm_param->desired_working_mode is also HS
+		 * since host_params->desired_working_mode is also HS
 		 * then final decision (FAST/FASTAUTO) is done according
 		 * to pltfrm_params as it is the restricting factor
 		 */
-		agreed_pwr->pwr_rx = pltfrm_param->rx_pwr_hs;
+		agreed_pwr->pwr_rx = host_params->rx_pwr_hs;
 		agreed_pwr->pwr_tx = agreed_pwr->pwr_rx;
 	} else {
 		/*
-		 * here pltfrm_param->desired_working_mode is PWM.
+		 * here host_params->desired_working_mode is PWM.
 		 * it doesn't matter whether device supports HS or PWM,
-		 * in both cases pltfrm_param->desired_working_mode will
+		 * in both cases host_params->desired_working_mode will
 		 * determine the mode
 		 */
-		agreed_pwr->pwr_rx = pltfrm_param->rx_pwr_pwm;
+		agreed_pwr->pwr_rx = host_params->rx_pwr_pwm;
 		agreed_pwr->pwr_tx = agreed_pwr->pwr_rx;
 	}
 
@@ -403,9 +398,9 @@ int ufshcd_get_pwr_dev_param(const struct ufs_dev_params *pltfrm_param,
 	 * the same decision will be made for rx
 	 */
 	agreed_pwr->lane_tx = min_t(u32, dev_max->lane_tx,
-				    pltfrm_param->tx_lanes);
+				    host_params->tx_lanes);
 	agreed_pwr->lane_rx = min_t(u32, dev_max->lane_rx,
-				    pltfrm_param->rx_lanes);
+				    host_params->rx_lanes);
 
 	/* device maximum gear is the minimum between device rx and tx gears */
 	min_dev_gear = min_t(u32, dev_max->gear_rx, dev_max->gear_tx);
@@ -418,26 +413,26 @@ int ufshcd_get_pwr_dev_param(const struct ufs_dev_params *pltfrm_param,
 	 * what is the gear, as it is the one that also decided previously what
 	 * pwr the device will be configured to.
 	 */
-	if ((is_dev_sup_hs && is_pltfrm_max_hs) ||
-	    (!is_dev_sup_hs && !is_pltfrm_max_hs)) {
+	if ((is_dev_sup_hs && is_host_max_hs) ||
+	    (!is_dev_sup_hs && !is_host_max_hs)) {
 		agreed_pwr->gear_rx =
-			min_t(u32, min_dev_gear, min_pltfrm_gear);
+			min_t(u32, min_dev_gear, min_host_gear);
 	} else if (!is_dev_sup_hs) {
 		agreed_pwr->gear_rx = min_dev_gear;
 	} else {
-		agreed_pwr->gear_rx = min_pltfrm_gear;
+		agreed_pwr->gear_rx = min_host_gear;
 	}
 	agreed_pwr->gear_tx = agreed_pwr->gear_rx;
 
-	agreed_pwr->hs_rate = pltfrm_param->hs_rate;
+	agreed_pwr->hs_rate = host_params->hs_rate;
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(ufshcd_get_pwr_dev_param);
+EXPORT_SYMBOL_GPL(ufshcd_negotiate_pwr_params);
 
-void ufshcd_init_pwr_dev_param(struct ufs_dev_params *dev_param)
+void ufshcd_init_host_params(struct ufs_host_params *host_params)
 {
-	*dev_param = (struct ufs_dev_params){
+	*host_params = (struct ufs_host_params){
 		.tx_lanes = UFS_LANE_2,
 		.rx_lanes = UFS_LANE_2,
 		.hs_rx_gear = UFS_HS_G3,
@@ -452,7 +447,7 @@ void ufshcd_init_pwr_dev_param(struct ufs_dev_params *dev_param)
 		.desired_working_mode = UFS_HS_MODE,
 	};
 }
-EXPORT_SYMBOL_GPL(ufshcd_init_pwr_dev_param);
+EXPORT_SYMBOL_GPL(ufshcd_init_host_params);
 
 /**
  * ufshcd_pltfrm_init - probe routine of the driver
@@ -528,6 +523,22 @@ out:
 	return err;
 }
 EXPORT_SYMBOL_GPL(ufshcd_pltfrm_init);
+
+/**
+ * ufshcd_pltfrm_remove - Remove ufshcd platform
+ * @pdev: pointer to Platform device handle
+ */
+void ufshcd_pltfrm_remove(struct platform_device *pdev)
+{
+	struct ufs_hba *hba =  platform_get_drvdata(pdev);
+
+	pm_runtime_get_sync(&pdev->dev);
+	ufshcd_remove(hba);
+	ufshcd_dealloc_host(hba);
+	pm_runtime_disable(&pdev->dev);
+	pm_runtime_put_noidle(&pdev->dev);
+}
+EXPORT_SYMBOL_GPL(ufshcd_pltfrm_remove);
 
 MODULE_AUTHOR("Santosh Yaragnavi <santosh.sy@samsung.com>");
 MODULE_AUTHOR("Vinayak Holikatti <h.vinayak@samsung.com>");

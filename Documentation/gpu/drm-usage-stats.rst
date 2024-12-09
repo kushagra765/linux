@@ -73,6 +73,11 @@ scope of each device, in which case `drm-pdev` shall be present as well.
 Userspace should make sure to not double account any usage statistics by using
 the above described criteria in order to associate data to individual clients.
 
+- drm-client-name: <valstr>
+
+String optionally set by userspace using DRM_IOCTL_SET_CLIENT_NAME.
+
+
 Utilization
 ^^^^^^^^^^^
 
@@ -112,6 +117,19 @@ larger value within a reasonable period. Upon observing a value lower than what
 was previously read, userspace is expected to stay with that larger previous
 value until a monotonic update is seen.
 
+- drm-total-cycles-<keystr>: <uint>
+
+Engine identifier string must be the same as the one specified in the
+drm-cycles-<keystr> tag and shall contain the total number cycles for the given
+engine.
+
+This is a timestamp in GPU unspecified unit that matches the update rate
+of drm-cycles-<keystr>. For drivers that implement this interface, the engine
+utilization can be calculated entirely on the GPU clock domain, without
+considering the CPU sleep time between 2 samples.
+
+A driver may implement either this key or drm-maxfreq-<keystr>, but not both.
+
 - drm-maxfreq-<keystr>: <uint> [Hz|MHz|KHz]
 
 Engine identifier string must be the same as the one specified in the
@@ -121,6 +139,9 @@ percentage utilization of the engine, whereas drm-engine-<keystr> only reflects
 time active without considering what frequency the engine is operating as a
 percentage of its maximum frequency.
 
+A driver may implement either this key or drm-total-cycles-<keystr>, but not
+both.
+
 Memory
 ^^^^^^
 
@@ -128,7 +149,9 @@ Memory
 
 Each possible memory type which can be used to store buffer objects by the
 GPU in question shall be given a stable and unique name to be returned as the
-string here.  The name "memory" is reserved to refer to normal system memory.
+string here.
+
+The region name "memory" is reserved to refer to normal system memory.
 
 Value shall reflect the amount of storage currently consumed by the buffer
 objects belong to this client, in the respective memory region.
@@ -136,26 +159,43 @@ objects belong to this client, in the respective memory region.
 Default unit shall be bytes with optional unit specifiers of 'KiB' or 'MiB'
 indicating kibi- or mebi-bytes.
 
+This key is deprecated and is an alias for drm-resident-<region>. Only one of
+the two should be present in the output.
+
 - drm-shared-<region>: <uint> [KiB|MiB]
 
-The total size of buffers that are shared with another file (ie. have more
+The total size of buffers that are shared with another file (e.g., have more
 than a single handle).
 
 - drm-total-<region>: <uint> [KiB|MiB]
 
-The total size of buffers that including shared and private memory.
+The total size of all created buffers including shared and private memory. The
+backing store for the buffers does not have to be currently instantiated to be
+counted under this category.
 
 - drm-resident-<region>: <uint> [KiB|MiB]
 
-The total size of buffers that are resident in the specified region.
+The total size of buffers that are resident (have their backing store present or
+instantiated) in the specified region.
+
+This is an alias for drm-memory-<region> and only one of the two should be
+present in the output.
 
 - drm-purgeable-<region>: <uint> [KiB|MiB]
 
 The total size of buffers that are purgeable.
 
+For example drivers which implement a form of 'madvise' like functionality can
+here count buffers which have instantiated backing store, but have been marked
+with an equivalent of MADV_DONTNEED.
+
 - drm-active-<region>: <uint> [KiB|MiB]
 
 The total size of buffers that are active on one or more engines.
+
+One practical example of this can be presence of unsignaled fences in an GEM
+buffer reservation object. Therefore the active category is a subset of
+resident.
 
 Implementation Details
 ======================
@@ -168,5 +208,7 @@ be documented above and where possible, aligned with other drivers.
 Driver specific implementations
 -------------------------------
 
-:ref:`i915-usage-stats`
-:ref:`panfrost-usage-stats`
+* :ref:`i915-usage-stats`
+* :ref:`panfrost-usage-stats`
+* :ref:`panthor-usage-stats`
+* :ref:`xe-usage-stats`

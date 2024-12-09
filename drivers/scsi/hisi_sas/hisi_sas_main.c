@@ -868,10 +868,11 @@ err_out:
 	return rc;
 }
 
-int hisi_sas_slave_configure(struct scsi_device *sdev)
+int hisi_sas_device_configure(struct scsi_device *sdev,
+		struct queue_limits *lim)
 {
 	struct domain_device *dev = sdev_to_domain_dev(sdev);
-	int ret = sas_slave_configure(sdev);
+	int ret = sas_device_configure(sdev, lim);
 
 	if (ret)
 		return ret;
@@ -880,7 +881,7 @@ int hisi_sas_slave_configure(struct scsi_device *sdev)
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(hisi_sas_slave_configure);
+EXPORT_SYMBOL_GPL(hisi_sas_device_configure);
 
 void hisi_sas_scan_start(struct Scsi_Host *shost)
 {
@@ -1320,6 +1321,7 @@ static int hisi_sas_softreset_ata_disk(struct domain_device *device)
 	}
 
 	if (rc == TMF_RESP_FUNC_COMPLETE) {
+		usleep_range(900, 1000);
 		ata_for_each_link(link, ap, EDGE) {
 			int pmp = sata_srst_pmp(link);
 
@@ -1383,6 +1385,7 @@ static void hisi_sas_refresh_port_id(struct hisi_hba *hisi_hba)
 
 static void hisi_sas_rescan_topology(struct hisi_hba *hisi_hba, u32 state)
 {
+	u32 new_state = hisi_hba->hw->get_phys_state(hisi_hba);
 	struct asd_sas_port *_sas_port = NULL;
 	int phy_no;
 
@@ -1396,7 +1399,7 @@ static void hisi_sas_rescan_topology(struct hisi_hba *hisi_hba, u32 state)
 			continue;
 
 		/* Report PHY state change to libsas */
-		if (state & BIT(phy_no)) {
+		if (new_state & BIT(phy_no)) {
 			if (do_port_check && sas_port && sas_port->port_dev) {
 				struct domain_device *dev = sas_port->port_dev;
 
@@ -1409,6 +1412,16 @@ static void hisi_sas_rescan_topology(struct hisi_hba *hisi_hba, u32 state)
 			}
 		} else {
 			hisi_sas_phy_down(hisi_hba, phy_no, 0, GFP_KERNEL);
+
+			/*
+			 * The new_state is not ready but old_state is ready,
+			 * the two possible causes:
+			 * 1. The connected device is removed
+			 * 2. Device exists but phyup timed out
+			 */
+			if (state & BIT(phy_no))
+				hisi_sas_notify_phy_event(phy,
+							  HISI_PHYE_LINK_RESET);
 		}
 	}
 }
@@ -1507,7 +1520,12 @@ void hisi_sas_controller_reset_prepare(struct hisi_hba *hisi_hba)
 	scsi_block_requests(shost);
 	hisi_hba->hw->wait_cmds_complete_timeout(hisi_hba, 100, 5000);
 
-	del_timer_sync(&hisi_hba->timer);
+	/*
+	 * hisi_hba->timer is only used for v1/v2 hw, and check hw->sht
+	 * which is also only used for v1/v2 hw to skip it for v3 hw
+	 */
+	if (hisi_hba->hw->sht)
+		del_timer_sync(&hisi_hba->timer);
 
 	set_bit(HISI_SAS_REJECT_CMD_BIT, &hisi_hba->flags);
 }
@@ -1539,9 +1557,15 @@ void hisi_sas_controller_reset_done(struct hisi_hba *hisi_hba)
 	/* Init and wait for PHYs to come up and all libsas event finished. */
 	for (phy_no = 0; phy_no < hisi_hba->n_phy; phy_no++) {
 		struct hisi_sas_phy *phy = &hisi_hba->phy[phy_no];
+		struct asd_sas_phy *sas_phy = &phy->sas_phy;
 
-		if (!(hisi_hba->phy_state & BIT(phy_no)))
+		if (!sas_phy->phy->enabled)
 			continue;
+
+		if (!(hisi_hba->phy_state & BIT(phy_no))) {
+			hisi_sas_phy_enable(hisi_hba, phy_no, 1);
+			continue;
+		}
 
 		async_schedule_domain(hisi_sas_async_init_wait_phyup,
 				      phy, &async);
@@ -1565,15 +1589,15 @@ EXPORT_SYMBOL_GPL(hisi_sas_controller_reset_done);
 static int hisi_sas_controller_prereset(struct hisi_hba *hisi_hba)
 {
 	if (!hisi_hba->hw->soft_reset)
-		return -1;
+		return -ENOENT;
 
 	down(&hisi_hba->sem);
 	if (test_and_set_bit(HISI_SAS_RESETTING_BIT, &hisi_hba->flags)) {
 		up(&hisi_hba->sem);
-		return -1;
+		return -EPERM;
 	}
 
-	if (hisi_sas_debugfs_enable && hisi_hba->debugfs_itct[0].itct)
+	if (hisi_sas_debugfs_enable)
 		hisi_hba->hw->debugfs_snapshot_regs(hisi_hba);
 
 	return 0;
@@ -1641,7 +1665,10 @@ static int hisi_sas_abort_task(struct sas_task *task)
 	task->task_state_flags |= SAS_TASK_STATE_ABORTED;
 	spin_unlock_irqrestore(&task->task_state_lock, flags);
 
-	if (slot && task->task_proto & SAS_PROTOCOL_SSP) {
+	if (!slot)
+		goto out;
+
+	if (task->task_proto & SAS_PROTOCOL_SSP) {
 		u16 tag = slot->idx;
 		int rc2;
 
@@ -1688,7 +1715,7 @@ static int hisi_sas_abort_task(struct sas_task *task)
 				rc = hisi_sas_softreset_ata_disk(device);
 			}
 		}
-	} else if (slot && task->task_proto & SAS_PROTOCOL_SMP) {
+	} else if (task->task_proto & SAS_PROTOCOL_SMP) {
 		/* SMP */
 		u32 tag = slot->idx;
 		struct hisi_sas_cq *cq = &hisi_hba->cq[slot->dlvry_queue];
@@ -1789,7 +1816,7 @@ static int hisi_sas_debug_I_T_nexus_reset(struct domain_device *device)
 	if (dev_is_sata(device)) {
 		struct ata_link *link = &device->sata_dev.ap->link;
 
-		rc = ata_wait_after_reset(link, HISI_SAS_WAIT_PHYUP_TIMEOUT,
+		rc = ata_wait_after_reset(link, jiffies + HISI_SAS_WAIT_PHYUP_TIMEOUT,
 					  smp_ata_check_ready_type);
 	} else {
 		msleep(2000);
@@ -1958,10 +1985,18 @@ static bool hisi_sas_internal_abort_timeout(struct sas_task *task,
 	struct hisi_hba *hisi_hba = dev_to_hisi_hba(device);
 	struct hisi_sas_internal_abort_data *timeout = data;
 
-	if (hisi_sas_debugfs_enable && hisi_hba->debugfs_itct[0].itct) {
-		down(&hisi_hba->sem);
+	if (hisi_sas_debugfs_enable) {
+		/*
+		 * If timeout occurs in device gone scenario, to avoid
+		 * circular dependency like:
+		 * hisi_sas_dev_gone() -> down() -> ... ->
+		 * hisi_sas_internal_abort_timeout() -> down().
+		 */
+		if (!timeout->rst_ha_timeout)
+			down(&hisi_hba->sem);
 		hisi_hba->hw->debugfs_snapshot_regs(hisi_hba);
-		up(&hisi_hba->sem);
+		if (!timeout->rst_ha_timeout)
+			up(&hisi_hba->sem);
 	}
 
 	if (task->task_state_flags & SAS_TASK_STATE_DONE) {
@@ -2285,7 +2320,8 @@ int hisi_sas_alloc(struct hisi_hba *hisi_hba)
 
 	hisi_hba->last_slot_index = 0;
 
-	hisi_hba->wq = create_singlethread_workqueue(dev_name(dev));
+	hisi_hba->wq =
+		alloc_ordered_workqueue("%s", WQ_MEM_RECLAIM, dev_name(dev));
 	if (!hisi_hba->wq) {
 		dev_err(dev, "sas_alloc: failed to create workqueue\n");
 		goto err_out;
@@ -2431,6 +2467,11 @@ static struct Scsi_Host *hisi_sas_shost_alloc(struct platform_device *pdev,
 
 	if (hisi_sas_get_fw_info(hisi_hba) < 0)
 		goto err_out;
+
+	if (hisi_hba->hw->fw_info_check) {
+		if (hisi_hba->hw->fw_info_check(hisi_hba))
+			goto err_out;
+	}
 
 	error = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(64));
 	if (error) {
@@ -2612,9 +2653,10 @@ static __init int hisi_sas_init(void)
 
 static __exit void hisi_sas_exit(void)
 {
-	sas_release_transport(hisi_sas_stt);
+	if (hisi_sas_debugfs_enable)
+		debugfs_remove(hisi_sas_debugfs_dir);
 
-	debugfs_remove(hisi_sas_debugfs_dir);
+	sas_release_transport(hisi_sas_stt);
 }
 
 module_init(hisi_sas_init);

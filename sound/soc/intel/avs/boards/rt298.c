@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //
-// Copyright(c) 2021-2022 Intel Corporation. All rights reserved.
+// Copyright(c) 2021-2022 Intel Corporation
 //
 // Authors: Cezary Rojewski <cezary.rojewski@intel.com>
 //          Amadeusz Slawinski <amadeuszx.slawinski@linux.intel.com>
@@ -49,7 +49,7 @@ static const struct snd_soc_dapm_route card_base_routes[] = {
 	{"Speaker", NULL, "SPOL"},
 };
 
-static struct snd_soc_jack_pin card_headset_pins[] = {
+static const struct snd_soc_jack_pin card_headset_pins[] = {
 	{
 		.pin = "Headphone Jack",
 		.mask = SND_JACK_HEADPHONE,
@@ -74,8 +74,8 @@ static int avs_rt298_codec_init(struct snd_soc_pcm_runtime *runtime)
 	if (!pins)
 		return -ENOMEM;
 
-	ret = snd_soc_card_jack_new_pins(card, "Headset", SND_JACK_HEADSET | SND_JACK_BTN_0, jack,
-					 pins, num_pins);
+	ret = snd_soc_card_jack_new_pins(card, "Headset Jack", SND_JACK_HEADSET | SND_JACK_BTN_0,
+					 jack, pins, num_pins);
 	if (ret)
 		return ret;
 
@@ -173,8 +173,6 @@ static int avs_create_dai_link(struct device *dev, const char *platform_name, in
 	dl->ops = &avs_rt298_ops;
 	dl->nonatomic = 1;
 	dl->no_pcm = 1;
-	dl->dpcm_capture = 1;
-	dl->dpcm_playback = 1;
 
 	*dai_link = dl;
 
@@ -247,15 +245,24 @@ static int avs_rt298_probe(struct platform_device *pdev)
 	return devm_snd_soc_register_card(dev, card);
 }
 
+static const struct platform_device_id avs_rt298_driver_ids[] = {
+	{
+		.name = "avs_rt298",
+	},
+	{},
+};
+MODULE_DEVICE_TABLE(platform, avs_rt298_driver_ids);
+
 static struct platform_driver avs_rt298_driver = {
 	.probe = avs_rt298_probe,
 	.driver = {
 		.name = "avs_rt298",
 		.pm = &snd_soc_pm_ops,
 	},
+	.id_table = avs_rt298_driver_ids,
 };
 
 module_platform_driver(avs_rt298_driver);
 
+MODULE_DESCRIPTION("Intel rt298 machine driver");
 MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:avs_rt298");

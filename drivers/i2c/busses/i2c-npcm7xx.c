@@ -136,11 +136,13 @@ enum i2c_addr {
  * Since the addr regs are sprinkled all over the address space,
  * use this array to get the address or each register.
  */
-#define I2C_NUM_OWN_ADDR 2
+#define I2C_NUM_OWN_ADDR 10
 #define I2C_NUM_OWN_ADDR_SUPPORTED 2
 
 static const int npcm_i2caddr[I2C_NUM_OWN_ADDR] = {
-	NPCM_I2CADDR1, NPCM_I2CADDR2,
+	NPCM_I2CADDR1, NPCM_I2CADDR2, NPCM_I2CADDR3, NPCM_I2CADDR4,
+	NPCM_I2CADDR5, NPCM_I2CADDR6, NPCM_I2CADDR7, NPCM_I2CADDR8,
+	NPCM_I2CADDR9, NPCM_I2CADDR10,
 };
 #endif
 
@@ -326,13 +328,13 @@ struct npcm_i2c {
 	u8 slv_rd_buf[MAX_I2C_HW_FIFO_SIZE];
 	u8 slv_wr_buf[MAX_I2C_HW_FIFO_SIZE];
 #endif
-	struct dentry *debugfs; /* debugfs device directory */
 	u64 ber_cnt;
 	u64 rec_succ_cnt;
 	u64 rec_fail_cnt;
 	u64 nack_cnt;
 	u64 timeout_cnt;
 	u64 tx_complete_cnt;
+	bool ber_state; /* Indicate the bus error state */
 };
 
 static inline void npcm_i2c_select_bank(struct npcm_i2c *bus,
@@ -1265,9 +1267,6 @@ static int npcm_i2c_reg_slave(struct i2c_client *client)
 
 	bus->slave = client;
 
-	if (!bus->slave)
-		return -EINVAL;
-
 	if (client->flags & I2C_CLIENT_TEN)
 		return -EAFNOSUPPORT;
 
@@ -1523,6 +1522,7 @@ static void npcm_i2c_irq_handle_ber(struct npcm_i2c *bus)
 	if (npcm_i2c_is_master(bus)) {
 		npcm_i2c_master_abort(bus);
 	} else {
+		bus->ber_state = true;
 		npcm_i2c_clear_master_status(bus);
 
 		/* Clear BB (BUS BUSY) bit */
@@ -1630,13 +1630,10 @@ static void npcm_i2c_irq_handle_sda(struct npcm_i2c *bus, u8 i2cst)
 			npcm_i2c_wr_byte(bus, bus->dest_addr | BIT(0));
 	/* SDA interrupt, after start\restart */
 	} else {
-		if (NPCM_I2CST_XMIT & i2cst) {
-			bus->operation = I2C_WRITE_OPER;
+		if (bus->operation == I2C_WRITE_OPER)
 			npcm_i2c_irq_master_handler_write(bus);
-		} else {
-			bus->operation = I2C_READ_OPER;
+		else if (bus->operation == I2C_READ_OPER)
 			npcm_i2c_irq_master_handler_read(bus);
-		}
 	}
 }
 
@@ -1704,6 +1701,7 @@ static int npcm_i2c_recovery_tgclk(struct i2c_adapter *_adap)
 		dev_dbg(bus->dev, "bus%d-0x%x recovery skipped, bus not stuck",
 			bus->num, bus->dest_addr);
 		npcm_i2c_reset(bus);
+		bus->ber_state = false;
 		return 0;
 	}
 
@@ -1768,6 +1766,7 @@ static int npcm_i2c_recovery_tgclk(struct i2c_adapter *_adap)
 		if (bus->rec_succ_cnt < ULLONG_MAX)
 			bus->rec_succ_cnt++;
 	}
+	bus->ber_state = false;
 	return status;
 }
 
@@ -2163,7 +2162,16 @@ static int npcm_i2c_master_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs,
 
 	} while (time_is_after_jiffies(time_left) && bus_busy);
 
-	if (bus_busy) {
+	/*
+	 * Check the BER (bus error) state, when ber_state is true, it means that the module
+	 * detects the bus error which is caused by some factor like that the electricity
+	 * noise occurs on the bus. Under this condition, the module is reset and the bus
+	 * gets recovered.
+	 *
+	 * While ber_state is false, the module reset and bus recovery also get done as the
+	 * bus is busy.
+	 */
+	if (bus_busy || bus->ber_state) {
 		iowrite8(NPCM_I2CCST_BB, bus->reg + NPCM_I2CCST);
 		npcm_i2c_reset(bus);
 		i2c_recover_bus(adap);
@@ -2250,27 +2258,15 @@ static const struct i2c_algorithm npcm_i2c_algo = {
 #endif
 };
 
-/* i2c debugfs directory: used to keep health monitor of i2c devices */
-static struct dentry *npcm_i2c_debugfs_dir;
-
 static void npcm_i2c_init_debugfs(struct platform_device *pdev,
 				  struct npcm_i2c *bus)
 {
-	struct dentry *d;
-
-	if (!npcm_i2c_debugfs_dir)
-		return;
-	d = debugfs_create_dir(dev_name(&pdev->dev), npcm_i2c_debugfs_dir);
-	if (IS_ERR_OR_NULL(d))
-		return;
-	debugfs_create_u64("ber_cnt", 0444, d, &bus->ber_cnt);
-	debugfs_create_u64("nack_cnt", 0444, d, &bus->nack_cnt);
-	debugfs_create_u64("rec_succ_cnt", 0444, d, &bus->rec_succ_cnt);
-	debugfs_create_u64("rec_fail_cnt", 0444, d, &bus->rec_fail_cnt);
-	debugfs_create_u64("timeout_cnt", 0444, d, &bus->timeout_cnt);
-	debugfs_create_u64("tx_complete_cnt", 0444, d, &bus->tx_complete_cnt);
-
-	bus->debugfs = d;
+	debugfs_create_u64("ber_cnt", 0444, bus->adap.debugfs, &bus->ber_cnt);
+	debugfs_create_u64("nack_cnt", 0444, bus->adap.debugfs, &bus->nack_cnt);
+	debugfs_create_u64("rec_succ_cnt", 0444, bus->adap.debugfs, &bus->rec_succ_cnt);
+	debugfs_create_u64("rec_fail_cnt", 0444, bus->adap.debugfs, &bus->rec_fail_cnt);
+	debugfs_create_u64("timeout_cnt", 0444, bus->adap.debugfs, &bus->timeout_cnt);
+	debugfs_create_u64("tx_complete_cnt", 0444, bus->adap.debugfs, &bus->tx_complete_cnt);
 }
 
 static int npcm_i2c_probe_bus(struct platform_device *pdev)
@@ -2362,7 +2358,6 @@ static void npcm_i2c_remove_bus(struct platform_device *pdev)
 	unsigned long lock_flags;
 	struct npcm_i2c *bus = platform_get_drvdata(pdev);
 
-	debugfs_remove_recursive(bus->debugfs);
 	spin_lock_irqsave(&bus->lock, lock_flags);
 	npcm_i2c_disable(bus);
 	spin_unlock_irqrestore(&bus->lock, lock_flags);
@@ -2378,35 +2373,14 @@ MODULE_DEVICE_TABLE(of, npcm_i2c_bus_of_table);
 
 static struct platform_driver npcm_i2c_bus_driver = {
 	.probe = npcm_i2c_probe_bus,
-	.remove_new = npcm_i2c_remove_bus,
+	.remove = npcm_i2c_remove_bus,
 	.driver = {
 		.name = "nuvoton-i2c",
 		.of_match_table = npcm_i2c_bus_of_table,
 	}
 };
 
-static int __init npcm_i2c_init(void)
-{
-	int ret;
-
-	npcm_i2c_debugfs_dir = debugfs_create_dir("npcm_i2c", NULL);
-
-	ret = platform_driver_register(&npcm_i2c_bus_driver);
-	if (ret) {
-		debugfs_remove_recursive(npcm_i2c_debugfs_dir);
-		return ret;
-	}
-
-	return 0;
-}
-module_init(npcm_i2c_init);
-
-static void __exit npcm_i2c_exit(void)
-{
-	platform_driver_unregister(&npcm_i2c_bus_driver);
-	debugfs_remove_recursive(npcm_i2c_debugfs_dir);
-}
-module_exit(npcm_i2c_exit);
+module_platform_driver(npcm_i2c_bus_driver);
 
 MODULE_AUTHOR("Avi Fishman <avi.fishman@gmail.com>");
 MODULE_AUTHOR("Tali Perry <tali.perry@nuvoton.com>");

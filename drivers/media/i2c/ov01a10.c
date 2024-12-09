@@ -3,7 +3,7 @@
  * Copyright (c) 2023 Intel Corporation.
  */
 
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 
 #include <linux/acpi.h>
 #include <linux/bitfield.h>
@@ -13,7 +13,6 @@
 
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
-#include <media/v4l2-event.h>
 #include <media/v4l2-fwnode.h>
 
 #define OV01A10_LINK_FREQ_400MHZ	400000000ULL
@@ -723,14 +722,14 @@ static int ov01a10_set_format(struct v4l2_subdev *sd,
 					 h_blank);
 	}
 
-	format = v4l2_subdev_get_pad_format(sd, sd_state, fmt->stream);
+	format = v4l2_subdev_state_get_format(sd_state, fmt->stream);
 	*format = fmt->format;
 
 	return 0;
 }
 
-static int ov01a10_init_cfg(struct v4l2_subdev *sd,
-			    struct v4l2_subdev_state *state)
+static int ov01a10_init_state(struct v4l2_subdev *sd,
+			      struct v4l2_subdev_state *state)
 {
 	struct v4l2_subdev_format fmt = {
 		.which = V4L2_SUBDEV_FORMAT_TRY,
@@ -804,8 +803,6 @@ static int ov01a10_get_selection(struct v4l2_subdev *sd,
 
 static const struct v4l2_subdev_core_ops ov01a10_core_ops = {
 	.log_status = v4l2_ctrl_subdev_log_status,
-	.subscribe_event = v4l2_ctrl_subdev_subscribe_event,
-	.unsubscribe_event = v4l2_event_subdev_unsubscribe,
 };
 
 static const struct v4l2_subdev_video_ops ov01a10_video_ops = {
@@ -813,7 +810,6 @@ static const struct v4l2_subdev_video_ops ov01a10_video_ops = {
 };
 
 static const struct v4l2_subdev_pad_ops ov01a10_pad_ops = {
-	.init_cfg = ov01a10_init_cfg,
 	.set_fmt = ov01a10_set_format,
 	.get_fmt = v4l2_subdev_get_fmt,
 	.get_selection = ov01a10_get_selection,
@@ -825,6 +821,10 @@ static const struct v4l2_subdev_ops ov01a10_subdev_ops = {
 	.core = &ov01a10_core_ops,
 	.video = &ov01a10_video_ops,
 	.pad = &ov01a10_pad_ops,
+};
+
+static const struct v4l2_subdev_internal_ops ov01a10_internal_ops = {
+	.init_state = ov01a10_init_state,
 };
 
 static const struct media_entity_operations ov01a10_subdev_entity_ops = {
@@ -859,6 +859,7 @@ static void ov01a10_remove(struct i2c_client *client)
 	v4l2_ctrl_handler_free(sd->ctrl_handler);
 
 	pm_runtime_disable(&client->dev);
+	pm_runtime_set_suspended(&client->dev);
 }
 
 static int ov01a10_probe(struct i2c_client *client)
@@ -872,6 +873,7 @@ static int ov01a10_probe(struct i2c_client *client)
 		return -ENOMEM;
 
 	v4l2_i2c_subdev_init(&ov01a10->sd, client, &ov01a10_subdev_ops);
+	ov01a10->sd.internal_ops = &ov01a10_internal_ops;
 
 	ret = ov01a10_identify_module(ov01a10);
 	if (ret)
@@ -887,8 +889,7 @@ static int ov01a10_probe(struct i2c_client *client)
 	}
 
 	ov01a10->sd.state_lock = ov01a10->ctrl_handler.lock;
-	ov01a10->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE |
-		V4L2_SUBDEV_FL_HAS_EVENTS;
+	ov01a10->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
 	ov01a10->sd.entity.ops = &ov01a10_subdev_entity_ops;
 	ov01a10->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
 	ov01a10->pad.flags = MEDIA_PAD_FL_SOURCE;
@@ -905,16 +906,25 @@ static int ov01a10_probe(struct i2c_client *client)
 		goto err_media_entity_cleanup;
 	}
 
-	ret = v4l2_async_register_subdev_sensor(&ov01a10->sd);
-	if (ret < 0) {
-		dev_err(dev, "Failed to register subdev: %d\n", ret);
-		goto err_media_entity_cleanup;
-	}
-
+	/*
+	 * Device is already turned on by i2c-core with ACPI domain PM.
+	 * Enable runtime PM and turn off the device.
+	 */
+	pm_runtime_set_active(&client->dev);
 	pm_runtime_enable(dev);
 	pm_runtime_idle(dev);
 
+	ret = v4l2_async_register_subdev_sensor(&ov01a10->sd);
+	if (ret < 0) {
+		dev_err(dev, "Failed to register subdev: %d\n", ret);
+		goto err_pm_disable;
+	}
+
 	return 0;
+
+err_pm_disable:
+	pm_runtime_disable(dev);
+	pm_runtime_set_suspended(&client->dev);
 
 err_media_entity_cleanup:
 	media_entity_cleanup(&ov01a10->sd.entity);

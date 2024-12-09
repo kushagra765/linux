@@ -42,6 +42,12 @@ enum eq_event_id {
 	EQ_EVENT_PWR_BRK_ENTRY,
 	EQ_EVENT_PWR_BRK_EXIT,
 	EQ_EVENT_HEARTBEAT,
+	EQ_EVENT_CPLD_RESET_REASON,
+	EQ_EVENT_CPLD_SHUTDOWN,
+	EQ_EVENT_POWER_EVT_START,
+	EQ_EVENT_POWER_EVT_END,
+	EQ_EVENT_THERMAL_EVT_START,
+	EQ_EVENT_THERMAL_EVT_END,
 };
 
 /*
@@ -391,6 +397,9 @@ struct hl_eq_entry {
 #define EQ_CTL_READY_SHIFT		31
 #define EQ_CTL_READY_MASK		0x80000000
 
+#define EQ_CTL_EVENT_MODE_SHIFT		28
+#define EQ_CTL_EVENT_MODE_MASK		0x70000000
+
 #define EQ_CTL_EVENT_TYPE_SHIFT		16
 #define EQ_CTL_EVENT_TYPE_MASK		0x0FFF0000
 
@@ -659,6 +668,12 @@ enum pq_init_status {
  *       number (nonce) provided by the host to prevent replay attacks.
  *       public key and certificate also provided as part of the FW response.
  *
+ * CPUCP_PACKET_INFO_SIGNED_GET -
+ *       Get the device information signed by the Trusted Platform device.
+ *       device info data is also hashed with some unique number (nonce) provided
+ *       by the host to prevent replay attacks. public key and certificate also
+ *       provided as part of the FW response.
+ *
  * CPUCP_PACKET_MONITOR_DUMP_GET -
  *       Get monitors registers dump from the CpuCP kernel.
  *       The CPU will put the registers dump in the a buffer allocated by the driver
@@ -733,7 +748,7 @@ enum cpucp_packet_id {
 	CPUCP_PACKET_ENGINE_CORE_ASID_SET,	/* internal */
 	CPUCP_PACKET_RESERVED2,			/* not used */
 	CPUCP_PACKET_SEC_ATTEST_GET,		/* internal */
-	CPUCP_PACKET_RESERVED3,			/* not used */
+	CPUCP_PACKET_INFO_SIGNED_GET,		/* internal */
 	CPUCP_PACKET_RESERVED4,			/* not used */
 	CPUCP_PACKET_MONITOR_DUMP_GET,		/* debugfs */
 	CPUCP_PACKET_RESERVED5,			/* not used */
@@ -847,9 +862,6 @@ struct cpucp_packet {
 		 * result cannot be used to hold general purpose data.
 		 */
 		__le32 status_mask;
-
-		/* random, used once number, for security packets */
-		__le32 nonce;
 	};
 
 	union {
@@ -858,6 +870,9 @@ struct cpucp_packet {
 
 		/* For Generic packet sub index */
 		__le32 pkt_subidx;
+
+		/* random, used once number, for security packets */
+		__le32 nonce;
 	};
 };
 
@@ -1134,6 +1149,7 @@ struct cpucp_security_info {
  *                (0 = fully functional, 1 = lower-half is not functional,
  *                 2 = upper-half is not functional)
  * @sec_info: security information
+ * @cpld_timestamp: CPLD programmed F/W timestamp.
  * @pll_map: Bit map of supported PLLs for current ASIC version.
  * @mme_binning_mask: MME binning mask,
  *                    bits [0:6]   <==> dcore0 mme fma
@@ -1159,7 +1175,7 @@ struct cpucp_security_info {
 struct cpucp_info {
 	struct cpucp_sensor sensors[CPUCP_MAX_SENSORS];
 	__u8 kernel_version[VERSION_MAX_LEN];
-	__le32 reserved;
+	__le32 reserved1;
 	__le32 card_type;
 	__le32 card_location;
 	__le32 cpld_version;
@@ -1181,7 +1197,7 @@ struct cpucp_info {
 	__u8 substrate_version;
 	__u8 eq_health_check_supported;
 	struct cpucp_security_info sec_info;
-	__le32 fw_hbm_region_size;
+	__le32 cpld_timestamp;
 	__u8 pll_map[PLL_MAP_LEN];
 	__le64 mme_binning_mask;
 	__u8 fw_os_version[VERSION_MAX_LEN];

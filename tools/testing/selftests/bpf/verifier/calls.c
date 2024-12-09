@@ -76,7 +76,7 @@
 	},
 	.prog_type = BPF_PROG_TYPE_SCHED_CLS,
 	.result = REJECT,
-	.errstr = "R1 must have zero offset when passed to release func or trusted arg to kfunc",
+	.errstr = "arg#0 expected pointer to ctx, but got fp",
 	.fixup_kfunc_btf_id = {
 		{ "bpf_kfunc_call_test_pass_ctx", 2 },
 	},
@@ -274,6 +274,19 @@
 	},
 	.result_unpriv = REJECT,
 	.result = ACCEPT,
+},
+{
+	"calls: invalid kfunc call: must provide (attach_prog_fd, btf_id) pair when freplace",
+	.insns = {
+	BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, BPF_PSEUDO_KFUNC_CALL, 0, 0),
+	BPF_EXIT_INSN(),
+	},
+	.prog_type = BPF_PROG_TYPE_EXT,
+	.result = REJECT,
+	.errstr = "Tracing programs must provide btf_id",
+	.fixup_kfunc_btf_id = {
+		{ "bpf_dynptr_from_skb", 0 },
+	},
 },
 {
 	"calls: basic sanity",
@@ -1505,7 +1518,9 @@
 	.prog_type = BPF_PROG_TYPE_XDP,
 	.fixup_map_hash_8b = { 23 },
 	.result = REJECT,
-	.errstr = "invalid read from stack R7 off=-16 size=8",
+	.errstr = "R0 invalid mem access 'scalar'",
+	.result_unpriv = REJECT,
+	.errstr_unpriv = "invalid read from stack R7 off=-16 size=8",
 },
 {
 	"calls: two calls that receive map_value via arg=ptr_stack_of_caller. test1",

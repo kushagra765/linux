@@ -152,13 +152,11 @@ static int brcmstb_memc_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int brcmstb_memc_remove(struct platform_device *pdev)
+static void brcmstb_memc_remove(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 
 	sysfs_remove_group(&dev->kobj, &dev_attr_group);
-
-	return 0;
 }
 
 enum brcmstb_memc_hwtype {
@@ -245,6 +243,7 @@ static const struct of_device_id brcmstb_memc_of_match[] = {
 	},
 	{}
 };
+MODULE_DEVICE_TABLE(of, brcmstb_memc_of_match);
 
 static int brcmstb_memc_suspend(struct device *dev)
 {

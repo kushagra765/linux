@@ -67,13 +67,34 @@ static int divide_memory_pool(void *virt, unsigned long size)
 	return 0;
 }
 
+static int pkvm_create_host_sve_mappings(void)
+{
+	void *start, *end;
+	int ret, i;
+
+	if (!system_supports_sve())
+		return 0;
+
+	for (i = 0; i < hyp_nr_cpus; i++) {
+		struct kvm_host_data *host_data = per_cpu_ptr(&kvm_host_data, i);
+		struct cpu_sve_state *sve_state = host_data->sve_state;
+
+		start = kern_hyp_va(sve_state);
+		end = start + PAGE_ALIGN(pkvm_host_sve_state_size());
+		ret = pkvm_create_mappings(start, end, PAGE_HYP);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
 static int recreate_hyp_mappings(phys_addr_t phys, unsigned long size,
 				 unsigned long *per_cpu_base,
 				 u32 hyp_va_bits)
 {
 	void *start, *end, *virt = hyp_phys_to_virt(phys);
 	unsigned long pgt_size = hyp_s1_pgtable_pages() << PAGE_SHIFT;
-	enum kvm_pgtable_prot prot;
 	int ret, i;
 
 	/* Recreate the hyp page-table using the early page allocator */
@@ -125,22 +146,7 @@ static int recreate_hyp_mappings(phys_addr_t phys, unsigned long size,
 			return ret;
 	}
 
-	/*
-	 * Map the host sections RO in the hypervisor, but transfer the
-	 * ownership from the host to the hypervisor itself to make sure they
-	 * can't be donated or shared with another entity.
-	 *
-	 * The ownership transition requires matching changes in the host
-	 * stage-2. This will be done later (see finalize_host_mappings()) once
-	 * the hyp_vmemmap is addressable.
-	 */
-	prot = pkvm_mkstate(PAGE_HYP_RO, PKVM_PAGE_SHARED_OWNED);
-	ret = pkvm_create_mappings(&kvm_vgic_global_state,
-				   &kvm_vgic_global_state + 1, prot);
-	if (ret)
-		return ret;
-
-	return 0;
+	return pkvm_create_host_sve_mappings();
 }
 
 static void update_nvhe_init_params(void)
@@ -181,7 +187,7 @@ static int fix_host_ownership_walker(const struct kvm_pgtable_visit_ctx *ctx,
 	if (!kvm_pte_valid(ctx->old))
 		return 0;
 
-	if (ctx->level != (KVM_PGTABLE_MAX_LEVELS - 1))
+	if (ctx->level != KVM_PGTABLE_LAST_LEVEL)
 		return -EINVAL;
 
 	phys = kvm_pte_to_phys(ctx->old);
@@ -257,8 +263,7 @@ static int fix_hyp_pgtable_refcnt(void)
 
 void __noreturn __pkvm_init_finalise(void)
 {
-	struct kvm_host_data *host_data = this_cpu_ptr(&kvm_host_data);
-	struct kvm_cpu_context *host_ctxt = &host_data->host_ctxt;
+	struct kvm_cpu_context *host_ctxt = host_data_ptr(host_ctxt);
 	unsigned long nr_pages, reserved_pages, pfn;
 	int ret;
 
@@ -316,7 +321,7 @@ int __pkvm_init(phys_addr_t phys, unsigned long size, unsigned long nr_cpus,
 {
 	struct kvm_nvhe_init_params *params;
 	void *virt = hyp_phys_to_virt(phys);
-	void (*fn)(phys_addr_t params_pa, void *finalize_fn_va);
+	typeof(__pkvm_init_switch_pgd) *fn;
 	int ret;
 
 	BUG_ON(kvm_check_pvm_sysreg_table());
@@ -340,7 +345,7 @@ int __pkvm_init(phys_addr_t phys, unsigned long size, unsigned long nr_cpus,
 	/* Jump in the idmap page to switch to the new page-tables */
 	params = this_cpu_ptr(&kvm_init_params);
 	fn = (typeof(fn))__hyp_pa(__pkvm_init_switch_pgd);
-	fn(__hyp_pa(params), __pkvm_init_finalise);
+	fn(params->pgd_pa, params->stack_hyp_va, __pkvm_init_finalise);
 
 	unreachable();
 }

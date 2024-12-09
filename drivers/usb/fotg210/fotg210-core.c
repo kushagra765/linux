@@ -95,6 +95,7 @@ static int fotg210_gemini_init(struct fotg210 *fotg, struct resource *res,
 
 /**
  * fotg210_vbus() - Called by gadget driver to enable/disable VBUS
+ * @fotg: pointer to a private fotg210 object
  * @enable: true to enable VBUS, false to disable VBUS
  */
 void fotg210_vbus(struct fotg210 *fotg, bool enable)
@@ -194,7 +195,7 @@ static struct platform_driver fotg210_driver = {
 		.of_match_table = of_match_ptr(fotg210_of_match),
 	},
 	.probe  = fotg210_probe,
-	.remove_new = fotg210_remove,
+	.remove = fotg210_remove,
 };
 
 static int __init fotg210_init(void)

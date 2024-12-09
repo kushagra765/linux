@@ -150,7 +150,8 @@ static inline bool inet_bound_dev_eq(bool l3mdev_accept, int bound_dev_if,
 	return bound_dev_if == dif || bound_dev_if == sdif;
 }
 
-static inline bool inet_sk_bound_dev_eq(struct net *net, int bound_dev_if,
+static inline bool inet_sk_bound_dev_eq(const struct net *net,
+					int bound_dev_if,
 					int dif, int sdif)
 {
 #if IS_ENABLED(CONFIG_NET_L3_MASTER_DEV)
@@ -173,6 +174,7 @@ struct inet_cork {
 	__s16			tos;
 	char			priority;
 	__u16			gso_size;
+	u32			ts_opt_id;
 	u64			transmit_time;
 	u32			mark;
 };
@@ -234,16 +236,14 @@ struct inet_sock {
 	int			uc_index;
 	int			mc_index;
 	__be32			mc_addr;
-	struct {
-		__u16 lo;
-		__u16 hi;
-	}			local_port_range;
+	u32			local_port_range;	/* high << 16 | low */
 
 	struct ip_mc_socklist __rcu	*mc_list;
 	struct inet_cork_full	cork;
 };
 
-#define IPCORK_OPT	1	/* ip-options has been held in ipcork.opt */
+#define IPCORK_OPT		1	/* ip-options has been held in ipcork.opt */
+#define IPCORK_TS_OPT_ID	2	/* ts_opt_id field is valid, overriding sk_tskey */
 
 enum {
 	INET_FLAGS_PKTINFO	= 0,
@@ -277,6 +277,7 @@ enum {
 	INET_FLAGS_REPFLOW	= 27,
 	INET_FLAGS_RTALERT_ISOLATE = 28,
 	INET_FLAGS_SNDFLOW	= 29,
+	INET_FLAGS_RTALERT	= 30,
 };
 
 /* cmsg flags for inet */
@@ -310,11 +311,6 @@ static inline unsigned long inet_cmsg_flags(const struct inet_sock *inet)
 #define inet_assign_bit(nr, sk, val)		\
 	assign_bit(INET_FLAGS_##nr, &inet_sk(sk)->inet_flags, val)
 
-static inline bool sk_is_inet(struct sock *sk)
-{
-	return sk->sk_family == AF_INET || sk->sk_family == AF_INET6;
-}
-
 /**
  * sk_to_full_sk - Access to a full socket
  * @sk: pointer to a socket
@@ -325,8 +321,10 @@ static inline bool sk_is_inet(struct sock *sk)
 static inline struct sock *sk_to_full_sk(struct sock *sk)
 {
 #ifdef CONFIG_INET
-	if (sk && sk->sk_state == TCP_NEW_SYN_RECV)
+	if (sk && READ_ONCE(sk->sk_state) == TCP_NEW_SYN_RECV)
 		sk = inet_reqsk(sk)->rsk_listener;
+	if (sk && READ_ONCE(sk->sk_state) == TCP_TIME_WAIT)
+		sk = NULL;
 #endif
 	return sk;
 }
@@ -335,8 +333,10 @@ static inline struct sock *sk_to_full_sk(struct sock *sk)
 static inline const struct sock *sk_const_to_full_sk(const struct sock *sk)
 {
 #ifdef CONFIG_INET
-	if (sk && sk->sk_state == TCP_NEW_SYN_RECV)
+	if (sk && READ_ONCE(sk->sk_state) == TCP_NEW_SYN_RECV)
 		sk = ((const struct request_sock *)sk)->rsk_listener;
+	if (sk && READ_ONCE(sk->sk_state) == TCP_TIME_WAIT)
+		sk = NULL;
 #endif
 	return sk;
 }

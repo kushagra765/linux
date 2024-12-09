@@ -9,13 +9,15 @@
 #define GSP_PAGE_SIZE  BIT(GSP_PAGE_SHIFT)
 
 struct nvkm_gsp_mem {
-	u32 size;
+	size_t size;
 	void *data;
 	dma_addr_t addr;
 };
 
 struct nvkm_gsp_radix3 {
-	struct nvkm_gsp_mem mem[3];
+	struct nvkm_gsp_mem lvl0;
+	struct nvkm_gsp_mem lvl1;
+	struct sg_table lvl2;
 };
 
 int nvkm_gsp_sg(struct nvkm_device *, u64 size, struct sg_table *);
@@ -187,7 +189,7 @@ struct nvkm_gsp {
 		void (*rpc_done)(struct nvkm_gsp *gsp, void *repv);
 
 		void *(*rm_ctrl_get)(struct nvkm_gsp_object *, u32 cmd, u32 argc);
-		void *(*rm_ctrl_push)(struct nvkm_gsp_object *, void *argv, u32 repc);
+		int (*rm_ctrl_push)(struct nvkm_gsp_object *, void **argv, u32 repc);
 		void (*rm_ctrl_done)(struct nvkm_gsp_object *, void *repv);
 
 		void *(*rm_alloc_get)(struct nvkm_gsp_object *, u32 oclass, u32 argc);
@@ -208,9 +210,15 @@ struct nvkm_gsp {
 	} *rm;
 
 	struct {
-		struct mutex mutex;;
+		struct mutex mutex;
 		struct idr idr;
 	} client_id;
+
+	/* A linked list of registry items. The registry RPC will be built from it. */
+	struct list_head registry_list;
+
+	/* The size of the registry RPC */
+	size_t registry_rpc_size;
 };
 
 static inline bool
@@ -265,7 +273,7 @@ nvkm_gsp_rm_ctrl_get(struct nvkm_gsp_object *object, u32 cmd, u32 argc)
 	return object->client->gsp->rm->rm_ctrl_get(object, cmd, argc);
 }
 
-static inline void *
+static inline int
 nvkm_gsp_rm_ctrl_push(struct nvkm_gsp_object *object, void *argv, u32 repc)
 {
 	return object->client->gsp->rm->rm_ctrl_push(object, argv, repc);
@@ -275,21 +283,24 @@ static inline void *
 nvkm_gsp_rm_ctrl_rd(struct nvkm_gsp_object *object, u32 cmd, u32 repc)
 {
 	void *argv = nvkm_gsp_rm_ctrl_get(object, cmd, repc);
+	int ret;
 
 	if (IS_ERR(argv))
 		return argv;
 
-	return nvkm_gsp_rm_ctrl_push(object, argv, repc);
+	ret = nvkm_gsp_rm_ctrl_push(object, &argv, repc);
+	if (ret)
+		return ERR_PTR(ret);
+	return argv;
 }
 
 static inline int
 nvkm_gsp_rm_ctrl_wr(struct nvkm_gsp_object *object, void *argv)
 {
-	void *repv = nvkm_gsp_rm_ctrl_push(object, argv, 0);
+	int ret = nvkm_gsp_rm_ctrl_push(object, &argv, 0);
 
-	if (IS_ERR(repv))
-		return PTR_ERR(repv);
-
+	if (ret)
+		return ret;
 	return 0;
 }
 

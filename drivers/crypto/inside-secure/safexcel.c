@@ -1191,8 +1191,6 @@ static struct safexcel_alg_template *safexcel_algs[] = {
 	&safexcel_alg_cbc_des3_ede,
 	&safexcel_alg_ecb_aes,
 	&safexcel_alg_cbc_aes,
-	&safexcel_alg_cfb_aes,
-	&safexcel_alg_ofb_aes,
 	&safexcel_alg_ctr_aes,
 	&safexcel_alg_md5,
 	&safexcel_alg_sha1,
@@ -1231,8 +1229,6 @@ static struct safexcel_alg_template *safexcel_algs[] = {
 	&safexcel_alg_hmac_sm3,
 	&safexcel_alg_ecb_sm4,
 	&safexcel_alg_cbc_sm4,
-	&safexcel_alg_ofb_sm4,
-	&safexcel_alg_cfb_sm4,
 	&safexcel_alg_ctr_sm4,
 	&safexcel_alg_authenc_hmac_sha1_cbc_sm4,
 	&safexcel_alg_authenc_hmac_sm3_cbc_sm4,
@@ -1872,7 +1868,7 @@ MODULE_DEVICE_TABLE(of, safexcel_of_match_table);
 
 static struct platform_driver  crypto_safexcel = {
 	.probe		= safexcel_probe,
-	.remove_new	= safexcel_remove,
+	.remove		= safexcel_remove,
 	.driver		= {
 		.name	= "crypto-safexcel",
 		.of_match_table = safexcel_of_match_table,
@@ -2035,7 +2031,7 @@ MODULE_AUTHOR("Ofer Heifetz <oferh@marvell.com>");
 MODULE_AUTHOR("Igal Liberman <igall@marvell.com>");
 MODULE_DESCRIPTION("Support for SafeXcel cryptographic engines: EIP97 & EIP197");
 MODULE_LICENSE("GPL v2");
-MODULE_IMPORT_NS(CRYPTO_INTERNAL);
+MODULE_IMPORT_NS("CRYPTO_INTERNAL");
 
 MODULE_FIRMWARE("ifpp.bin");
 MODULE_FIRMWARE("ipue.bin");

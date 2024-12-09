@@ -165,14 +165,6 @@ struct i915_gem_mm {
 	struct notifier_block vmap_notifier;
 	struct shrinker *shrinker;
 
-#ifdef CONFIG_MMU_NOTIFIER
-	/**
-	 * notifier_lock for mmu notifiers, memory may not be allocated
-	 * while holding this lock.
-	 */
-	rwlock_t notifier_lock;
-#endif
-
 	/* shrinker accounting, also useful for userland debugging */
 	u64 shrink_memory;
 	u32 shrink_count;
@@ -242,26 +234,19 @@ struct drm_i915_private {
 
 	/* protects the irq masks */
 	spinlock_t irq_lock;
-
-	bool display_irqs_enabled;
+	bool irqs_enabled;
 
 	/* Sideband mailbox protection */
 	struct mutex sb_lock;
 	struct pm_qos_request sb_qos;
 
 	/** Cached value of IMR to avoid reads in updating the bitfield */
-	union {
-		u32 irq_mask;
-		u32 de_irq_mask[I915_MAX_PIPES];
-	};
-	u32 pipestat_irq_mask[I915_MAX_PIPES];
+	u32 irq_mask;
 
 	bool preserve_bios_swizzle;
 
 	unsigned int fsb_freq, mem_freq, is_ddr3;
-	unsigned int skl_preferred_vco_freq;
 
-	unsigned int max_dotclk_freq;
 	unsigned int hpll_freq;
 	unsigned int czclk_freq;
 
@@ -321,6 +306,7 @@ struct drm_i915_private {
 			INTEL_DRAM_LPDDR4,
 			INTEL_DRAM_DDR5,
 			INTEL_DRAM_LPDDR5,
+			INTEL_DRAM_GDDR,
 		} type;
 		u8 num_qgv_points;
 		u8 num_psf_gv_points;
@@ -358,11 +344,6 @@ struct drm_i915_private {
 
 	struct intel_pxp *pxp;
 
-	/* For i915gm/i945gm vblank irq workaround */
-	u8 vblank_enabled;
-
-	bool irq_enabled;
-
 	struct i915_pmu pmu;
 
 	/* The TTM device structure. */
@@ -383,12 +364,16 @@ static inline struct drm_i915_private *to_i915(const struct drm_device *dev)
 
 static inline struct drm_i915_private *kdev_to_i915(struct device *kdev)
 {
-	return dev_get_drvdata(kdev);
+	struct drm_device *drm = dev_get_drvdata(kdev);
+
+	return drm ? to_i915(drm) : NULL;
 }
 
 static inline struct drm_i915_private *pdev_to_i915(struct pci_dev *pdev)
 {
-	return pci_get_drvdata(pdev);
+	struct drm_device *drm = pci_get_drvdata(pdev);
+
+	return drm ? to_i915(drm) : NULL;
 }
 
 static inline struct intel_gt *to_gt(const struct drm_i915_private *i915)
@@ -396,31 +381,12 @@ static inline struct intel_gt *to_gt(const struct drm_i915_private *i915)
 	return i915->gt[0];
 }
 
-/* Simple iterator over all initialised engines */
-#define for_each_engine(engine__, gt__, id__) \
-	for ((id__) = 0; \
-	     (id__) < I915_NUM_ENGINES; \
-	     (id__)++) \
-		for_each_if ((engine__) = (gt__)->engine[(id__)])
-
-/* Iterator over subset of engines selected by mask */
-#define for_each_engine_masked(engine__, gt__, mask__, tmp__) \
-	for ((tmp__) = (mask__) & (gt__)->info.engine_mask; \
-	     (tmp__) ? \
-	     ((engine__) = (gt__)->engine[__mask_next_bit(tmp__)]), 1 : \
-	     0;)
-
 #define rb_to_uabi_engine(rb) \
 	rb_entry_safe(rb, struct intel_engine_cs, uabi_node)
 
 #define for_each_uabi_engine(engine__, i915__) \
 	for ((engine__) = rb_to_uabi_engine(rb_first(&(i915__)->uabi_engines));\
 	     (engine__); \
-	     (engine__) = rb_to_uabi_engine(rb_next(&(engine__)->uabi_node)))
-
-#define for_each_uabi_class_engine(engine__, class__, i915__) \
-	for ((engine__) = intel_engine_lookup_user((i915__), (class__), 0); \
-	     (engine__) && (engine__)->uabi_class == (class__); \
 	     (engine__) = rb_to_uabi_engine(rb_next(&(engine__)->uabi_node)))
 
 #define INTEL_INFO(i915)	((i915)->__info)
@@ -445,14 +411,8 @@ static inline struct intel_gt *to_gt(const struct drm_i915_private *i915)
 
 #define INTEL_REVID(i915)	(to_pci_dev((i915)->drm.dev)->revision)
 
-#define INTEL_DISPLAY_STEP(__i915) (RUNTIME_INFO(__i915)->step.display_step)
 #define INTEL_GRAPHICS_STEP(__i915) (RUNTIME_INFO(__i915)->step.graphics_step)
 #define INTEL_MEDIA_STEP(__i915) (RUNTIME_INFO(__i915)->step.media_step)
-#define INTEL_BASEDIE_STEP(__i915) (RUNTIME_INFO(__i915)->step.basedie_step)
-
-#define IS_DISPLAY_STEP(__i915, since, until) \
-	(drm_WARN_ON(&(__i915)->drm, INTEL_DISPLAY_STEP(__i915) == STEP_NONE), \
-	 INTEL_DISPLAY_STEP(__i915) >= (since) && INTEL_DISPLAY_STEP(__i915) < (until))
 
 #define IS_GRAPHICS_STEP(__i915, since, until) \
 	(drm_WARN_ON(&(__i915)->drm, INTEL_GRAPHICS_STEP(__i915) == STEP_NONE), \
@@ -461,10 +421,6 @@ static inline struct intel_gt *to_gt(const struct drm_i915_private *i915)
 #define IS_MEDIA_STEP(__i915, since, until) \
 	(drm_WARN_ON(&(__i915)->drm, INTEL_MEDIA_STEP(__i915) == STEP_NONE), \
 	 INTEL_MEDIA_STEP(__i915) >= (since) && INTEL_MEDIA_STEP(__i915) < (until))
-
-#define IS_BASEDIE_STEP(__i915, since, until) \
-	(drm_WARN_ON(&(__i915)->drm, INTEL_BASEDIE_STEP(__i915) == STEP_NONE), \
-	 INTEL_BASEDIE_STEP(__i915) >= (since) && INTEL_BASEDIE_STEP(__i915) < (until))
 
 static __always_inline unsigned int
 __platform_mask_index(const struct intel_runtime_info *info,
@@ -551,8 +507,6 @@ IS_SUBPLATFORM(const struct drm_i915_private *i915,
 	(IS_PLATFORM(i915, INTEL_IRONLAKE) && IS_MOBILE(i915))
 #define IS_SANDYBRIDGE(i915) IS_PLATFORM(i915, INTEL_SANDYBRIDGE)
 #define IS_IVYBRIDGE(i915)	IS_PLATFORM(i915, INTEL_IVYBRIDGE)
-#define IS_IVB_GT1(i915)	(IS_IVYBRIDGE(i915) && \
-				 INTEL_INFO(i915)->gt == 1)
 #define IS_VALLEYVIEW(i915)	IS_PLATFORM(i915, INTEL_VALLEYVIEW)
 #define IS_CHERRYVIEW(i915)	IS_PLATFORM(i915, INTEL_CHERRYVIEW)
 #define IS_HASWELL(i915)	IS_PLATFORM(i915, INTEL_HASWELL)
@@ -571,11 +525,25 @@ IS_SUBPLATFORM(const struct drm_i915_private *i915,
 #define IS_DG1(i915)        IS_PLATFORM(i915, INTEL_DG1)
 #define IS_ALDERLAKE_S(i915) IS_PLATFORM(i915, INTEL_ALDERLAKE_S)
 #define IS_ALDERLAKE_P(i915) IS_PLATFORM(i915, INTEL_ALDERLAKE_P)
-#define IS_XEHPSDV(i915) IS_PLATFORM(i915, INTEL_XEHPSDV)
 #define IS_DG2(i915)	IS_PLATFORM(i915, INTEL_DG2)
-#define IS_PONTEVECCHIO(i915) IS_PLATFORM(i915, INTEL_PONTEVECCHIO)
 #define IS_METEORLAKE(i915) IS_PLATFORM(i915, INTEL_METEORLAKE)
+/*
+ * Display code shared by i915 and Xe relies on macros like IS_LUNARLAKE,
+ * so we need to define these even on platforms that the i915 base driver
+ * doesn't support.  Ensure the parameter is used in the definition to
+ * avoid 'unused variable' warnings when compiling the shared display code
+ * for i915.
+ */
+#define IS_LUNARLAKE(i915) (0 && i915)
+#define IS_BATTLEMAGE(i915)  (0 && i915)
+#define IS_PANTHERLAKE(i915) (0 && i915)
 
+#define IS_ARROWLAKE_H(i915) \
+	IS_SUBPLATFORM(i915, INTEL_METEORLAKE, INTEL_SUBPLATFORM_ARL_H)
+#define IS_ARROWLAKE_U(i915) \
+	IS_SUBPLATFORM(i915, INTEL_METEORLAKE, INTEL_SUBPLATFORM_ARL_U)
+#define IS_ARROWLAKE_S(i915) \
+	IS_SUBPLATFORM(i915, INTEL_METEORLAKE, INTEL_SUBPLATFORM_ARL_S)
 #define IS_DG2_G10(i915) \
 	IS_SUBPLATFORM(i915, INTEL_DG2, INTEL_SUBPLATFORM_G10)
 #define IS_DG2_G11(i915) \
@@ -596,14 +564,8 @@ IS_SUBPLATFORM(const struct drm_i915_private *i915,
 	IS_SUBPLATFORM(i915, INTEL_BROADWELL, INTEL_SUBPLATFORM_ULT)
 #define IS_BROADWELL_ULX(i915) \
 	IS_SUBPLATFORM(i915, INTEL_BROADWELL, INTEL_SUBPLATFORM_ULX)
-#define IS_BROADWELL_GT3(i915)	(IS_BROADWELL(i915) && \
-				 INTEL_INFO(i915)->gt == 3)
 #define IS_HASWELL_ULT(i915) \
 	IS_SUBPLATFORM(i915, INTEL_HASWELL, INTEL_SUBPLATFORM_ULT)
-#define IS_HASWELL_GT3(i915)	(IS_HASWELL(i915) && \
-				 INTEL_INFO(i915)->gt == 3)
-#define IS_HASWELL_GT1(i915)	(IS_HASWELL(i915) && \
-				 INTEL_INFO(i915)->gt == 1)
 /* ULX machines are also considered ULT. */
 #define IS_HASWELL_ULX(i915) \
 	IS_SUBPLATFORM(i915, INTEL_HASWELL, INTEL_SUBPLATFORM_ULX)
@@ -615,31 +577,14 @@ IS_SUBPLATFORM(const struct drm_i915_private *i915,
 	IS_SUBPLATFORM(i915, INTEL_KABYLAKE, INTEL_SUBPLATFORM_ULT)
 #define IS_KABYLAKE_ULX(i915) \
 	IS_SUBPLATFORM(i915, INTEL_KABYLAKE, INTEL_SUBPLATFORM_ULX)
-#define IS_SKYLAKE_GT2(i915)	(IS_SKYLAKE(i915) && \
-				 INTEL_INFO(i915)->gt == 2)
-#define IS_SKYLAKE_GT3(i915)	(IS_SKYLAKE(i915) && \
-				 INTEL_INFO(i915)->gt == 3)
-#define IS_SKYLAKE_GT4(i915)	(IS_SKYLAKE(i915) && \
-				 INTEL_INFO(i915)->gt == 4)
-#define IS_KABYLAKE_GT2(i915)	(IS_KABYLAKE(i915) && \
-				 INTEL_INFO(i915)->gt == 2)
-#define IS_KABYLAKE_GT3(i915)	(IS_KABYLAKE(i915) && \
-				 INTEL_INFO(i915)->gt == 3)
 #define IS_COFFEELAKE_ULT(i915) \
 	IS_SUBPLATFORM(i915, INTEL_COFFEELAKE, INTEL_SUBPLATFORM_ULT)
 #define IS_COFFEELAKE_ULX(i915) \
 	IS_SUBPLATFORM(i915, INTEL_COFFEELAKE, INTEL_SUBPLATFORM_ULX)
-#define IS_COFFEELAKE_GT2(i915)	(IS_COFFEELAKE(i915) && \
-				 INTEL_INFO(i915)->gt == 2)
-#define IS_COFFEELAKE_GT3(i915)	(IS_COFFEELAKE(i915) && \
-				 INTEL_INFO(i915)->gt == 3)
-
 #define IS_COMETLAKE_ULT(i915) \
 	IS_SUBPLATFORM(i915, INTEL_COMETLAKE, INTEL_SUBPLATFORM_ULT)
 #define IS_COMETLAKE_ULX(i915) \
 	IS_SUBPLATFORM(i915, INTEL_COMETLAKE, INTEL_SUBPLATFORM_ULX)
-#define IS_COMETLAKE_GT2(i915)	(IS_COMETLAKE(i915) && \
-				 INTEL_INFO(i915)->gt == 2)
 
 #define IS_ICL_WITH_PORT_F(i915) \
 	IS_SUBPLATFORM(i915, INTEL_ICELAKE, INTEL_SUBPLATFORM_PORTF)
@@ -647,20 +592,8 @@ IS_SUBPLATFORM(const struct drm_i915_private *i915,
 #define IS_TIGERLAKE_UY(i915) \
 	IS_SUBPLATFORM(i915, INTEL_TIGERLAKE, INTEL_SUBPLATFORM_UY)
 
-#define IS_XEHPSDV_GRAPHICS_STEP(__i915, since, until) \
-	(IS_XEHPSDV(__i915) && IS_GRAPHICS_STEP(__i915, since, until))
-
-#define IS_PVC_BD_STEP(__i915, since, until) \
-	(IS_PONTEVECCHIO(__i915) && \
-	 IS_BASEDIE_STEP(__i915, since, until))
-
-#define IS_PVC_CT_STEP(__i915, since, until) \
-	(IS_PONTEVECCHIO(__i915) && \
-	 IS_GRAPHICS_STEP(__i915, since, until))
-
-#define IS_LP(i915)		(INTEL_INFO(i915)->is_lp)
-#define IS_GEN9_LP(i915)	(GRAPHICS_VER(i915) == 9 && IS_LP(i915))
-#define IS_GEN9_BC(i915)	(GRAPHICS_VER(i915) == 9 && !IS_LP(i915))
+#define IS_GEN9_LP(i915)	(IS_BROXTON(i915) || IS_GEMINILAKE(i915))
+#define IS_GEN9_BC(i915)	(GRAPHICS_VER(i915) == 9 && !IS_GEN9_LP(i915))
 
 #define __HAS_ENGINE(engine_mask, id) ((engine_mask) & BIT(id))
 #define HAS_ENGINE(gt, id) __HAS_ENGINE((gt)->info.engine_mask, id)
@@ -719,15 +652,12 @@ IS_SUBPLATFORM(const struct drm_i915_private *i915,
 	((sizes) & ~RUNTIME_INFO(i915)->page_sizes) == 0; \
 })
 
-/* Early gen2 have a totally busted CS tlb and require pinned batches. */
-#define HAS_BROKEN_CS_TLB(i915)	(IS_I830(i915) || IS_I845G(i915))
-
 #define NEEDS_RC6_CTX_CORRUPTION_WA(i915)	\
 	(IS_BROADWELL(i915) || GRAPHICS_VER(i915) == 9)
 
 /* WaRsDisableCoarsePowerGating:skl,cnl */
 #define NEEDS_WaRsDisableCoarsePowerGating(i915)			\
-	(IS_SKYLAKE_GT3(i915) || IS_SKYLAKE_GT4(i915))
+	(IS_SKYLAKE(i915) && (INTEL_INFO(i915)->gt == 3 || INTEL_INFO(i915)->gt == 4))
 
 /* With the 945 and later, Y tiling got adjusted so that it was 32 128-byte
  * rows, which changed the alignment requirements and fence programming.
@@ -740,6 +670,9 @@ IS_SUBPLATFORM(const struct drm_i915_private *i915,
 #define HAS_RC6pp(i915)		 (false) /* HW was never validated */
 
 #define HAS_RPS(i915)	(INTEL_INFO(i915)->has_rps)
+
+#define HAS_PXP(i915) \
+	(IS_ENABLED(CONFIG_DRM_I915_PXP) && INTEL_INFO(i915)->has_pxp)
 
 #define HAS_HECI_PXP(i915) \
 	(INTEL_INFO(i915)->has_heci_pxp)
@@ -765,8 +698,8 @@ IS_SUBPLATFORM(const struct drm_i915_private *i915,
  */
 #define HAS_64K_PAGES(i915) (INTEL_INFO(i915)->has_64k_pages)
 
-#define HAS_REGION(i915, i) (INTEL_INFO(i915)->memory_regions & (i))
-#define HAS_LMEM(i915) HAS_REGION(i915, REGION_LMEM)
+#define HAS_REGION(i915, id) (INTEL_INFO(i915)->memory_regions & BIT(id))
+#define HAS_LMEM(i915) HAS_REGION(i915, INTEL_REGION_LMEM_0)
 
 #define HAS_EXTRA_GT_LIST(i915)   (INTEL_INFO(i915)->extra_gt_list)
 
@@ -788,7 +721,7 @@ IS_SUBPLATFORM(const struct drm_i915_private *i915,
 
 /* DPF == dynamic parity feature */
 #define HAS_L3_DPF(i915) (INTEL_INFO(i915)->has_l3_dpf)
-#define NUM_L3_SLICES(i915) (IS_HASWELL_GT3(i915) ? \
+#define NUM_L3_SLICES(i915) (IS_HASWELL(i915) && INTEL_INFO(i915)->gt == 3 ? \
 				 2 : HAS_L3_DPF(i915))
 
 #define HAS_GUC_DEPRIVILEGE(i915) \

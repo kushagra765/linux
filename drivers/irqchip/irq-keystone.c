@@ -190,7 +190,7 @@ static int keystone_irq_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int keystone_irq_remove(struct platform_device *pdev)
+static void keystone_irq_remove(struct platform_device *pdev)
 {
 	struct keystone_irq_device *kirq = platform_get_drvdata(pdev);
 	int hwirq;
@@ -201,7 +201,6 @@ static int keystone_irq_remove(struct platform_device *pdev)
 		irq_dispose_mapping(irq_find_mapping(kirq->irqd, hwirq));
 
 	irq_domain_remove(kirq->irqd);
-	return 0;
 }
 
 static const struct of_device_id keystone_irq_dt_ids[] = {

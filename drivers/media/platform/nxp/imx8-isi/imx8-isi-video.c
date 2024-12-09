@@ -713,7 +713,7 @@ static int mxc_isi_video_validate_format(struct mxc_isi_video *video)
 
 	info = mxc_isi_format_by_fourcc(video->pix.pixelformat,
 					MXC_ISI_VIDEO_CAP);
-	format = v4l2_subdev_get_try_format(sd, state, MXC_ISI_PIPE_PAD_SOURCE);
+	format = v4l2_subdev_state_get_format(state, MXC_ISI_PIPE_PAD_SOURCE);
 
 	if (format->code != info->mbus_code ||
 	    format->width != video->pix.width ||
@@ -987,8 +987,6 @@ static const struct vb2_ops mxc_isi_vb2_qops = {
 	.buf_init		= mxc_isi_vb2_buffer_init,
 	.buf_prepare		= mxc_isi_vb2_buffer_prepare,
 	.buf_queue		= mxc_isi_vb2_buffer_queue,
-	.wait_prepare		= vb2_ops_wait_prepare,
-	.wait_finish		= vb2_ops_wait_finish,
 	.start_streaming	= mxc_isi_vb2_start_streaming,
 	.stop_streaming		= mxc_isi_vb2_stop_streaming,
 };
@@ -1453,7 +1451,7 @@ int mxc_isi_video_register(struct mxc_isi_pipe *pipe,
 	q->mem_ops = &vb2_dma_contig_memops;
 	q->buf_struct_size = sizeof(struct mxc_isi_buffer);
 	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
-	q->min_buffers_needed = 2;
+	q->min_queued_buffers = 2;
 	q->lock = &video->lock;
 	q->dev = pipe->isi->dev;
 

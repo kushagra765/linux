@@ -14,6 +14,7 @@
 #include <linux/pm_runtime.h>
 
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_client_setup.h>
 #include <drm/drm_debugfs.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_fbdev_dma.h>
@@ -138,7 +139,7 @@ static int tilcdc_irq_install(struct drm_device *dev, unsigned int irq)
 	if (ret)
 		return ret;
 
-	priv->irq_enabled = false;
+	priv->irq_enabled = true;
 
 	return 0;
 }
@@ -182,9 +183,6 @@ static void tilcdc_fini(struct drm_device *dev)
 	if (priv->clk)
 		clk_put(priv->clk);
 
-	if (priv->mmio)
-		iounmap(priv->mmio);
-
 	if (priv->wq)
 		destroy_workqueue(priv->wq);
 
@@ -201,7 +199,6 @@ static int tilcdc_init(const struct drm_driver *ddrv, struct device *dev)
 	struct platform_device *pdev = to_platform_device(dev);
 	struct device_node *node = dev->of_node;
 	struct tilcdc_drm_private *priv;
-	struct resource *res;
 	u32 bpp = 0;
 	int ret;
 
@@ -226,17 +223,10 @@ static int tilcdc_init(const struct drm_driver *ddrv, struct device *dev)
 		goto init_failed;
 	}
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	if (!res) {
-		dev_err(dev, "failed to get memory resource\n");
-		ret = -EINVAL;
-		goto init_failed;
-	}
-
-	priv->mmio = ioremap(res->start, resource_size(res));
-	if (!priv->mmio) {
-		dev_err(dev, "failed to ioremap\n");
-		ret = -ENOMEM;
+	priv->mmio = devm_platform_ioremap_resource(pdev, 0);
+	if (IS_ERR(priv->mmio)) {
+		dev_err(dev, "failed to request / ioremap\n");
+		ret = PTR_ERR(priv->mmio);
 		goto init_failed;
 	}
 
@@ -385,7 +375,8 @@ static int tilcdc_init(const struct drm_driver *ddrv, struct device *dev)
 		goto init_failed;
 	priv->is_registered = true;
 
-	drm_fbdev_dma_setup(ddev, bpp);
+	drm_client_setup_with_color_mode(ddev, bpp);
+
 	return 0;
 
 init_failed:
@@ -483,6 +474,7 @@ DEFINE_DRM_GEM_DMA_FOPS(fops);
 static const struct drm_driver tilcdc_driver = {
 	.driver_features    = DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
 	DRM_GEM_DMA_DRIVER_OPS,
+	DRM_FBDEV_DMA_DRIVER_OPS,
 #ifdef CONFIG_DEBUG_FS
 	.debugfs_init       = tilcdc_debugfs_init,
 #endif
@@ -570,19 +562,18 @@ static int tilcdc_pdev_probe(struct platform_device *pdev)
 						       match);
 }
 
-static int tilcdc_pdev_remove(struct platform_device *pdev)
+static void tilcdc_pdev_remove(struct platform_device *pdev)
 {
 	int ret;
 
 	ret = tilcdc_get_external_components(&pdev->dev, NULL);
 	if (ret < 0)
-		return ret;
+		dev_err(&pdev->dev, "tilcdc_get_external_components() failed (%pe)\n",
+			ERR_PTR(ret));
 	else if (ret == 0)
 		tilcdc_fini(platform_get_drvdata(pdev));
 	else
 		component_master_del(&pdev->dev, &tilcdc_comp_ops);
-
-	return 0;
 }
 
 static void tilcdc_pdev_shutdown(struct platform_device *pdev)

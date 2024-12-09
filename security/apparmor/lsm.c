@@ -24,6 +24,7 @@
 #include <linux/zstd.h>
 #include <net/sock.h>
 #include <uapi/linux/mount.h>
+#include <uapi/linux/lsm.h>
 
 #include "include/apparmor.h"
 #include "include/apparmorfs.h"
@@ -460,6 +461,7 @@ static int apparmor_file_open(struct file *file)
 	struct aa_file_ctx *fctx = file_ctx(file);
 	struct aa_label *label;
 	int error = 0;
+	bool needput;
 
 	if (!path_mediated_fs(file->f_path.dentry))
 		return 0;
@@ -468,13 +470,15 @@ static int apparmor_file_open(struct file *file)
 	 * Cache permissions granted by the previous exec check, with
 	 * implicit read and executable mmap which are required to
 	 * actually execute the image.
+	 *
+	 * Illogically, FMODE_EXEC is in f_flags, not f_mode.
 	 */
-	if (current->in_execve) {
+	if (file->f_flags & __FMODE_EXEC) {
 		fctx->allow = MAY_EXEC | MAY_READ | AA_EXEC_MMAP;
 		return 0;
 	}
 
-	label = aa_get_newest_cred_label(file->f_cred);
+	label = aa_get_newest_cred_label_condref(file->f_cred, &needput);
 	if (!unconfined(label)) {
 		struct mnt_idmap *idmap = file_mnt_idmap(file);
 		struct inode *inode = file_inode(file);
@@ -491,7 +495,7 @@ static int apparmor_file_open(struct file *file)
 		/* todo cache full allowed permissions set and state */
 		fctx->allow = aa_map_file_to_perms(file);
 	}
-	aa_put_label(label);
+	aa_put_label_condref(label, needput);
 
 	return error;
 }
@@ -775,6 +779,46 @@ static int apparmor_sb_pivotroot(const struct path *old_path,
 	return error;
 }
 
+static int apparmor_getselfattr(unsigned int attr, struct lsm_ctx __user *lx,
+				u32 *size, u32 flags)
+{
+	int error = -ENOENT;
+	struct aa_task_ctx *ctx = task_ctx(current);
+	struct aa_label *label = NULL;
+	char *value = NULL;
+
+	switch (attr) {
+	case LSM_ATTR_CURRENT:
+		label = aa_get_newest_label(cred_label(current_cred()));
+		break;
+	case LSM_ATTR_PREV:
+		if (ctx->previous)
+			label = aa_get_newest_label(ctx->previous);
+		break;
+	case LSM_ATTR_EXEC:
+		if (ctx->onexec)
+			label = aa_get_newest_label(ctx->onexec);
+		break;
+	default:
+		error = -EOPNOTSUPP;
+		break;
+	}
+
+	if (label) {
+		error = aa_getprocattr(label, &value, false);
+		if (error > 0)
+			error = lsm_fill_user_ctx(lx, size, value, error,
+						  LSM_ID_APPARMOR, 0);
+		kfree(value);
+	}
+
+	aa_put_label(label);
+
+	if (error < 0)
+		return error;
+	return 1;
+}
+
 static int apparmor_getprocattr(struct task_struct *task, const char *name,
 				char **value)
 {
@@ -794,7 +838,7 @@ static int apparmor_getprocattr(struct task_struct *task, const char *name,
 		error = -EINVAL;
 
 	if (label)
-		error = aa_getprocattr(label, value);
+		error = aa_getprocattr(label, value, true);
 
 	aa_put_label(label);
 	put_cred(cred);
@@ -802,8 +846,7 @@ static int apparmor_getprocattr(struct task_struct *task, const char *name,
 	return error;
 }
 
-static int apparmor_setprocattr(const char *name, void *value,
-				size_t size)
+static int do_setattr(u64 attr, void *value, size_t size)
 {
 	char *command, *largs = NULL, *args = value;
 	size_t arg_size;
@@ -834,7 +877,7 @@ static int apparmor_setprocattr(const char *name, void *value,
 		goto out;
 
 	arg_size = size - (args - (largs ? largs : (char *) value));
-	if (strcmp(name, "current") == 0) {
+	if (attr == LSM_ATTR_CURRENT) {
 		if (strcmp(command, "changehat") == 0) {
 			error = aa_setprocattr_changehat(args, arg_size,
 							 AA_CHANGE_NOFLAGS);
@@ -849,7 +892,7 @@ static int apparmor_setprocattr(const char *name, void *value,
 			error = aa_change_profile(args, AA_CHANGE_STACK);
 		} else
 			goto fail;
-	} else if (strcmp(name, "exec") == 0) {
+	} else if (attr == LSM_ATTR_EXEC) {
 		if (strcmp(command, "exec") == 0)
 			error = aa_change_profile(args, AA_CHANGE_ONEXEC);
 		else if (strcmp(command, "stack") == 0)
@@ -869,11 +912,40 @@ out:
 
 fail:
 	ad.subj_label = begin_current_label_crit_section();
-	ad.info = name;
+	if (attr == LSM_ATTR_CURRENT)
+		ad.info = "current";
+	else if (attr == LSM_ATTR_EXEC)
+		ad.info = "exec";
+	else
+		ad.info = "invalid";
 	ad.error = error = -EINVAL;
 	aa_audit_msg(AUDIT_APPARMOR_DENIED, &ad, NULL);
 	end_current_label_crit_section(ad.subj_label);
 	goto out;
+}
+
+static int apparmor_setselfattr(unsigned int attr, struct lsm_ctx *ctx,
+				u32 size, u32 flags)
+{
+	int rc;
+
+	if (attr != LSM_ATTR_CURRENT && attr != LSM_ATTR_EXEC)
+		return -EOPNOTSUPP;
+
+	rc = do_setattr(attr, ctx->ctx, ctx->ctx_len);
+	if (rc > 0)
+		return 0;
+	return rc;
+}
+
+static int apparmor_setprocattr(const char *name, void *value,
+				size_t size)
+{
+	int attr = lsm_name_to_attr(name);
+
+	if (attr)
+		return do_setattr(attr, value, size);
+	return -EINVAL;
 }
 
 /**
@@ -910,17 +982,20 @@ static void apparmor_bprm_committed_creds(const struct linux_binprm *bprm)
 	return;
 }
 
-static void apparmor_current_getsecid_subj(u32 *secid)
+static void apparmor_current_getlsmprop_subj(struct lsm_prop *prop)
 {
 	struct aa_label *label = __begin_current_label_crit_section();
-	*secid = label->secid;
+
+	prop->apparmor.label = label;
 	__end_current_label_crit_section(label);
 }
 
-static void apparmor_task_getsecid_obj(struct task_struct *p, u32 *secid)
+static void apparmor_task_getlsmprop_obj(struct task_struct *p,
+					  struct lsm_prop *prop)
 {
 	struct aa_label *label = aa_get_task_label(p);
-	*secid = label->secid;
+
+	prop->apparmor.label = label;
 	aa_put_label(label);
 }
 
@@ -954,7 +1029,6 @@ static int apparmor_task_kill(struct task_struct *target, struct kernel_siginfo 
 		cl = aa_get_newest_cred_label(cred);
 		error = aa_may_signal(cred, cl, tc, tl, sig);
 		aa_put_label(cl);
-		return error;
 	} else {
 		cl = __begin_current_label_crit_section();
 		error = aa_may_signal(current_cred(), cl, tc, tl, sig);
@@ -987,37 +1061,18 @@ static int apparmor_userns_create(const struct cred *cred)
 	return error;
 }
 
-/**
- * apparmor_sk_alloc_security - allocate and attach the sk_security field
- */
-static int apparmor_sk_alloc_security(struct sock *sk, int family, gfp_t flags)
-{
-	struct aa_sk_ctx *ctx;
-
-	ctx = kzalloc(sizeof(*ctx), flags);
-	if (!ctx)
-		return -ENOMEM;
-
-	sk->sk_security = ctx;
-
-	return 0;
-}
-
-/**
- * apparmor_sk_free_security - free the sk_security field
- */
 static void apparmor_sk_free_security(struct sock *sk)
 {
 	struct aa_sk_ctx *ctx = aa_sock(sk);
 
-	sk->sk_security = NULL;
 	aa_put_label(ctx->label);
 	aa_put_label(ctx->peer);
-	kfree(ctx);
 }
 
 /**
  * apparmor_sk_clone_security - clone the sk_security field
+ * @sk: sock to have security cloned
+ * @newsk: sock getting clone
  */
 static void apparmor_sk_clone_security(const struct sock *sk,
 				       struct sock *newsk)
@@ -1034,9 +1089,6 @@ static void apparmor_sk_clone_security(const struct sock *sk,
 	new->peer = aa_get_label(ctx->peer);
 }
 
-/**
- * apparmor_socket_create - check perms before creating a new socket
- */
 static int apparmor_socket_create(int family, int type, int protocol, int kern)
 {
 	struct aa_label *label;
@@ -1058,10 +1110,14 @@ static int apparmor_socket_create(int family, int type, int protocol, int kern)
 
 /**
  * apparmor_socket_post_create - setup the per-socket security struct
+ * @sock: socket that is being setup
+ * @family: family of socket being created
+ * @type: type of the socket
+ * @protocol: protocol of the socket
+ * @kern: socket is a special kernel socket
  *
  * Note:
- * -   kernel sockets currently labeled unconfined but we may want to
- *     move to a special kernel label
+ * -   kernel sockets labeled kernel_t used to use unconfined
  * -   socket may not have sk here if created with sock_create_lite or
  *     sock_alloc. These should be accept cases which will be handled in
  *     sock_graft.
@@ -1087,9 +1143,6 @@ static int apparmor_socket_post_create(struct socket *sock, int family,
 	return 0;
 }
 
-/**
- * apparmor_socket_bind - check perms before bind addr to socket
- */
 static int apparmor_socket_bind(struct socket *sock,
 				struct sockaddr *address, int addrlen)
 {
@@ -1103,9 +1156,6 @@ static int apparmor_socket_bind(struct socket *sock,
 			 aa_sk_perm(OP_BIND, AA_MAY_BIND, sock->sk));
 }
 
-/**
- * apparmor_socket_connect - check perms before connecting @sock to @address
- */
 static int apparmor_socket_connect(struct socket *sock,
 				   struct sockaddr *address, int addrlen)
 {
@@ -1119,9 +1169,6 @@ static int apparmor_socket_connect(struct socket *sock,
 			 aa_sk_perm(OP_CONNECT, AA_MAY_CONNECT, sock->sk));
 }
 
-/**
- * apparmor_socket_listen - check perms before allowing listen
- */
 static int apparmor_socket_listen(struct socket *sock, int backlog)
 {
 	AA_BUG(!sock);
@@ -1133,9 +1180,7 @@ static int apparmor_socket_listen(struct socket *sock, int backlog)
 			 aa_sk_perm(OP_LISTEN, AA_MAY_LISTEN, sock->sk));
 }
 
-/**
- * apparmor_socket_accept - check perms before accepting a new connection.
- *
+/*
  * Note: while @newsock is created and has some information, the accept
  *       has not been done.
  */
@@ -1164,18 +1209,12 @@ static int aa_sock_msg_perm(const char *op, u32 request, struct socket *sock,
 			 aa_sk_perm(op, request, sock->sk));
 }
 
-/**
- * apparmor_socket_sendmsg - check perms before sending msg to another socket
- */
 static int apparmor_socket_sendmsg(struct socket *sock,
 				   struct msghdr *msg, int size)
 {
 	return aa_sock_msg_perm(OP_SENDMSG, AA_MAY_SEND, sock, msg, size);
 }
 
-/**
- * apparmor_socket_recvmsg - check perms before receiving a message
- */
 static int apparmor_socket_recvmsg(struct socket *sock,
 				   struct msghdr *msg, int size, int flags)
 {
@@ -1194,17 +1233,11 @@ static int aa_sock_perm(const char *op, u32 request, struct socket *sock)
 			 aa_sk_perm(op, request, sock->sk));
 }
 
-/**
- * apparmor_socket_getsockname - check perms before getting the local address
- */
 static int apparmor_socket_getsockname(struct socket *sock)
 {
 	return aa_sock_perm(OP_GETSOCKNAME, AA_MAY_GETATTR, sock);
 }
 
-/**
- * apparmor_socket_getpeername - check perms before getting remote address
- */
 static int apparmor_socket_getpeername(struct socket *sock)
 {
 	return aa_sock_perm(OP_GETPEERNAME, AA_MAY_GETATTR, sock);
@@ -1223,9 +1256,6 @@ static int aa_sock_opt_perm(const char *op, u32 request, struct socket *sock,
 			 aa_sk_perm(op, request, sock->sk));
 }
 
-/**
- * apparmor_socket_getsockopt - check perms before getting socket options
- */
 static int apparmor_socket_getsockopt(struct socket *sock, int level,
 				      int optname)
 {
@@ -1233,9 +1263,6 @@ static int apparmor_socket_getsockopt(struct socket *sock, int level,
 				level, optname);
 }
 
-/**
- * apparmor_socket_setsockopt - check perms before setting socket options
- */
 static int apparmor_socket_setsockopt(struct socket *sock, int level,
 				      int optname)
 {
@@ -1243,9 +1270,6 @@ static int apparmor_socket_setsockopt(struct socket *sock, int level,
 				level, optname);
 }
 
-/**
- * apparmor_socket_shutdown - check perms before shutting down @sock conn
- */
 static int apparmor_socket_shutdown(struct socket *sock, int how)
 {
 	return aa_sock_perm(OP_SHUTDOWN, AA_MAY_SHUTDOWN, sock);
@@ -1254,6 +1278,8 @@ static int apparmor_socket_shutdown(struct socket *sock, int how)
 #ifdef CONFIG_NETWORK_SECMARK
 /**
  * apparmor_socket_sock_rcv_skb - check perms before associating skb to sk
+ * @sk: sk to associate @skb with
+ * @skb: skb to check for perms
  *
  * Note: can not sleep may be called with locks held
  *
@@ -1266,6 +1292,13 @@ static int apparmor_socket_sock_rcv_skb(struct sock *sk, struct sk_buff *skb)
 
 	if (!skb->secmark)
 		return 0;
+
+	/*
+	 * If reach here before socket_post_create hook is called, in which
+	 * case label is null, drop the packet.
+	 */
+	if (!ctx->label)
+		return -EACCES;
 
 	return apparmor_secmark_check(ctx->label, OP_RECVMSG, AA_MAY_RECEIVE,
 				      skb->secmark, sk);
@@ -1285,6 +1318,11 @@ static struct aa_label *sk_peer_label(struct sock *sk)
 
 /**
  * apparmor_socket_getpeersec_stream - get security context of peer
+ * @sock: socket that we are trying to get the peer context of
+ * @optval: output - buffer to copy peer name to
+ * @optlen: output - size of copied name in @optval
+ * @len: size of @optval buffer
+ * Returns: 0 on success, -errno of failure
  *
  * Note: for tcp only valid if using ipsec or cipso on lan
  */
@@ -1383,6 +1421,12 @@ struct lsm_blob_sizes apparmor_blob_sizes __ro_after_init = {
 	.lbs_cred = sizeof(struct aa_label *),
 	.lbs_file = sizeof(struct aa_file_ctx),
 	.lbs_task = sizeof(struct aa_task_ctx),
+	.lbs_sock = sizeof(struct aa_sk_ctx),
+};
+
+static const struct lsm_id apparmor_lsmid = {
+	.name = "apparmor",
+	.id = LSM_ID_APPARMOR,
 };
 
 static struct security_hook_list apparmor_hooks[] __ro_after_init = {
@@ -1418,10 +1462,11 @@ static struct security_hook_list apparmor_hooks[] __ro_after_init = {
 	LSM_HOOK_INIT(file_lock, apparmor_file_lock),
 	LSM_HOOK_INIT(file_truncate, apparmor_file_truncate),
 
+	LSM_HOOK_INIT(getselfattr, apparmor_getselfattr),
+	LSM_HOOK_INIT(setselfattr, apparmor_setselfattr),
 	LSM_HOOK_INIT(getprocattr, apparmor_getprocattr),
 	LSM_HOOK_INIT(setprocattr, apparmor_setprocattr),
 
-	LSM_HOOK_INIT(sk_alloc_security, apparmor_sk_alloc_security),
 	LSM_HOOK_INIT(sk_free_security, apparmor_sk_free_security),
 	LSM_HOOK_INIT(sk_clone_security, apparmor_sk_clone_security),
 
@@ -1461,8 +1506,9 @@ static struct security_hook_list apparmor_hooks[] __ro_after_init = {
 
 	LSM_HOOK_INIT(task_free, apparmor_task_free),
 	LSM_HOOK_INIT(task_alloc, apparmor_task_alloc),
-	LSM_HOOK_INIT(current_getsecid_subj, apparmor_current_getsecid_subj),
-	LSM_HOOK_INIT(task_getsecid_obj, apparmor_task_getsecid_obj),
+	LSM_HOOK_INIT(current_getlsmprop_subj,
+		      apparmor_current_getlsmprop_subj),
+	LSM_HOOK_INIT(task_getlsmprop_obj, apparmor_task_getlsmprop_obj),
 	LSM_HOOK_INIT(task_setrlimit, apparmor_task_setrlimit),
 	LSM_HOOK_INIT(task_kill, apparmor_task_kill),
 	LSM_HOOK_INIT(userns_create, apparmor_userns_create),
@@ -1475,6 +1521,7 @@ static struct security_hook_list apparmor_hooks[] __ro_after_init = {
 #endif
 
 	LSM_HOOK_INIT(secid_to_secctx, apparmor_secid_to_secctx),
+	LSM_HOOK_INIT(lsmprop_to_secctx, apparmor_lsmprop_to_secctx),
 	LSM_HOOK_INIT(secctx_to_secid, apparmor_secctx_to_secid),
 	LSM_HOOK_INIT(release_secctx, apparmor_release_secctx),
 
@@ -1980,7 +2027,7 @@ static int __init alloc_buffers(void)
 }
 
 #ifdef CONFIG_SYSCTL
-static int apparmor_dointvec(struct ctl_table *table, int write,
+static int apparmor_dointvec(const struct ctl_table *table, int write,
 			     void *buffer, size_t *lenp, loff_t *ppos)
 {
 	if (!aa_current_policy_admin_capable(NULL))
@@ -2015,7 +2062,6 @@ static struct ctl_table apparmor_sysctl_table[] = {
 		.mode           = 0600,
 		.proc_handler   = apparmor_dointvec,
 	},
-	{ }
 };
 
 static int __init apparmor_init_sysctl(void)
@@ -2106,7 +2152,7 @@ __initcall(apparmor_nf_ip_init);
 static char nulldfa_src[] = {
 	#include "nulldfa.in"
 };
-struct aa_dfa *nulldfa;
+static struct aa_dfa *nulldfa;
 
 static char stacksplitdfa_src[] = {
 	#include "stacksplitdfa.in"
@@ -2202,7 +2248,7 @@ static int __init apparmor_init(void)
 		goto buffers_out;
 	}
 	security_add_hooks(apparmor_hooks, ARRAY_SIZE(apparmor_hooks),
-				"apparmor");
+				&apparmor_lsmid);
 
 	/* Report that AppArmor successfully initialized */
 	apparmor_initialized = 1;

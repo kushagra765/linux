@@ -166,7 +166,6 @@ int pm8001_phy_control(struct asd_sas_phy *sas_phy, enum phy_func func,
 	unsigned long flags;
 	pm8001_ha = sas_phy->ha->lldd_ha;
 	phy = &pm8001_ha->phy[phy_id];
-	pm8001_ha->phy[phy_id].enable_completion = &completion;
 
 	if (PM8001_CHIP_DISP->fatal_errors(pm8001_ha)) {
 		/*
@@ -190,6 +189,7 @@ int pm8001_phy_control(struct asd_sas_phy *sas_phy, enum phy_func func,
 				rates->maximum_linkrate;
 		}
 		if (pm8001_ha->phy[phy_id].phy_state ==  PHY_LINK_DISABLE) {
+			pm8001_ha->phy[phy_id].enable_completion = &completion;
 			PM8001_CHIP_DISP->phy_start_req(pm8001_ha, phy_id);
 			wait_for_completion(&completion);
 		}
@@ -198,6 +198,7 @@ int pm8001_phy_control(struct asd_sas_phy *sas_phy, enum phy_func func,
 		break;
 	case PHY_FUNC_HARD_RESET:
 		if (pm8001_ha->phy[phy_id].phy_state == PHY_LINK_DISABLE) {
+			pm8001_ha->phy[phy_id].enable_completion = &completion;
 			PM8001_CHIP_DISP->phy_start_req(pm8001_ha, phy_id);
 			wait_for_completion(&completion);
 		}
@@ -206,6 +207,7 @@ int pm8001_phy_control(struct asd_sas_phy *sas_phy, enum phy_func func,
 		break;
 	case PHY_FUNC_LINK_RESET:
 		if (pm8001_ha->phy[phy_id].phy_state == PHY_LINK_DISABLE) {
+			pm8001_ha->phy[phy_id].enable_completion = &completion;
 			PM8001_CHIP_DISP->phy_start_req(pm8001_ha, phy_id);
 			wait_for_completion(&completion);
 		}
@@ -570,6 +572,13 @@ void pm8001_ccb_task_free(struct pm8001_hba_info *pm8001_ha,
 	pm8001_ccb_free(pm8001_ha, ccb);
 }
 
+static void pm8001_init_dev(struct pm8001_device *pm8001_dev, int id)
+{
+	pm8001_dev->id = id;
+	pm8001_dev->device_id = PM8001_MAX_DEVICES;
+	atomic_set(&pm8001_dev->running_req, 0);
+}
+
 /**
  * pm8001_alloc_dev - find a empty pm8001_device
  * @pm8001_ha: our hba card information
@@ -578,9 +587,11 @@ static struct pm8001_device *pm8001_alloc_dev(struct pm8001_hba_info *pm8001_ha)
 {
 	u32 dev;
 	for (dev = 0; dev < PM8001_MAX_DEVICES; dev++) {
-		if (pm8001_ha->devices[dev].dev_type == SAS_PHY_UNUSED) {
-			pm8001_ha->devices[dev].id = dev;
-			return &pm8001_ha->devices[dev];
+		struct pm8001_device *pm8001_dev = &pm8001_ha->devices[dev];
+
+		if (pm8001_dev->dev_type == SAS_PHY_UNUSED) {
+			pm8001_init_dev(pm8001_dev, dev);
+			return pm8001_dev;
 		}
 	}
 	if (dev == PM8001_MAX_DEVICES) {
@@ -611,9 +622,7 @@ struct pm8001_device *pm8001_find_dev(struct pm8001_hba_info *pm8001_ha,
 
 void pm8001_free_dev(struct pm8001_device *pm8001_dev)
 {
-	u32 id = pm8001_dev->id;
 	memset(pm8001_dev, 0, sizeof(*pm8001_dev));
-	pm8001_dev->id = id;
 	pm8001_dev->dev_type = SAS_PHY_UNUSED;
 	pm8001_dev->device_id = PM8001_MAX_DEVICES;
 	pm8001_dev->sas_device = NULL;

@@ -34,8 +34,7 @@ int bch2_extent_fallocate(struct btree_trans *trans,
 	struct open_buckets open_buckets = { 0 };
 	struct bkey_s_c k;
 	struct bkey_buf old, new;
-	unsigned sectors_allocated = 0;
-	bool have_reservation = false;
+	unsigned sectors_allocated = 0, new_replicas;
 	bool unwritten = opts.nocow &&
 	    c->sb.version >= bcachefs_metadata_version_unwritten_extents;
 	int ret;
@@ -50,28 +49,20 @@ int bch2_extent_fallocate(struct btree_trans *trans,
 		return ret;
 
 	sectors = min_t(u64, sectors, k.k->p.offset - iter->pos.offset);
+	new_replicas = max(0, (int) opts.data_replicas -
+			   (int) bch2_bkey_nr_ptrs_fully_allocated(k));
 
-	if (!have_reservation) {
-		unsigned new_replicas =
-			max(0, (int) opts.data_replicas -
-			    (int) bch2_bkey_nr_ptrs_fully_allocated(k));
-		/*
-		 * Get a disk reservation before (in the nocow case) calling
-		 * into the allocator:
-		 */
-		ret = bch2_disk_reservation_get(c, &disk_res, sectors, new_replicas, 0);
-		if (unlikely(ret))
-			goto err;
+	/*
+	 * Get a disk reservation before (in the nocow case) calling
+	 * into the allocator:
+	 */
+	ret = bch2_disk_reservation_get(c, &disk_res, sectors, new_replicas, 0);
+	if (unlikely(ret))
+		goto err_noprint;
 
-		bch2_bkey_buf_reassemble(&old, c, k);
-	}
+	bch2_bkey_buf_reassemble(&old, c, k);
 
-	if (have_reservation) {
-		if (!bch2_extents_match(k, bkey_i_to_s_c(old.k)))
-			goto err;
-
-		bch2_key_resize(&new.k->k, sectors);
-	} else if (!unwritten) {
+	if (!unwritten) {
 		struct bkey_i_reservation *reservation;
 
 		bch2_bkey_buf_realloc(&new, c, sizeof(*reservation) / sizeof(u64));
@@ -83,7 +74,6 @@ int bch2_extent_fallocate(struct btree_trans *trans,
 		struct bkey_i_extent *e;
 		struct bch_devs_list devs_have;
 		struct write_point *wp;
-		struct bch_extent_ptr *ptr;
 
 		devs_have.nr = 0;
 
@@ -118,22 +108,25 @@ int bch2_extent_fallocate(struct btree_trans *trans,
 			ptr->unwritten = true;
 	}
 
-	have_reservation = true;
-
 	ret = bch2_extent_update(trans, inum, iter, new.k, &disk_res,
 				 0, i_sectors_delta, true);
 err:
 	if (!ret && sectors_allocated)
 		bch2_increment_clock(c, sectors_allocated, WRITE);
-
+	if (should_print_err(ret))
+		bch_err_inum_offset_ratelimited(c,
+			inum.inum,
+			iter->pos.offset << 9,
+			"%s(): error: %s", __func__, bch2_err_str(ret));
+err_noprint:
 	bch2_open_buckets_put(c, &open_buckets);
 	bch2_disk_reservation_put(c, &disk_res);
 	bch2_bkey_buf_exit(&new, c);
 	bch2_bkey_buf_exit(&old, c);
 
 	if (closure_nr_remaining(&cl) != 1) {
-		bch2_trans_unlock(trans);
-		closure_sync(&cl);
+		bch2_trans_unlock_long(trans);
+		bch2_wait_on_allocator(c, &cl);
 	}
 
 	return ret;
@@ -205,7 +198,7 @@ int bch2_fpunch(struct bch_fs *c, subvol_inum inum, u64 start, u64 end,
 
 	bch2_trans_iter_init(trans, &iter, BTREE_ID_extents,
 			     POS(inum.inum, start),
-			     BTREE_ITER_INTENT);
+			     BTREE_ITER_intent);
 
 	ret = bch2_fpunch_at(trans, &iter, inum, end, i_sectors_delta);
 
@@ -231,13 +224,14 @@ void bch2_logged_op_truncate_to_text(struct printbuf *out, struct bch_fs *c, str
 
 static int truncate_set_isize(struct btree_trans *trans,
 			      subvol_inum inum,
-			      u64 new_i_size)
+			      u64 new_i_size,
+			      bool warn)
 {
 	struct btree_iter iter = { NULL };
 	struct bch_inode_unpacked inode_u;
 	int ret;
 
-	ret   = bch2_inode_peek(trans, &iter, &inode_u, inum, BTREE_ITER_INTENT) ?:
+	ret   = __bch2_inode_peek(trans, &iter, &inode_u, inum, BTREE_ITER_intent, warn) ?:
 		(inode_u.bi_size = new_i_size, 0) ?:
 		bch2_inode_write(trans, &iter, &inode_u);
 
@@ -254,23 +248,25 @@ static int __bch2_resume_logged_op_truncate(struct btree_trans *trans,
 	struct bkey_i_logged_op_truncate *op = bkey_i_to_logged_op_truncate(op_k);
 	subvol_inum inum = { le32_to_cpu(op->v.subvol), le64_to_cpu(op->v.inum) };
 	u64 new_i_size = le64_to_cpu(op->v.new_i_size);
+	bool warn_errors = i_sectors_delta != NULL;
 	int ret;
 
-	ret = commit_do(trans, NULL, NULL, BTREE_INSERT_NOFAIL,
-			truncate_set_isize(trans, inum, new_i_size));
+	ret = commit_do(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc,
+			truncate_set_isize(trans, inum, new_i_size, i_sectors_delta != NULL));
 	if (ret)
 		goto err;
 
 	bch2_trans_iter_init(trans, &fpunch_iter, BTREE_ID_extents,
 			     POS(inum.inum, round_up(new_i_size, block_bytes(c)) >> 9),
-			     BTREE_ITER_INTENT);
+			     BTREE_ITER_intent);
 	ret = bch2_fpunch_at(trans, &fpunch_iter, inum, U64_MAX, i_sectors_delta);
 	bch2_trans_iter_exit(trans, &fpunch_iter);
 
 	if (bch2_err_matches(ret, BCH_ERR_transaction_restart))
 		ret = 0;
 err:
-	bch2_logged_op_finish(trans, op_k);
+	if (warn_errors)
+		bch_err_fn(c, ret);
 	return ret;
 }
 
@@ -294,9 +290,14 @@ int bch2_truncate(struct bch_fs *c, subvol_inum inum, u64 new_i_size, u64 *i_sec
 	 * resume only proceeding in one of the snapshots
 	 */
 	down_read(&c->snapshot_create_lock);
-	int ret = bch2_trans_run(c,
-		bch2_logged_op_start(trans, &op.k_i) ?:
-		__bch2_resume_logged_op_truncate(trans, &op.k_i, i_sectors_delta));
+	struct btree_trans *trans = bch2_trans_get(c);
+	int ret = bch2_logged_op_start(trans, &op.k_i);
+	if (ret)
+		goto out;
+	ret = __bch2_resume_logged_op_truncate(trans, &op.k_i, i_sectors_delta);
+	ret = bch2_logged_op_finish(trans, &op.k_i) ?: ret;
+out:
+	bch2_trans_put(trans);
 	up_read(&c->snapshot_create_lock);
 
 	return ret;
@@ -314,7 +315,8 @@ void bch2_logged_op_finsert_to_text(struct printbuf *out, struct bch_fs *c, stru
 	prt_printf(out, " src_offset=%llu",	le64_to_cpu(op.v->src_offset));
 }
 
-static int adjust_i_size(struct btree_trans *trans, subvol_inum inum, u64 offset, s64 len)
+static int adjust_i_size(struct btree_trans *trans, subvol_inum inum,
+			 u64 offset, s64 len, bool warn)
 {
 	struct btree_iter iter;
 	struct bch_inode_unpacked inode_u;
@@ -323,7 +325,7 @@ static int adjust_i_size(struct btree_trans *trans, subvol_inum inum, u64 offset
 	offset	<<= 9;
 	len	<<= 9;
 
-	ret = bch2_inode_peek(trans, &iter, &inode_u, inum, BTREE_ITER_INTENT);
+	ret = __bch2_inode_peek(trans, &iter, &inode_u, inum, BTREE_ITER_intent, warn);
 	if (ret)
 		return ret;
 
@@ -363,23 +365,33 @@ static int __bch2_resume_logged_op_finsert(struct btree_trans *trans,
 	u64 len = abs(shift);
 	u64 pos = le64_to_cpu(op->v.pos);
 	bool insert = shift > 0;
+	u32 snapshot;
+	bool warn_errors = i_sectors_delta != NULL;
 	int ret = 0;
 
 	ret = bch2_inum_opts_get(trans, inum, &opts);
 	if (ret)
 		return ret;
 
+	/*
+	 * check for missing subvolume before fpunch, as in resume we don't want
+	 * it to be a fatal error
+	 */
+	ret = lockrestart_do(trans, __bch2_subvolume_get_snapshot(trans, inum.subvol, &snapshot, warn_errors));
+	if (ret)
+		return ret;
+
 	bch2_trans_iter_init(trans, &iter, BTREE_ID_extents,
 			     POS(inum.inum, 0),
-			     BTREE_ITER_INTENT);
+			     BTREE_ITER_intent);
 
 	switch (op->v.state) {
 case LOGGED_OP_FINSERT_start:
 	op->v.state = LOGGED_OP_FINSERT_shift_extents;
 
 	if (insert) {
-		ret = commit_do(trans, NULL, NULL, BTREE_INSERT_NOFAIL,
-				adjust_i_size(trans, inum, src_offset, len) ?:
+		ret = commit_do(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc,
+				adjust_i_size(trans, inum, src_offset, len, warn_errors) ?:
 				bch2_logged_op_update(trans, &op->k_i));
 		if (ret)
 			goto err;
@@ -390,7 +402,7 @@ case LOGGED_OP_FINSERT_start:
 		if (ret && !bch2_err_matches(ret, BCH_ERR_transaction_restart))
 			goto err;
 
-		ret = commit_do(trans, NULL, NULL, BTREE_INSERT_NOFAIL,
+		ret = commit_do(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc,
 				bch2_logged_op_update(trans, &op->k_i));
 	}
 
@@ -402,11 +414,11 @@ case LOGGED_OP_FINSERT_shift_extents:
 		struct bkey_i delete, *copy;
 		struct bkey_s_c k;
 		struct bpos src_pos = POS(inum.inum, src_offset);
-		u32 snapshot;
 
 		bch2_trans_begin(trans);
 
-		ret = bch2_subvolume_get_snapshot(trans, inum.subvol, &snapshot);
+		ret = __bch2_subvolume_get_snapshot(trans, inum.subvol, &snapshot,
+						    warn_errors);
 		if (ret)
 			goto btree_err;
 
@@ -449,13 +461,11 @@ case LOGGED_OP_FINSERT_shift_extents:
 
 		op->v.pos = cpu_to_le64(insert ? bkey_start_offset(&delete.k) : delete.k.p.offset);
 
-		ret =   bch2_bkey_set_needs_rebalance(c, copy,
-					opts.background_target,
-					opts.background_compression) ?:
+		ret =   bch2_bkey_set_needs_rebalance(c, copy, &opts) ?:
 			bch2_btree_insert_trans(trans, BTREE_ID_extents, &delete, 0) ?:
 			bch2_btree_insert_trans(trans, BTREE_ID_extents, copy, 0) ?:
 			bch2_logged_op_update(trans, &op->k_i) ?:
-			bch2_trans_commit(trans, &disk_res, NULL, BTREE_INSERT_NOFAIL);
+			bch2_trans_commit(trans, &disk_res, NULL, BCH_TRANS_COMMIT_no_enospc);
 btree_err:
 		bch2_disk_reservation_put(c, &disk_res);
 
@@ -470,13 +480,13 @@ btree_err:
 	op->v.state = LOGGED_OP_FINSERT_finish;
 
 	if (!insert) {
-		ret = commit_do(trans, NULL, NULL, BTREE_INSERT_NOFAIL,
-				adjust_i_size(trans, inum, src_offset, shift) ?:
+		ret = commit_do(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc,
+				adjust_i_size(trans, inum, src_offset, shift, warn_errors) ?:
 				bch2_logged_op_update(trans, &op->k_i));
 	} else {
 		/* We need an inode update to update bi_journal_seq for fsync: */
-		ret = commit_do(trans, NULL, NULL, BTREE_INSERT_NOFAIL,
-				adjust_i_size(trans, inum, 0, 0) ?:
+		ret = commit_do(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc,
+				adjust_i_size(trans, inum, 0, 0, warn_errors) ?:
 				bch2_logged_op_update(trans, &op->k_i));
 	}
 
@@ -485,8 +495,9 @@ case LOGGED_OP_FINSERT_finish:
 	break;
 	}
 err:
-	bch2_logged_op_finish(trans, op_k);
 	bch2_trans_iter_exit(trans, &iter);
+	if (warn_errors)
+		bch_err_fn(c, ret);
 	return ret;
 }
 
@@ -515,9 +526,14 @@ int bch2_fcollapse_finsert(struct bch_fs *c, subvol_inum inum,
 	 * resume only proceeding in one of the snapshots
 	 */
 	down_read(&c->snapshot_create_lock);
-	int ret = bch2_trans_run(c,
-		bch2_logged_op_start(trans, &op.k_i) ?:
-		__bch2_resume_logged_op_finsert(trans, &op.k_i, i_sectors_delta));
+	struct btree_trans *trans = bch2_trans_get(c);
+	int ret = bch2_logged_op_start(trans, &op.k_i);
+	if (ret)
+		goto out;
+	ret = __bch2_resume_logged_op_finsert(trans, &op.k_i, i_sectors_delta);
+	ret = bch2_logged_op_finish(trans, &op.k_i) ?: ret;
+out:
+	bch2_trans_put(trans);
 	up_read(&c->snapshot_create_lock);
 
 	return ret;

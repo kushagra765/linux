@@ -630,6 +630,9 @@ static struct scpi_dvfs_info *scpi_dvfs_get_info(u8 domain)
 	if (ret)
 		return ERR_PTR(ret);
 
+	if (!buf.opp_count)
+		return ERR_PTR(-ENOENT);
+
 	info = kmalloc(sizeof(*info), GFP_KERNEL);
 	if (!info)
 		return ERR_PTR(-ENOMEM);
@@ -863,7 +866,7 @@ static void scpi_free_channels(void *data)
 		mbox_free_channel(info->channels[i].chan);
 }
 
-static int scpi_remove(struct platform_device *pdev)
+static void scpi_remove(struct platform_device *pdev)
 {
 	int i;
 	struct scpi_drvinfo *info = platform_get_drvdata(pdev);
@@ -874,8 +877,6 @@ static int scpi_remove(struct platform_device *pdev)
 		kfree(info->dvfs[i]->opps);
 		kfree(info->dvfs[i]);
 	}
-
-	return 0;
 }
 
 #define MAX_SCPI_XFERS		10

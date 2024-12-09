@@ -17,7 +17,7 @@
 
 #include <crypto/internal/hash.h>
 
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 
 #define DRIVER_NAME             "stm32-crc32"
 #define CHKSUM_DIGEST_SIZE      4
@@ -104,7 +104,7 @@ static struct stm32_crc *stm32_crc_get_next_crc(void)
 	struct stm32_crc *crc;
 
 	spin_lock_bh(&crc_list.lock);
-	crc = list_first_entry(&crc_list.dev_list, struct stm32_crc, list);
+	crc = list_first_entry_or_null(&crc_list.dev_list, struct stm32_crc, list);
 	if (crc)
 		list_move_tail(&crc->list, &crc_list.dev_list);
 	spin_unlock_bh(&crc_list.lock);
@@ -465,7 +465,7 @@ MODULE_DEVICE_TABLE(of, stm32_dt_ids);
 
 static struct platform_driver stm32_crc_driver = {
 	.probe  = stm32_crc_probe,
-	.remove_new = stm32_crc_remove,
+	.remove = stm32_crc_remove,
 	.driver = {
 		.name           = DRIVER_NAME,
 		.pm		= &stm32_crc_pm_ops,

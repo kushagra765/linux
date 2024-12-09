@@ -439,12 +439,13 @@ static int rtl2832_sdr_queue_setup(struct vb2_queue *vq,
 {
 	struct rtl2832_sdr_dev *dev = vb2_get_drv_priv(vq);
 	struct platform_device *pdev = dev->pdev;
+	unsigned int q_num_bufs = vb2_get_num_buffers(vq);
 
 	dev_dbg(&pdev->dev, "nbuffers=%d\n", *nbuffers);
 
 	/* Need at least 8 buffers */
-	if (vq->num_buffers + *nbuffers < 8)
-		*nbuffers = 8 - vq->num_buffers;
+	if (q_num_bufs + *nbuffers < 8)
+		*nbuffers = 8 - q_num_bufs;
 	*nplanes = 1;
 	sizes[0] = PAGE_ALIGN(dev->buffersize);
 	dev_dbg(&pdev->dev, "nbuffers=%d sizes[0]=%d\n", *nbuffers, sizes[0]);
@@ -946,8 +947,6 @@ static const struct vb2_ops rtl2832_sdr_vb2_ops = {
 	.buf_queue              = rtl2832_sdr_buf_queue,
 	.start_streaming        = rtl2832_sdr_start_streaming,
 	.stop_streaming         = rtl2832_sdr_stop_streaming,
-	.wait_prepare           = vb2_ops_wait_prepare,
-	.wait_finish            = vb2_ops_wait_finish,
 };
 
 static int rtl2832_sdr_g_tuner(struct file *file, void *priv,
@@ -1486,7 +1485,7 @@ static struct platform_driver rtl2832_sdr_driver = {
 		.name   = "rtl2832_sdr",
 	},
 	.probe          = rtl2832_sdr_probe,
-	.remove_new     = rtl2832_sdr_remove,
+	.remove         = rtl2832_sdr_remove,
 };
 module_platform_driver(rtl2832_sdr_driver);
 

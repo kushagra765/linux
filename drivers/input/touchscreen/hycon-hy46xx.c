@@ -15,7 +15,7 @@
 #include <linux/regulator/consumer.h>
 #include <linux/regmap.h>
 
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 
 #define HY46XX_CHKSUM_CODE		0x1
 #define HY46XX_FINGER_NUM		0x2
@@ -202,7 +202,7 @@ static ssize_t hycon_hy46xx_setting_show(struct device *dev,
 		*field = val;
 	}
 
-	count = scnprintf(buf, PAGE_SIZE, "%d\n", val);
+	count = sysfs_emit(buf, "%d\n", val);
 
 out:
 	mutex_unlock(&tsdata->mutex);

@@ -175,8 +175,8 @@ static int altera_jtaguart_startup(struct uart_port *port)
 	ret = request_irq(port->irq, altera_jtaguart_interrupt, 0,
 			DRV_NAME, port);
 	if (ret) {
-		pr_err(DRV_NAME ": unable to attach Altera JTAG UART %d "
-		       "interrupt vector=%d\n", port->line, port->irq);
+		dev_err(port->dev, "unable to attach Altera JTAG UART %d interrupt vector=%d\n",
+			port->line, port->irq);
 		return ret;
 	}
 
@@ -425,7 +425,7 @@ static int altera_jtaguart_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int altera_jtaguart_remove(struct platform_device *pdev)
+static void altera_jtaguart_remove(struct platform_device *pdev)
 {
 	struct uart_port *port;
 	int i = pdev->id;
@@ -436,8 +436,6 @@ static int altera_jtaguart_remove(struct platform_device *pdev)
 	port = &altera_jtaguart_ports[i];
 	uart_remove_one_port(&altera_jtaguart_driver, port);
 	iounmap(port->membase);
-
-	return 0;
 }
 
 #ifdef CONFIG_OF
@@ -451,7 +449,7 @@ MODULE_DEVICE_TABLE(of, altera_jtaguart_match);
 
 static struct platform_driver altera_jtaguart_platform_driver = {
 	.probe	= altera_jtaguart_probe,
-	.remove	= altera_jtaguart_remove,
+	.remove = altera_jtaguart_remove,
 	.driver	= {
 		.name		= DRV_NAME,
 		.of_match_table	= of_match_ptr(altera_jtaguart_match),

@@ -506,7 +506,7 @@ static int amd_gpio_irq_set_type(struct irq_data *d, unsigned int type)
 	case IRQ_TYPE_EDGE_BOTH:
 		pin_reg &= ~BIT(LEVEL_TRIG_OFF);
 		pin_reg &= ~(ACTIVE_LEVEL_MASK << ACTIVE_LEVEL_OFF);
-		pin_reg |= BOTH_EADGE << ACTIVE_LEVEL_OFF;
+		pin_reg |= BOTH_EDGES << ACTIVE_LEVEL_OFF;
 		irq_set_handler_locked(d, handle_edge_irq);
 		break;
 
@@ -1159,7 +1159,7 @@ static int amd_gpio_probe(struct platform_device *pdev)
 	}
 
 	ret = devm_request_irq(&pdev->dev, gpio_dev->irq, amd_gpio_irq_handler,
-			       IRQF_SHARED, KBUILD_MODNAME, gpio_dev);
+			       IRQF_SHARED | IRQF_COND_ONESHOT, KBUILD_MODNAME, gpio_dev);
 	if (ret)
 		goto out2;
 
@@ -1204,7 +1204,7 @@ static struct platform_driver amd_gpio_driver = {
 #endif
 	},
 	.probe		= amd_gpio_probe,
-	.remove_new	= amd_gpio_remove,
+	.remove		= amd_gpio_remove,
 };
 
 module_platform_driver(amd_gpio_driver);

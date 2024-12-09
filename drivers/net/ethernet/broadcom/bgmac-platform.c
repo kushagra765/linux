@@ -294,8 +294,9 @@ static struct platform_driver bgmac_enet_driver = {
 		.pm = BGMAC_PM_OPS
 	},
 	.probe = bgmac_probe,
-	.remove_new = bgmac_remove,
+	.remove = bgmac_remove,
 };
 
 module_platform_driver(bgmac_enet_driver);
+MODULE_DESCRIPTION("Broadcom iProc GBit platform interface driver");
 MODULE_LICENSE("GPL");

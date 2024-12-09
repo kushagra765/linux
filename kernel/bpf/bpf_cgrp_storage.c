@@ -82,7 +82,7 @@ static void *bpf_cgrp_storage_lookup_elem(struct bpf_map *map, void *key)
 	int fd;
 
 	fd = *(int *)key;
-	cgroup = cgroup_get_from_fd(fd);
+	cgroup = cgroup_v1v2_get_from_fd(fd);
 	if (IS_ERR(cgroup))
 		return ERR_CAST(cgroup);
 
@@ -101,13 +101,13 @@ static long bpf_cgrp_storage_update_elem(struct bpf_map *map, void *key,
 	int fd;
 
 	fd = *(int *)key;
-	cgroup = cgroup_get_from_fd(fd);
+	cgroup = cgroup_v1v2_get_from_fd(fd);
 	if (IS_ERR(cgroup))
 		return PTR_ERR(cgroup);
 
 	bpf_cgrp_storage_lock();
 	sdata = bpf_local_storage_update(cgroup, (struct bpf_local_storage_map *)map,
-					 value, map_flags, GFP_ATOMIC);
+					 value, map_flags, false, GFP_ATOMIC);
 	bpf_cgrp_storage_unlock();
 	cgroup_put(cgroup);
 	return PTR_ERR_OR_ZERO(sdata);
@@ -131,7 +131,7 @@ static long bpf_cgrp_storage_delete_elem(struct bpf_map *map, void *key)
 	int err, fd;
 
 	fd = *(int *)key;
-	cgroup = cgroup_get_from_fd(fd);
+	cgroup = cgroup_v1v2_get_from_fd(fd);
 	if (IS_ERR(cgroup))
 		return PTR_ERR(cgroup);
 
@@ -181,7 +181,7 @@ BPF_CALL_5(bpf_cgrp_storage_get, struct bpf_map *, map, struct cgroup *, cgroup,
 	if (!percpu_ref_is_dying(&cgroup->self.refcnt) &&
 	    (flags & BPF_LOCAL_STORAGE_GET_F_CREATE))
 		sdata = bpf_local_storage_update(cgroup, (struct bpf_local_storage_map *)map,
-						 value, BPF_NOEXIST, gfp_flags);
+						 value, BPF_NOEXIST, false, gfp_flags);
 
 unlock:
 	bpf_cgrp_storage_unlock();

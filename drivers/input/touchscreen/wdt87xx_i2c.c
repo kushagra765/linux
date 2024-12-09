@@ -20,7 +20,7 @@
 #include <linux/firmware.h>
 #include <linux/input/mt.h>
 #include <linux/acpi.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 
 #define WDT87XX_NAME		"wdt87xx_i2c"
 #define WDT87XX_FW_NAME		"wdt87xx_fw.bin"
@@ -887,7 +887,7 @@ static ssize_t config_csum_show(struct device *dev,
 	cfg_csum = wdt->param.xmls_id1;
 	cfg_csum = (cfg_csum << 16) | wdt->param.xmls_id2;
 
-	return scnprintf(buf, PAGE_SIZE, "%x\n", cfg_csum);
+	return sysfs_emit(buf, "%x\n", cfg_csum);
 }
 
 static ssize_t fw_version_show(struct device *dev,
@@ -896,7 +896,7 @@ static ssize_t fw_version_show(struct device *dev,
 	struct i2c_client *client = to_i2c_client(dev);
 	struct wdt87xx_data *wdt = i2c_get_clientdata(client);
 
-	return scnprintf(buf, PAGE_SIZE, "%x\n", wdt->param.fw_id);
+	return sysfs_emit(buf, "%x\n", wdt->param.fw_id);
 }
 
 static ssize_t plat_id_show(struct device *dev,
@@ -905,7 +905,7 @@ static ssize_t plat_id_show(struct device *dev,
 	struct i2c_client *client = to_i2c_client(dev);
 	struct wdt87xx_data *wdt = i2c_get_clientdata(client);
 
-	return scnprintf(buf, PAGE_SIZE, "%x\n", wdt->param.plat_id);
+	return sysfs_emit(buf, "%x\n", wdt->param.plat_id);
 }
 
 static ssize_t update_config_store(struct device *dev,
@@ -1148,7 +1148,7 @@ static int wdt87xx_resume(struct device *dev)
 static DEFINE_SIMPLE_DEV_PM_OPS(wdt87xx_pm_ops, wdt87xx_suspend, wdt87xx_resume);
 
 static const struct i2c_device_id wdt87xx_dev_id[] = {
-	{ WDT87XX_NAME, 0 },
+	{ WDT87XX_NAME },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, wdt87xx_dev_id);

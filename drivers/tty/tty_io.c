@@ -350,22 +350,19 @@ int tty_dev_name_to_number(const char *name, dev_t *number)
 		return ret;
 
 	prefix_length = str - name;
-	mutex_lock(&tty_mutex);
+
+	guard(mutex)(&tty_mutex);
 
 	list_for_each_entry(p, &tty_drivers, tty_drivers)
 		if (prefix_length == strlen(p->name) && strncmp(name,
 					p->name, prefix_length) == 0) {
 			if (index < p->num) {
 				*number = MKDEV(p->major, p->minor_start + index);
-				goto out;
+				return 0;
 			}
 		}
 
-	/* if here then driver wasn't found */
-	ret = -ENODEV;
-out:
-	mutex_unlock(&tty_mutex);
-	return ret;
+	return -ENODEV;
 }
 EXPORT_SYMBOL_GPL(tty_dev_name_to_number);
 
@@ -462,7 +459,6 @@ static void tty_show_fdinfo(struct seq_file *m, struct file *file)
 }
 
 static const struct file_operations tty_fops = {
-	.llseek		= no_llseek,
 	.read_iter	= tty_read,
 	.write_iter	= tty_write,
 	.splice_read	= copy_splice_read,
@@ -477,7 +473,6 @@ static const struct file_operations tty_fops = {
 };
 
 static const struct file_operations console_fops = {
-	.llseek		= no_llseek,
 	.read_iter	= tty_read,
 	.write_iter	= redirected_tty_write,
 	.splice_read	= copy_splice_read,
@@ -491,7 +486,6 @@ static const struct file_operations console_fops = {
 };
 
 static const struct file_operations hung_up_tty_fops = {
-	.llseek		= no_llseek,
 	.read_iter	= hung_up_tty_read,
 	.write_iter	= hung_up_tty_write,
 	.poll		= hung_up_tty_poll,
@@ -852,9 +846,9 @@ static ssize_t iterate_tty_read(struct tty_ldisc *ld, struct tty_struct *tty,
 {
 	void *cookie = NULL;
 	unsigned long offset = 0;
-	char kernel_buf[64];
 	ssize_t retval = 0;
 	size_t copied, count = iov_iter_count(to);
+	u8 kernel_buf[64];
 
 	do {
 		ssize_t size = min(count, sizeof(kernel_buf));
@@ -995,7 +989,7 @@ static ssize_t iterate_tty_write(struct tty_ldisc *ld, struct tty_struct *tty,
 
 	/* write_buf/write_cnt is protected by the atomic_write_lock mutex */
 	if (tty->write_cnt < chunk) {
-		unsigned char *buf_chunk;
+		u8 *buf_chunk;
 
 		if (chunk < 1024)
 			chunk = 1024;
@@ -1047,6 +1041,7 @@ out:
 	return ret;
 }
 
+#ifdef CONFIG_PRINT_QUOTA_WARNING
 /**
  * tty_write_message - write a message to a certain tty, not just the console.
  * @tty: the destination tty_struct
@@ -1057,6 +1052,8 @@ out:
  * needed.
  *
  * We must still hold the BTM and test the CLOSING flag for the moment.
+ *
+ * This function is DEPRECATED, do not use in new code.
  */
 void tty_write_message(struct tty_struct *tty, char *msg)
 {
@@ -1069,6 +1066,7 @@ void tty_write_message(struct tty_struct *tty, char *msg)
 		tty_write_unlock(tty);
 	}
 }
+#endif
 
 static ssize_t file_tty_write(struct file *file, struct kiocb *iocb, struct iov_iter *from)
 {
@@ -1145,7 +1143,7 @@ ssize_t redirected_tty_write(struct kiocb *iocb, struct iov_iter *iter)
  *
  * Locking: none for xchar method, write ordering for write method.
  */
-int tty_send_xchar(struct tty_struct *tty, char ch)
+int tty_send_xchar(struct tty_struct *tty, u8 ch)
 {
 	bool was_stopped = tty->flow.stopped;
 
@@ -2221,6 +2219,12 @@ static int __tty_fasync(int fd, struct file *filp, int on)
 	if (tty_paranoia_check(tty, file_inode(filp), "tty_fasync"))
 		goto out;
 
+	if (on) {
+		retval = file_f_owner_allocate(filp);
+		if (retval)
+			goto out;
+	}
+
 	retval = fasync_helper(fd, filp, on, &tty->fasync);
 	if (retval <= 0)
 		goto out;
@@ -2274,10 +2278,10 @@ static bool tty_legacy_tiocsti __read_mostly = IS_ENABLED(CONFIG_LEGACY_TIOCSTI)
  *  * Called functions take tty_ldiscs_lock
  *  * current->signal->tty check is safe without locks
  */
-static int tiocsti(struct tty_struct *tty, char __user *p)
+static int tiocsti(struct tty_struct *tty, u8 __user *p)
 {
-	char ch, mbz = 0;
 	struct tty_ldisc *ld;
+	u8 ch;
 
 	if (!tty_legacy_tiocsti && !capable(CAP_SYS_ADMIN))
 		return -EIO;
@@ -2292,7 +2296,7 @@ static int tiocsti(struct tty_struct *tty, char __user *p)
 		return -EIO;
 	tty_buffer_lock_exclusive(tty->port);
 	if (ld->ops->receive_buf)
-		ld->ops->receive_buf(tty, &ch, &mbz, 1);
+		ld->ops->receive_buf(tty, &ch, NULL, 1);
 	tty_buffer_unlock_exclusive(tty->port);
 	tty_ldisc_deref(ld);
 	return 0;
@@ -2489,6 +2493,9 @@ static int send_break(struct tty_struct *tty, unsigned int duration)
 	if (!retval) {
 		msleep_interruptible(duration);
 		retval = tty->ops->break_ctl(tty, 0);
+	} else if (retval == -EOPNOTSUPP) {
+		/* some drivers can tell only dynamically */
+		retval = 0;
 	}
 	tty_write_unlock(tty);
 
@@ -2497,6 +2504,24 @@ static int send_break(struct tty_struct *tty, unsigned int duration)
 
 	return retval;
 }
+
+/**
+ * tty_get_tiocm - get tiocm status register
+ * @tty: tty device
+ *
+ * Obtain the modem status bits from the tty driver if the feature
+ * is supported.
+ */
+int tty_get_tiocm(struct tty_struct *tty)
+{
+	int retval = -ENOTTY;
+
+	if (tty->ops->tiocmget)
+		retval = tty->ops->tiocmget(tty);
+
+	return retval;
+}
+EXPORT_SYMBOL_GPL(tty_get_tiocm);
 
 /**
  * tty_tiocmget - get modem status
@@ -2510,14 +2535,12 @@ static int send_break(struct tty_struct *tty, unsigned int duration)
  */
 static int tty_tiocmget(struct tty_struct *tty, int __user *p)
 {
-	int retval = -ENOTTY;
+	int retval;
 
-	if (tty->ops->tiocmget) {
-		retval = tty->ops->tiocmget(tty);
+	retval = tty_get_tiocm(tty);
+	if (retval >= 0)
+		retval = put_user(retval, p);
 
-		if (retval >= 0)
-			retval = put_user(retval, p);
-	}
 	return retval;
 }
 
@@ -3138,7 +3161,7 @@ struct tty_struct *alloc_tty_struct(struct tty_driver *driver, int idx)
  *
  * Return: the number of characters successfully output.
  */
-int tty_put_char(struct tty_struct *tty, unsigned char ch)
+int tty_put_char(struct tty_struct *tty, u8 ch)
 {
 	if (tty->ops->put_char)
 		return tty->ops->put_char(tty, ch);
@@ -3544,7 +3567,7 @@ static ssize_t show_cons_active(struct device *dev,
 	for_each_console(c) {
 		if (!c->device)
 			continue;
-		if (!c->write)
+		if (!(c->flags & CON_NBCON) && !c->write)
 			continue;
 		if ((c->flags & CON_ENABLED) == 0)
 			continue;
@@ -3608,7 +3631,7 @@ static struct ctl_table tty_table[] = {
 		.data		= &tty_ldisc_autoload,
 		.maxlen		= sizeof(tty_ldisc_autoload),
 		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
+		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= SYSCTL_ZERO,
 		.extra2		= SYSCTL_ONE,
 	},

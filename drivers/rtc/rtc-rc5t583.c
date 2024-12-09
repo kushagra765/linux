@@ -298,7 +298,7 @@ static SIMPLE_DEV_PM_OPS(rc5t583_rtc_pm_ops, rc5t583_rtc_suspend,
 
 static struct platform_driver rc5t583_rtc_driver = {
 	.probe		= rc5t583_rtc_probe,
-	.remove_new	= rc5t583_rtc_remove,
+	.remove		= rc5t583_rtc_remove,
 	.driver		= {
 		.name	= "rtc-rc5t583",
 		.pm	= &rc5t583_rtc_pm_ops,
@@ -308,4 +308,5 @@ static struct platform_driver rc5t583_rtc_driver = {
 module_platform_driver(rc5t583_rtc_driver);
 MODULE_ALIAS("platform:rtc-rc5t583");
 MODULE_AUTHOR("Venu Byravarasu <vbyravarasu@nvidia.com>");
+MODULE_DESCRIPTION("RICOH 5T583 RTC driver");
 MODULE_LICENSE("GPL v2");

@@ -9,8 +9,8 @@ This document covers the in-kernel APIs only. For the best practices on
 userspace API implementation in camera sensor drivers, please see
 :ref:`media_using_camera_sensor_drivers`.
 
-CSI-2 and parallel (BT.601 and BT.656) busses
----------------------------------------------
+CSI-2, parallel and BT.656 buses
+--------------------------------
 
 Please see :ref:`transmitter-receiver`.
 
@@ -60,7 +60,8 @@ management over the pipeline.
 Camera sensor drivers are responsible for controlling the power state of the
 device they otherwise control as well. They shall use runtime PM to manage
 power states. Runtime PM shall be enabled at probe time and disabled at remove
-time. Drivers should enable runtime PM autosuspend.
+time. Drivers should enable runtime PM autosuspend. Also see
+:ref:`async sub-device registration <media-registering-async-subdevs>`.
 
 The runtime PM handlers shall handle clocks, regulators, GPIOs, and other
 system resources required to power the sensor up and down. For drivers that
@@ -80,10 +81,10 @@ restart when the system is resumed. This requires coordination between the
 camera sensor and the rest of the camera pipeline. Bridge drivers are
 responsible for this coordination, and instruct camera sensors to stop and
 restart streaming by calling the appropriate subdev operations
-(``.s_stream()``, ``.enable_streams()`` or ``.disable_streams()``). Camera
-sensor drivers shall therefore **not** keep track of the streaming state to
-stop streaming in the PM suspend handler and restart it in the resume handler.
-Drivers should in general not implement the system PM handlers.
+(``.enable_streams()`` or ``.disable_streams()``). Camera sensor drivers shall
+therefore **not** keep track of the streaming state to stop streaming in the PM
+suspend handler and restart it in the resume handler. Drivers should in general
+not implement the system PM handlers.
 
 Camera sensor drivers shall **not** implement the subdev ``.s_power()``
 operation, as it is deprecated. While this operation is implemented in some

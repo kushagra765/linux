@@ -33,18 +33,40 @@ config RAVB
 	select CRC32
 	select MII
 	select MDIO_BITBANG
+	select PAGE_POOL
 	select PHYLIB
+	select RESET_CONTROLLER
 	help
 	  Renesas Ethernet AVB device driver.
 
 config RENESAS_ETHER_SWITCH
 	tristate "Renesas Ethernet Switch support"
 	depends on ARCH_RENESAS || COMPILE_TEST
-	depends on PTP_1588_CLOCK_OPTIONAL
+	depends on PTP_1588_CLOCK
 	select CRC32
 	select MII
 	select PHYLINK
+	select RENESAS_GEN4_PTP
 	help
 	  Renesas Ethernet Switch device driver.
+
+config RENESAS_GEN4_PTP
+	tristate "Renesas R-Car Gen4 gPTP support" if COMPILE_TEST
+	depends on PTP_1588_CLOCK
+	select CRC32
+	select MII
+	select PHYLIB
+	help
+	  Renesas R-Car Gen4 gPTP device driver.
+
+config RTSN
+	tristate "Renesas Ethernet-TSN support"
+	depends on ARCH_RENESAS || COMPILE_TEST
+	depends on PTP_1588_CLOCK
+	select CRC32
+	select PHYLIB
+	select RENESAS_GEN4_PTP
+	help
+	  Renesas Ethernet-TSN device driver.
 
 endif # NET_VENDOR_RENESAS

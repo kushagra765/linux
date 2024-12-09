@@ -351,15 +351,13 @@ static int tad_pmu_probe(struct platform_device *pdev)
 	return ret;
 }
 
-static int tad_pmu_remove(struct platform_device *pdev)
+static void tad_pmu_remove(struct platform_device *pdev)
 {
 	struct tad_pmu *pmu = platform_get_drvdata(pdev);
 
 	cpuhp_state_remove_instance_nocalls(tad_pmu_cpuhp_state,
 						&pmu->node);
 	perf_pmu_unregister(&pmu->pmu);
-
-	return 0;
 }
 
 #ifdef CONFIG_OF

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 // Copyright (c) 2019 Intel Corporation.
 
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 #include <linux/acpi.h>
 #include <linux/clk.h>
 #include <linux/delay.h>
@@ -1435,7 +1435,7 @@ struct ov8856 {
 	/* Application specified mbus format */
 	u32 cur_mbus_index;
 
-	/* To serialize asynchronus callbacks */
+	/* To serialize asynchronous callbacks */
 	struct mutex mutex;
 
 	/* lanes index */
@@ -2134,7 +2134,7 @@ static int ov8856_set_format(struct v4l2_subdev *sd,
 	mutex_lock(&ov8856->mutex);
 	ov8856_update_pad_format(ov8856, mode, &fmt->format);
 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
-		*v4l2_subdev_get_try_format(sd, sd_state, fmt->pad) = fmt->format;
+		*v4l2_subdev_state_get_format(sd_state, fmt->pad) = fmt->format;
 	} else {
 		ov8856->cur_mode = mode;
 		__v4l2_ctrl_s_ctrl(ov8856->link_freq, mode->link_freq_index);
@@ -2172,9 +2172,8 @@ static int ov8856_get_format(struct v4l2_subdev *sd,
 
 	mutex_lock(&ov8856->mutex);
 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY)
-		fmt->format = *v4l2_subdev_get_try_format(&ov8856->sd,
-							  sd_state,
-							  fmt->pad);
+		fmt->format = *v4l2_subdev_state_get_format(sd_state,
+							    fmt->pad);
 	else
 		ov8856_update_pad_format(ov8856, ov8856->cur_mode, &fmt->format);
 
@@ -2225,7 +2224,7 @@ static int ov8856_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 
 	mutex_lock(&ov8856->mutex);
 	ov8856_update_pad_format(ov8856, &ov8856->priv_lane->supported_modes[0],
-				 v4l2_subdev_get_try_format(sd, fh->state, 0));
+				 v4l2_subdev_state_get_format(fh->state, 0));
 	mutex_unlock(&ov8856->mutex);
 
 	return 0;

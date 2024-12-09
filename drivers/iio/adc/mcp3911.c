@@ -7,6 +7,7 @@
  */
 #include <linux/bitfield.h>
 #include <linux/bits.h>
+#include <linux/cleanup.h>
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/err.h>
@@ -22,7 +23,7 @@
 #include <linux/iio/trigger_consumer.h>
 #include <linux/iio/trigger.h>
 
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 
 #define MCP3911_REG_CHANNEL0		0x00
 #define MCP3911_REG_CHANNEL1		0x03
@@ -102,7 +103,7 @@ struct mcp3911_chip_info {
 	const struct iio_chan_spec *channels;
 	unsigned int num_channels;
 
-	int (*config)(struct mcp3911 *adc);
+	int (*config)(struct mcp3911 *adc, bool external_vref);
 	int (*get_osr)(struct mcp3911 *adc, u32 *val);
 	int (*set_osr)(struct mcp3911 *adc, u32 val);
 	int (*enable_offset)(struct mcp3911 *adc, bool enable);
@@ -114,7 +115,6 @@ struct mcp3911_chip_info {
 struct mcp3911 {
 	struct spi_device *spi;
 	struct mutex lock;
-	struct regulator *vref;
 	struct clk *clki;
 	u32 dev_addr;
 	struct iio_trigger *trig;
@@ -316,47 +316,37 @@ static int mcp3911_read_raw(struct iio_dev *indio_dev,
 			    int *val2, long mask)
 {
 	struct mcp3911 *adc = iio_priv(indio_dev);
-	int ret = -EINVAL;
+	int ret;
 
-	mutex_lock(&adc->lock);
+	guard(mutex)(&adc->lock);
 	switch (mask) {
 	case IIO_CHAN_INFO_RAW:
 		ret = mcp3911_read(adc,
 				   MCP3911_CHANNEL(channel->channel), val, 3);
 		if (ret)
-			goto out;
+			return ret;
 
 		*val = sign_extend32(*val, 23);
-
-		ret = IIO_VAL_INT;
-		break;
-
+		return IIO_VAL_INT;
 	case IIO_CHAN_INFO_OFFSET:
-
 		ret = adc->chip->get_offset(adc, channel->channel, val);
 		if (ret)
-			goto out;
+			return ret;
 
-		ret = IIO_VAL_INT;
-		break;
+		return IIO_VAL_INT;
 	case IIO_CHAN_INFO_OVERSAMPLING_RATIO:
 		ret = adc->chip->get_osr(adc, val);
 		if (ret)
-			goto out;
+			return ret;
 
-		ret = IIO_VAL_INT;
-		break;
-
+		return IIO_VAL_INT;
 	case IIO_CHAN_INFO_SCALE:
 		*val = mcp3911_scale_table[ilog2(adc->gain[channel->channel])][0];
 		*val2 = mcp3911_scale_table[ilog2(adc->gain[channel->channel])][1];
-		ret = IIO_VAL_INT_PLUS_NANO;
-		break;
+		return IIO_VAL_INT_PLUS_NANO;
+	default:
+		return -EINVAL;
 	}
-
-out:
-	mutex_unlock(&adc->lock);
-	return ret;
 }
 
 static int mcp3911_write_raw(struct iio_dev *indio_dev,
@@ -364,9 +354,8 @@ static int mcp3911_write_raw(struct iio_dev *indio_dev,
 			     int val2, long mask)
 {
 	struct mcp3911 *adc = iio_priv(indio_dev);
-	int ret = -EINVAL;
 
-	mutex_lock(&adc->lock);
+	guard(mutex)(&adc->lock);
 	switch (mask) {
 	case IIO_CHAN_INFO_SCALE:
 		for (int i = 0; i < MCP3911_NUM_SCALES; i++) {
@@ -374,50 +363,31 @@ static int mcp3911_write_raw(struct iio_dev *indio_dev,
 			    val2 == mcp3911_scale_table[i][1]) {
 
 				adc->gain[channel->channel] = BIT(i);
-				ret = adc->chip->set_scale(adc, channel->channel, i);
+				return adc->chip->set_scale(adc, channel->channel, i);
 			}
 		}
-		break;
+		return -EINVAL;
 	case IIO_CHAN_INFO_OFFSET:
-		if (val2 != 0) {
-			ret = -EINVAL;
-			goto out;
-		}
+		if (val2 != 0)
+			return -EINVAL;
 
-		ret = adc->chip->set_offset(adc, channel->channel, val);
-		break;
-
+		return adc->chip->set_offset(adc, channel->channel, val);
 	case IIO_CHAN_INFO_OVERSAMPLING_RATIO:
 		for (int i = 0; i < ARRAY_SIZE(mcp3911_osr_table); i++) {
 			if (val == mcp3911_osr_table[i]) {
-				ret = adc->chip->set_osr(adc, i);
-				break;
+				return adc->chip->set_osr(adc, i);
 			}
 		}
-		break;
+		return -EINVAL;
+	default:
+		return -EINVAL;
 	}
-
-out:
-	mutex_unlock(&adc->lock);
-	return ret;
 }
 
-static int mcp3911_calc_scale_table(struct mcp3911 *adc)
+static int mcp3911_calc_scale_table(u32 vref_mv)
 {
-	struct device *dev = &adc->spi->dev;
-	u32 ref = MCP3911_INT_VREF_MV;
 	u32 div;
-	int ret;
 	u64 tmp;
-
-	if (adc->vref) {
-		ret = regulator_get_voltage(adc->vref);
-		if (ret < 0) {
-			return dev_err_probe(dev, ret, "failed to get vref voltage\n");
-		}
-
-		ref = ret / 1000;
-	}
 
 	/*
 	 * For 24-bit Conversion
@@ -429,7 +399,7 @@ static int mcp3911_calc_scale_table(struct mcp3911 *adc)
 	 */
 	for (int i = 0; i < MCP3911_NUM_SCALES; i++) {
 		div = 12582912 * BIT(i);
-		tmp = div_s64((s64)ref * 1000000000LL, div);
+		tmp = div_s64((s64)vref_mv * 1000000000LL, div);
 
 		mcp3911_scale_table[i][0] = 0;
 		mcp3911_scale_table[i][1] = tmp;
@@ -532,7 +502,7 @@ static irqreturn_t mcp3911_trigger_handler(int irq, void *p)
 	int i = 0;
 	int ret;
 
-	mutex_lock(&adc->lock);
+	guard(mutex)(&adc->lock);
 	adc->tx_buf = MCP3911_REG_READ(MCP3911_CHANNEL(0), adc->dev_addr);
 	ret = spi_sync_transfer(adc->spi, xfer, ARRAY_SIZE(xfer));
 	if (ret < 0) {
@@ -540,7 +510,7 @@ static irqreturn_t mcp3911_trigger_handler(int irq, void *p)
 		goto out;
 	}
 
-	for_each_set_bit(scan_index, indio_dev->active_scan_mask, indio_dev->masklength) {
+	iio_for_each_active_channel(indio_dev, scan_index) {
 		const struct iio_chan_spec *scan_chan = &indio_dev->channels[scan_index];
 
 		adc->scan.channels[i] = get_unaligned_be24(&adc->rx_buf[scan_chan->channel * 3]);
@@ -549,7 +519,6 @@ static irqreturn_t mcp3911_trigger_handler(int irq, void *p)
 	iio_push_to_buffers_with_timestamp(indio_dev, &adc->scan,
 					   iio_get_time_ns(indio_dev));
 out:
-	mutex_unlock(&adc->lock);
 	iio_trigger_notify_done(indio_dev->trig);
 
 	return IRQ_HANDLED;
@@ -562,7 +531,7 @@ static const struct iio_info mcp3911_info = {
 	.write_raw_get_fmt = mcp3911_write_raw_get_fmt,
 };
 
-static int mcp3911_config(struct mcp3911 *adc)
+static int mcp3911_config(struct mcp3911 *adc, bool external_vref)
 {
 	struct device *dev = &adc->spi->dev;
 	u32 regval;
@@ -573,7 +542,7 @@ static int mcp3911_config(struct mcp3911 *adc)
 		return ret;
 
 	regval &= ~MCP3911_CONFIG_VREFEXT;
-	if (adc->vref) {
+	if (external_vref) {
 		dev_dbg(dev, "use external voltage reference\n");
 		regval |= FIELD_PREP(MCP3911_CONFIG_VREFEXT, 1);
 	} else {
@@ -628,7 +597,7 @@ static int mcp3911_config(struct mcp3911 *adc)
 	return mcp3911_write(adc, MCP3911_REG_GAIN, regval, 1);
 }
 
-static int mcp3910_config(struct mcp3911 *adc)
+static int mcp3910_config(struct mcp3911 *adc, bool external_vref)
 {
 	struct device *dev = &adc->spi->dev;
 	u32 regval;
@@ -639,7 +608,7 @@ static int mcp3910_config(struct mcp3911 *adc)
 		return ret;
 
 	regval &= ~MCP3910_CONFIG1_VREFEXT;
-	if (adc->vref) {
+	if (external_vref) {
 		dev_dbg(dev, "use external voltage reference\n");
 		regval |= FIELD_PREP(MCP3910_CONFIG1_VREFEXT, 1);
 	} else {
@@ -695,11 +664,6 @@ static int mcp3910_config(struct mcp3911 *adc)
 	return adc->chip->enable_offset(adc, 0);
 }
 
-static void mcp3911_cleanup_regulator(void *vref)
-{
-	regulator_disable(vref);
-}
-
 static int mcp3911_set_trigger_state(struct iio_trigger *trig, bool enable)
 {
 	struct mcp3911 *adc = iio_trigger_get_drvdata(trig);
@@ -722,6 +686,8 @@ static int mcp3911_probe(struct spi_device *spi)
 	struct device *dev = &spi->dev;
 	struct iio_dev *indio_dev;
 	struct mcp3911 *adc;
+	bool external_vref;
+	u32 vref_mv;
 	int ret;
 
 	indio_dev = devm_iio_device_alloc(dev, sizeof(*adc));
@@ -732,23 +698,12 @@ static int mcp3911_probe(struct spi_device *spi)
 	adc->spi = spi;
 	adc->chip = spi_get_device_match_data(spi);
 
-	adc->vref = devm_regulator_get_optional(dev, "vref");
-	if (IS_ERR(adc->vref)) {
-		if (PTR_ERR(adc->vref) == -ENODEV) {
-			adc->vref = NULL;
-		} else {
-			return dev_err_probe(dev, PTR_ERR(adc->vref), "failed to get regulator\n");
-		}
+	ret = devm_regulator_get_enable_read_voltage(dev, "vref");
+	if (ret < 0 && ret != -ENODEV)
+		return dev_err_probe(dev, ret, "failed to get vref voltage\n");
 
-	} else {
-		ret = regulator_enable(adc->vref);
-		if (ret)
-			return ret;
-
-		ret = devm_add_action_or_reset(dev, mcp3911_cleanup_regulator, adc->vref);
-		if (ret)
-			return ret;
-	}
+	external_vref = ret != -ENODEV;
+	vref_mv = external_vref ? ret / 1000 : MCP3911_INT_VREF_MV;
 
 	adc->clki = devm_clk_get_enabled(dev, NULL);
 	if (IS_ERR(adc->clki)) {
@@ -773,11 +728,11 @@ static int mcp3911_probe(struct spi_device *spi)
 	}
 	dev_dbg(dev, "use device address %i\n", adc->dev_addr);
 
-	ret = adc->chip->config(adc);
+	ret = adc->chip->config(adc, external_vref);
 	if (ret)
 		return ret;
 
-	ret = mcp3911_calc_scale_table(adc);
+	ret = mcp3911_calc_scale_table(vref_mv);
 	if (ret)
 		return ret;
 

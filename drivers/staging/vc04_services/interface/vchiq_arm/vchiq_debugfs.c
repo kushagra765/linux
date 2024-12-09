@@ -40,6 +40,16 @@ static int debugfs_trace_show(struct seq_file *f, void *offset)
 	return 0;
 }
 
+static int vchiq_dump_show(struct seq_file *f, void *offset)
+{
+	struct vchiq_state *state = f->private;
+
+	vchiq_dump_state(f, state);
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(vchiq_dump);
+
 static int debugfs_trace_open(struct inode *inode, struct file *file)
 {
 	return single_open(file, debugfs_trace_show, inode->i_private);
@@ -111,10 +121,13 @@ void vchiq_debugfs_remove_instance(struct vchiq_instance *instance)
 	debugfs_remove_recursive(node->dentry);
 }
 
-void vchiq_debugfs_init(void)
+void vchiq_debugfs_init(struct vchiq_state *state)
 {
 	vchiq_dbg_dir = debugfs_create_dir("vchiq", NULL);
 	vchiq_dbg_clients = debugfs_create_dir("clients", vchiq_dbg_dir);
+
+	debugfs_create_file("state", S_IFREG | 0444, vchiq_dbg_dir, state,
+			    &vchiq_dump_fops);
 }
 
 /* remove all the debugfs entries */
@@ -125,7 +138,7 @@ void vchiq_debugfs_deinit(void)
 
 #else /* CONFIG_DEBUG_FS */
 
-void vchiq_debugfs_init(void)
+void vchiq_debugfs_init(struct vchiq_state *state)
 {
 }
 

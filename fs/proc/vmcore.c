@@ -383,6 +383,8 @@ static ssize_t __read_vmcore(struct iov_iter *iter, loff_t *fpos)
 		/* leave now if filled buffer already */
 		if (!iov_iter_count(iter))
 			return acc;
+
+		cond_resched();
 	}
 
 	list_for_each_entry(m, &vmcore_list, list) {
@@ -411,6 +413,34 @@ static ssize_t read_vmcore(struct kiocb *iocb, struct iov_iter *iter)
 {
 	return __read_vmcore(iter, &iocb->ki_pos);
 }
+
+/**
+ * vmcore_alloc_buf - allocate buffer in vmalloc memory
+ * @size: size of buffer
+ *
+ * If CONFIG_MMU is defined, use vmalloc_user() to allow users to mmap
+ * the buffer to user-space by means of remap_vmalloc_range().
+ *
+ * If CONFIG_MMU is not defined, use vzalloc() since mmap_vmcore() is
+ * disabled and there's no need to allow users to mmap the buffer.
+ */
+static inline char *vmcore_alloc_buf(size_t size)
+{
+#ifdef CONFIG_MMU
+	return vmalloc_user(size);
+#else
+	return vzalloc(size);
+#endif
+}
+
+/*
+ * Disable mmap_vmcore() if CONFIG_MMU is not defined. MMU is
+ * essential for mmap_vmcore() in order to map physically
+ * non-contiguous objects (ELF header, ELF note segment and memory
+ * regions in the 1st kernel pointed to by PT_LOAD entries) into
+ * virtually contiguous user-space in ELF layout.
+ */
+#ifdef CONFIG_MMU
 
 /*
  * The vmcore fault handler uses the page cache and fills data using the
@@ -459,33 +489,6 @@ static const struct vm_operations_struct vmcore_mmap_ops = {
 	.fault = mmap_vmcore_fault,
 };
 
-/**
- * vmcore_alloc_buf - allocate buffer in vmalloc memory
- * @size: size of buffer
- *
- * If CONFIG_MMU is defined, use vmalloc_user() to allow users to mmap
- * the buffer to user-space by means of remap_vmalloc_range().
- *
- * If CONFIG_MMU is not defined, use vzalloc() since mmap_vmcore() is
- * disabled and there's no need to allow users to mmap the buffer.
- */
-static inline char *vmcore_alloc_buf(size_t size)
-{
-#ifdef CONFIG_MMU
-	return vmalloc_user(size);
-#else
-	return vzalloc(size);
-#endif
-}
-
-/*
- * Disable mmap_vmcore() if CONFIG_MMU is not defined. MMU is
- * essential for mmap_vmcore() in order to map physically
- * non-contiguous objects (ELF header, ELF note segment and memory
- * regions in the 1st kernel pointed to by PT_LOAD entries) into
- * virtually contiguous user-space in ELF layout.
- */
-#ifdef CONFIG_MMU
 /*
  * remap_oldmem_pfn_checked - do remap_oldmem_pfn_range replacing all pages
  * reported as not being ram with the zero page.
@@ -1370,9 +1373,8 @@ static void vmcoredd_write_header(void *buf, struct vmcoredd_data *data,
 	vdd_hdr->n_descsz = size + sizeof(vdd_hdr->dump_name);
 	vdd_hdr->n_type = NT_VMCOREDD;
 
-	strncpy((char *)vdd_hdr->name, VMCOREDD_NOTE_NAME,
-		sizeof(vdd_hdr->name));
-	memcpy(vdd_hdr->dump_name, data->dump_name, sizeof(vdd_hdr->dump_name));
+	strscpy_pad(vdd_hdr->name, VMCOREDD_NOTE_NAME);
+	strscpy_pad(vdd_hdr->dump_name, data->dump_name);
 }
 
 /**

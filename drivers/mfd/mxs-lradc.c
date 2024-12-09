@@ -137,7 +137,7 @@ static int mxs_lradc_probe(struct platform_device *pdev)
 	if (!lradc)
 		return -ENOMEM;
 
-	lradc->soc = (enum mxs_lradc_id)device_get_match_data(&pdev->dev);
+	lradc->soc = (kernel_ulong_t)device_get_match_data(&pdev->dev);
 
 	lradc->clk = devm_clk_get(&pdev->dev, NULL);
 	if (IS_ERR(lradc->clk)) {
@@ -230,13 +230,11 @@ err_clk:
 	return ret;
 }
 
-static int mxs_lradc_remove(struct platform_device *pdev)
+static void mxs_lradc_remove(struct platform_device *pdev)
 {
 	struct mxs_lradc *lradc = platform_get_drvdata(pdev);
 
 	clk_disable_unprepare(lradc->clk);
-
-	return 0;
 }
 
 static struct platform_driver mxs_lradc_driver = {

@@ -78,6 +78,8 @@ static umode_t spi_nor_sysfs_is_visible(struct kobject *kobj,
 
 	if (attr == &dev_attr_manufacturer.attr && !nor->manufacturer)
 		return 0;
+	if (attr == &dev_attr_partname.attr && !nor->info->name)
+		return 0;
 	if (attr == &dev_attr_jedec_id.attr && !nor->info->id && !nor->id)
 		return 0;
 
@@ -85,7 +87,7 @@ static umode_t spi_nor_sysfs_is_visible(struct kobject *kobj,
 }
 
 static umode_t spi_nor_sysfs_is_bin_visible(struct kobject *kobj,
-					    struct bin_attribute *attr, int n)
+					    const struct bin_attribute *attr, int n)
 {
 	struct spi_device *spi = to_spi_device(kobj_to_dev(kobj));
 	struct spi_mem *spimem = spi_get_drvdata(spi);

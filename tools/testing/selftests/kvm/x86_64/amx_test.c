@@ -6,8 +6,6 @@
  *
  * Tests for amx #NM exception and save/restore.
  */
-
-#define _GNU_SOURCE /* for program_invocation_short_name */
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -88,6 +86,8 @@ static inline void __xsavec(struct xstate *xstate, uint64_t rfbm)
 
 static void check_xtile_info(void)
 {
+	GUEST_ASSERT((xgetbv(0) & XFEATURE_MASK_XTILE) == XFEATURE_MASK_XTILE);
+
 	GUEST_ASSERT(this_cpu_has_p(X86_PROPERTY_XSTATE_MAX_SIZE_XCR0));
 	GUEST_ASSERT(this_cpu_property(X86_PROPERTY_XSTATE_MAX_SIZE_XCR0) <= XSAVE_SIZE);
 
@@ -124,29 +124,12 @@ static void set_tilecfg(struct tile_config *cfg)
 	}
 }
 
-static void init_regs(void)
-{
-	uint64_t cr4, xcr0;
-
-	GUEST_ASSERT(this_cpu_has(X86_FEATURE_XSAVE));
-
-	/* turn on CR4.OSXSAVE */
-	cr4 = get_cr4();
-	cr4 |= X86_CR4_OSXSAVE;
-	set_cr4(cr4);
-	GUEST_ASSERT(this_cpu_has(X86_FEATURE_OSXSAVE));
-
-	xcr0 = xgetbv(0);
-	xcr0 |= XFEATURE_MASK_XTILE;
-	xsetbv(0x0, xcr0);
-	GUEST_ASSERT((xgetbv(0) & XFEATURE_MASK_XTILE) == XFEATURE_MASK_XTILE);
-}
-
 static void __attribute__((__flatten__)) guest_code(struct tile_config *amx_cfg,
 						    struct tile_data *tiledata,
 						    struct xstate *xstate)
 {
-	init_regs();
+	GUEST_ASSERT(this_cpu_has(X86_FEATURE_XSAVE) &&
+		     this_cpu_has(X86_FEATURE_OSXSAVE));
 	check_xtile_info();
 	GUEST_SYNC(1);
 
@@ -221,7 +204,7 @@ int main(int argc, char *argv[])
 	vm_vaddr_t amx_cfg, tiledata, xstate;
 	struct ucall uc;
 	u32 amx_offset;
-	int stage, ret;
+	int ret;
 
 	/*
 	 * Note, all off-by-default features must be enabled before anything
@@ -246,8 +229,6 @@ int main(int argc, char *argv[])
 	vcpu_regs_get(vcpu, &regs1);
 
 	/* Register #NM handler */
-	vm_init_descriptor_tables(vm);
-	vcpu_init_descriptor_tables(vcpu);
 	vm_install_exception_handler(vm, NM_VECTOR, guest_nm_handler);
 
 	/* amx cfg for guest_code */
@@ -263,7 +244,7 @@ int main(int argc, char *argv[])
 	memset(addr_gva2hva(vm, xstate), 0, PAGE_SIZE * DIV_ROUND_UP(XSAVE_SIZE, PAGE_SIZE));
 	vcpu_args_set(vcpu, 3, amx_cfg, tiledata, xstate);
 
-	for (stage = 1; ; stage++) {
+	for (;;) {
 		vcpu_run(vcpu);
 		TEST_ASSERT_KVM_EXIT_REASON(vcpu, KVM_EXIT_IO);
 
@@ -296,7 +277,7 @@ int main(int argc, char *argv[])
 				void *tiles_data = (void *)addr_gva2hva(vm, tiledata);
 				/* Only check TMM0 register, 1 tile */
 				ret = memcmp(amx_start, tiles_data, TILE_SIZE);
-				TEST_ASSERT(ret == 0, "memcmp failed, ret=%d\n", ret);
+				TEST_ASSERT(ret == 0, "memcmp failed, ret=%d", ret);
 				kvm_x86_state_cleanup(state);
 				break;
 			case 9:

@@ -210,7 +210,7 @@ static int dsa_user_sync_uc(struct net_device *dev,
 		return 0;
 
 	return dsa_user_vlan_for_each(dev, dsa_user_host_vlan_rx_filtering,
-				       &ctx);
+				      &ctx);
 }
 
 static int dsa_user_unsync_uc(struct net_device *dev,
@@ -230,7 +230,7 @@ static int dsa_user_unsync_uc(struct net_device *dev,
 		return 0;
 
 	return dsa_user_vlan_for_each(dev, dsa_user_host_vlan_rx_filtering,
-				       &ctx);
+				      &ctx);
 }
 
 static int dsa_user_sync_mc(struct net_device *dev,
@@ -250,7 +250,7 @@ static int dsa_user_sync_mc(struct net_device *dev,
 		return 0;
 
 	return dsa_user_vlan_for_each(dev, dsa_user_host_vlan_rx_filtering,
-				       &ctx);
+				      &ctx);
 }
 
 static int dsa_user_unsync_mc(struct net_device *dev,
@@ -270,7 +270,7 @@ static int dsa_user_unsync_mc(struct net_device *dev,
 		return 0;
 
 	return dsa_user_vlan_for_each(dev, dsa_user_host_vlan_rx_filtering,
-				       &ctx);
+				      &ctx);
 }
 
 void dsa_user_sync_ha(struct net_device *dev)
@@ -352,14 +352,54 @@ void dsa_user_mii_bus_init(struct dsa_switch *ds)
 /* user device handling ****************************************************/
 static int dsa_user_get_iflink(const struct net_device *dev)
 {
-	return dsa_user_to_conduit(dev)->ifindex;
+	return READ_ONCE(dsa_user_to_conduit(dev)->ifindex);
+}
+
+int dsa_user_host_uc_install(struct net_device *dev, const u8 *addr)
+{
+	struct net_device *conduit = dsa_user_to_conduit(dev);
+	struct dsa_port *dp = dsa_user_to_port(dev);
+	struct dsa_switch *ds = dp->ds;
+	int err;
+
+	if (dsa_switch_supports_uc_filtering(ds)) {
+		err = dsa_port_standalone_host_fdb_add(dp, addr, 0);
+		if (err)
+			goto out;
+	}
+
+	if (!ether_addr_equal(addr, conduit->dev_addr)) {
+		err = dev_uc_add(conduit, addr);
+		if (err < 0)
+			goto del_host_addr;
+	}
+
+	return 0;
+
+del_host_addr:
+	if (dsa_switch_supports_uc_filtering(ds))
+		dsa_port_standalone_host_fdb_del(dp, addr, 0);
+out:
+	return err;
+}
+
+void dsa_user_host_uc_uninstall(struct net_device *dev)
+{
+	struct net_device *conduit = dsa_user_to_conduit(dev);
+	struct dsa_port *dp = dsa_user_to_port(dev);
+	struct dsa_switch *ds = dp->ds;
+
+	if (!ether_addr_equal(dev->dev_addr, conduit->dev_addr))
+		dev_uc_del(conduit, dev->dev_addr);
+
+	if (dsa_switch_supports_uc_filtering(ds))
+		dsa_port_standalone_host_fdb_del(dp, dev->dev_addr, 0);
 }
 
 static int dsa_user_open(struct net_device *dev)
 {
 	struct net_device *conduit = dsa_user_to_conduit(dev);
 	struct dsa_port *dp = dsa_user_to_port(dev);
-	struct dsa_switch *ds = dp->ds;
 	int err;
 
 	err = dev_open(conduit, NULL);
@@ -368,47 +408,29 @@ static int dsa_user_open(struct net_device *dev)
 		goto out;
 	}
 
-	if (dsa_switch_supports_uc_filtering(ds)) {
-		err = dsa_port_standalone_host_fdb_add(dp, dev->dev_addr, 0);
-		if (err)
-			goto out;
-	}
-
-	if (!ether_addr_equal(dev->dev_addr, conduit->dev_addr)) {
-		err = dev_uc_add(conduit, dev->dev_addr);
-		if (err < 0)
-			goto del_host_addr;
-	}
+	err = dsa_user_host_uc_install(dev, dev->dev_addr);
+	if (err)
+		goto out;
 
 	err = dsa_port_enable_rt(dp, dev->phydev);
 	if (err)
-		goto del_unicast;
+		goto out_del_host_uc;
 
 	return 0;
 
-del_unicast:
-	if (!ether_addr_equal(dev->dev_addr, conduit->dev_addr))
-		dev_uc_del(conduit, dev->dev_addr);
-del_host_addr:
-	if (dsa_switch_supports_uc_filtering(ds))
-		dsa_port_standalone_host_fdb_del(dp, dev->dev_addr, 0);
+out_del_host_uc:
+	dsa_user_host_uc_uninstall(dev);
 out:
 	return err;
 }
 
 static int dsa_user_close(struct net_device *dev)
 {
-	struct net_device *conduit = dsa_user_to_conduit(dev);
 	struct dsa_port *dp = dsa_user_to_port(dev);
-	struct dsa_switch *ds = dp->ds;
 
 	dsa_port_disable_rt(dp);
 
-	if (!ether_addr_equal(dev->dev_addr, conduit->dev_addr))
-		dev_uc_del(conduit, dev->dev_addr);
-
-	if (dsa_switch_supports_uc_filtering(ds))
-		dsa_port_standalone_host_fdb_del(dp, dev->dev_addr, 0);
+	dsa_user_host_uc_uninstall(dev);
 
 	return 0;
 }
@@ -448,7 +470,6 @@ static void dsa_user_set_rx_mode(struct net_device *dev)
 
 static int dsa_user_set_mac_address(struct net_device *dev, void *a)
 {
-	struct net_device *conduit = dsa_user_to_conduit(dev);
 	struct dsa_port *dp = dsa_user_to_port(dev);
 	struct dsa_switch *ds = dp->ds;
 	struct sockaddr *addr = a;
@@ -470,34 +491,16 @@ static int dsa_user_set_mac_address(struct net_device *dev, void *a)
 	if (!(dev->flags & IFF_UP))
 		goto out_change_dev_addr;
 
-	if (dsa_switch_supports_uc_filtering(ds)) {
-		err = dsa_port_standalone_host_fdb_add(dp, addr->sa_data, 0);
-		if (err)
-			return err;
-	}
+	err = dsa_user_host_uc_install(dev, addr->sa_data);
+	if (err)
+		return err;
 
-	if (!ether_addr_equal(addr->sa_data, conduit->dev_addr)) {
-		err = dev_uc_add(conduit, addr->sa_data);
-		if (err < 0)
-			goto del_unicast;
-	}
-
-	if (!ether_addr_equal(dev->dev_addr, conduit->dev_addr))
-		dev_uc_del(conduit, dev->dev_addr);
-
-	if (dsa_switch_supports_uc_filtering(ds))
-		dsa_port_standalone_host_fdb_del(dp, dev->dev_addr, 0);
+	dsa_user_host_uc_uninstall(dev);
 
 out_change_dev_addr:
 	eth_hw_addr_set(dev, addr->sa_data);
 
 	return 0;
-
-del_unicast:
-	if (dsa_switch_supports_uc_filtering(ds))
-		dsa_port_standalone_host_fdb_del(dp, addr->sa_data, 0);
-
-	return err;
 }
 
 struct dsa_user_dump_ctx {
@@ -875,8 +878,8 @@ static int dsa_user_port_obj_del(struct net_device *dev, const void *ctx,
 	return err;
 }
 
-static inline netdev_tx_t dsa_user_netpoll_send_skb(struct net_device *dev,
-						    struct sk_buff *skb)
+static netdev_tx_t dsa_user_netpoll_send_skb(struct net_device *dev,
+					     struct sk_buff *skb)
 {
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	struct dsa_user_priv *p = netdev_priv(dev);
@@ -920,30 +923,6 @@ netdev_tx_t dsa_enqueue_skb(struct sk_buff *skb, struct net_device *dev)
 }
 EXPORT_SYMBOL_GPL(dsa_enqueue_skb);
 
-static int dsa_realloc_skb(struct sk_buff *skb, struct net_device *dev)
-{
-	int needed_headroom = dev->needed_headroom;
-	int needed_tailroom = dev->needed_tailroom;
-
-	/* For tail taggers, we need to pad short frames ourselves, to ensure
-	 * that the tail tag does not fail at its role of being at the end of
-	 * the packet, once the conduit interface pads the frame. Account for
-	 * that pad length here, and pad later.
-	 */
-	if (unlikely(needed_tailroom && skb->len < ETH_ZLEN))
-		needed_tailroom += ETH_ZLEN - skb->len;
-	/* skb_headroom() returns unsigned int... */
-	needed_headroom = max_t(int, needed_headroom - skb_headroom(skb), 0);
-	needed_tailroom = max_t(int, needed_tailroom - skb_tailroom(skb), 0);
-
-	if (likely(!needed_headroom && !needed_tailroom && !skb_cloned(skb)))
-		/* No reallocation needed, yay! */
-		return 0;
-
-	return pskb_expand_head(skb, needed_headroom, needed_tailroom,
-				GFP_ATOMIC);
-}
-
 static netdev_tx_t dsa_user_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct dsa_user_priv *p = netdev_priv(dev);
@@ -956,13 +935,14 @@ static netdev_tx_t dsa_user_xmit(struct sk_buff *skb, struct net_device *dev)
 	/* Handle tx timestamp if any */
 	dsa_skb_tx_timestamp(p, skb);
 
-	if (dsa_realloc_skb(skb, dev)) {
+	if (skb_ensure_writable_head_tail(skb, dev)) {
 		dev_kfree_skb_any(skb);
 		return NETDEV_TX_OK;
 	}
 
 	/* needed_tailroom should still be 'warm' in the cache line from
-	 * dsa_realloc_skb(), which has also ensured that padding is safe.
+	 * skb_ensure_writable_head_tail(), which has also ensured that
+	 * padding is safe.
 	 */
 	if (dev->needed_tailroom)
 		eth_skb_pad(skb);
@@ -1062,15 +1042,12 @@ static void dsa_user_get_strings(struct net_device *dev,
 	struct dsa_switch *ds = dp->ds;
 
 	if (stringset == ETH_SS_STATS) {
-		int len = ETH_GSTRING_LEN;
-
-		strscpy_pad(data, "tx_packets", len);
-		strscpy_pad(data + len, "tx_bytes", len);
-		strscpy_pad(data + 2 * len, "rx_packets", len);
-		strscpy_pad(data + 3 * len, "rx_bytes", len);
+		ethtool_puts(&data, "tx_packets");
+		ethtool_puts(&data, "tx_bytes");
+		ethtool_puts(&data, "rx_packets");
+		ethtool_puts(&data, "rx_bytes");
 		if (ds->ops->get_strings)
-			ds->ops->get_strings(ds, dp->index, stringset,
-					     data + 4 * len);
+			ds->ops->get_strings(ds, dp->index, stringset, data);
 	} else if (stringset ==  ETH_SS_TEST) {
 		net_selftest_get_strings(data);
 	}
@@ -1245,7 +1222,7 @@ static int dsa_user_set_wol(struct net_device *dev, struct ethtool_wolinfo *w)
 	return ret;
 }
 
-static int dsa_user_set_eee(struct net_device *dev, struct ethtool_eee *e)
+static int dsa_user_set_eee(struct net_device *dev, struct ethtool_keee *e)
 {
 	struct dsa_port *dp = dsa_user_to_port(dev);
 	struct dsa_switch *ds = dp->ds;
@@ -1265,7 +1242,7 @@ static int dsa_user_set_eee(struct net_device *dev, struct ethtool_eee *e)
 	return phylink_ethtool_set_eee(dp->pl, e);
 }
 
-static int dsa_user_get_eee(struct net_device *dev, struct ethtool_eee *e)
+static int dsa_user_get_eee(struct net_device *dev, struct ethtool_keee *e)
 {
 	struct dsa_port *dp = dsa_user_to_port(dev);
 	struct dsa_switch *ds = dp->ds;
@@ -1328,8 +1305,7 @@ static int dsa_user_set_pauseparam(struct net_device *dev,
 }
 
 #ifdef CONFIG_NET_POLL_CONTROLLER
-static int dsa_user_netpoll_setup(struct net_device *dev,
-				  struct netpoll_info *ni)
+static int dsa_user_netpoll_setup(struct net_device *dev)
 {
 	struct net_device *conduit = dsa_user_to_conduit(dev);
 	struct dsa_user_priv *p = netdev_priv(dev);
@@ -1385,7 +1361,7 @@ dsa_user_mall_tc_entry_find(struct net_device *dev, unsigned long cookie)
 static int
 dsa_user_add_cls_matchall_mirred(struct net_device *dev,
 				 struct tc_cls_matchall_offload *cls,
-				 bool ingress)
+				 bool ingress, bool ingress_target)
 {
 	struct netlink_ext_ack *extack = cls->common.extack;
 	struct dsa_port *dp = dsa_user_to_port(dev);
@@ -1397,11 +1373,19 @@ dsa_user_add_cls_matchall_mirred(struct net_device *dev,
 	struct dsa_port *to_dp;
 	int err;
 
-	if (!ds->ops->port_mirror_add)
+	if (cls->common.protocol != htons(ETH_P_ALL)) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "Can only offload \"protocol all\" matchall filter");
 		return -EOPNOTSUPP;
+	}
 
-	if (!flow_action_basic_hw_stats_check(&cls->rule->action,
-					      cls->common.extack))
+	if (!ds->ops->port_mirror_add) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "Switch does not support mirroring operation");
+		return -EOPNOTSUPP;
+	}
+
+	if (!flow_action_basic_hw_stats_check(&cls->rule->action, extack))
 		return -EOPNOTSUPP;
 
 	act = &cls->rule->action.entries[0];
@@ -1409,8 +1393,36 @@ dsa_user_add_cls_matchall_mirred(struct net_device *dev,
 	if (!act->dev)
 		return -EINVAL;
 
-	if (!dsa_user_dev_check(act->dev))
+	if (dsa_user_dev_check(act->dev)) {
+		if (ingress_target) {
+			/* We can only fulfill this using software assist */
+			if (cls->common.skip_sw) {
+				NL_SET_ERR_MSG_MOD(extack,
+						   "Can only mirred to ingress of DSA user port if filter also runs in software");
+				return -EOPNOTSUPP;
+			}
+			to_dp = dp->cpu_dp;
+		} else {
+			to_dp = dsa_user_to_port(act->dev);
+		}
+	} else {
+		/* Handle mirroring to foreign target ports as a mirror towards
+		 * the CPU. The software tc rule will take the packets from
+		 * there.
+		 */
+		if (cls->common.skip_sw) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "Can only mirred to CPU if filter also runs in software");
+			return -EOPNOTSUPP;
+		}
+		to_dp = dp->cpu_dp;
+	}
+
+	if (dp->ds != to_dp->ds) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "Cross-chip mirroring not implemented");
 		return -EOPNOTSUPP;
+	}
 
 	mall_tc_entry = kzalloc(sizeof(*mall_tc_entry), GFP_KERNEL);
 	if (!mall_tc_entry)
@@ -1419,9 +1431,6 @@ dsa_user_add_cls_matchall_mirred(struct net_device *dev,
 	mall_tc_entry->cookie = cls->cookie;
 	mall_tc_entry->type = DSA_PORT_MALL_MIRROR;
 	mirror = &mall_tc_entry->mirror;
-
-	to_dp = dsa_user_to_port(act->dev);
-
 	mirror->to_local_port = to_dp->index;
 	mirror->ingress = ingress;
 
@@ -1462,8 +1471,7 @@ dsa_user_add_cls_matchall_police(struct net_device *dev,
 		return -EOPNOTSUPP;
 	}
 
-	if (!flow_action_basic_hw_stats_check(&cls->rule->action,
-					      cls->common.extack))
+	if (!flow_action_basic_hw_stats_check(&cls->rule->action, extack))
 		return -EOPNOTSUPP;
 
 	list_for_each_entry(mall_tc_entry, &p->mall_tc_list, list) {
@@ -1501,17 +1509,30 @@ static int dsa_user_add_cls_matchall(struct net_device *dev,
 				     struct tc_cls_matchall_offload *cls,
 				     bool ingress)
 {
-	int err = -EOPNOTSUPP;
+	const struct flow_action *action = &cls->rule->action;
+	struct netlink_ext_ack *extack = cls->common.extack;
 
-	if (cls->common.protocol == htons(ETH_P_ALL) &&
-	    flow_offload_has_one_action(&cls->rule->action) &&
-	    cls->rule->action.entries[0].id == FLOW_ACTION_MIRRED)
-		err = dsa_user_add_cls_matchall_mirred(dev, cls, ingress);
-	else if (flow_offload_has_one_action(&cls->rule->action) &&
-		 cls->rule->action.entries[0].id == FLOW_ACTION_POLICE)
-		err = dsa_user_add_cls_matchall_police(dev, cls, ingress);
+	if (!flow_offload_has_one_action(action)) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "Cannot offload matchall filter with more than one action");
+		return -EOPNOTSUPP;
+	}
 
-	return err;
+	switch (action->entries[0].id) {
+	case FLOW_ACTION_MIRRED:
+		return dsa_user_add_cls_matchall_mirred(dev, cls, ingress,
+							false);
+	case FLOW_ACTION_MIRRED_INGRESS:
+		return dsa_user_add_cls_matchall_mirred(dev, cls, ingress,
+							true);
+	case FLOW_ACTION_POLICE:
+		return dsa_user_add_cls_matchall_police(dev, cls, ingress);
+	default:
+		NL_SET_ERR_MSG_MOD(extack, "Unknown action");
+		break;
+	}
+
+	return -EOPNOTSUPP;
 }
 
 static void dsa_user_del_cls_matchall(struct net_device *dev,
@@ -1749,7 +1770,7 @@ static int dsa_user_set_rxnfc(struct net_device *dev,
 }
 
 static int dsa_user_get_ts_info(struct net_device *dev,
-				struct ethtool_ts_info *ts)
+				struct kernel_ethtool_ts_info *ts)
 {
 	struct dsa_user_priv *p = netdev_priv(dev);
 	struct dsa_switch *ds = p->dp->ds;
@@ -2143,7 +2164,7 @@ int dsa_user_change_mtu(struct net_device *dev, int new_mtu)
 	if (err)
 		goto out_port_failed;
 
-	dev->mtu = new_mtu;
+	WRITE_ONCE(dev->mtu, new_mtu);
 
 	dsa_bridge_mtu_normalization(dp);
 
@@ -2157,6 +2178,32 @@ out_cpu_failed:
 		dev_set_mtu(conduit, old_conduit_mtu);
 out_conduit_failed:
 	return err;
+}
+
+static int __maybe_unused
+dsa_user_dcbnl_set_apptrust(struct net_device *dev, u8 *sel, int nsel)
+{
+	struct dsa_port *dp = dsa_user_to_port(dev);
+	struct dsa_switch *ds = dp->ds;
+	int port = dp->index;
+
+	if (!ds->ops->port_set_apptrust)
+		return -EOPNOTSUPP;
+
+	return ds->ops->port_set_apptrust(ds, port, sel, nsel);
+}
+
+static int __maybe_unused
+dsa_user_dcbnl_get_apptrust(struct net_device *dev, u8 *sel, int *nsel)
+{
+	struct dsa_port *dp = dsa_user_to_port(dev);
+	struct dsa_switch *ds = dp->ds;
+	int port = dp->index;
+
+	if (!ds->ops->port_get_apptrust)
+		return -EOPNOTSUPP;
+
+	return ds->ops->port_get_apptrust(ds, port, sel, nsel);
 }
 
 static int __maybe_unused
@@ -2186,6 +2233,58 @@ dsa_user_dcbnl_set_default_prio(struct net_device *dev, struct dcb_app *app)
 	return 0;
 }
 
+/* Update the DSCP prio entries on all user ports of the switch in case
+ * the switch supports global DSCP prio instead of per port DSCP prios.
+ */
+static int dsa_user_dcbnl_ieee_global_dscp_setdel(struct net_device *dev,
+						  struct dcb_app *app, bool del)
+{
+	int (*setdel)(struct net_device *dev, struct dcb_app *app);
+	struct dsa_port *dp = dsa_user_to_port(dev);
+	struct dsa_switch *ds = dp->ds;
+	struct dsa_port *other_dp;
+	int err, restore_err;
+
+	if (del)
+		setdel = dcb_ieee_delapp;
+	else
+		setdel = dcb_ieee_setapp;
+
+	dsa_switch_for_each_user_port(other_dp, ds) {
+		struct net_device *user = other_dp->user;
+
+		if (!user || user == dev)
+			continue;
+
+		err = setdel(user, app);
+		if (err)
+			goto err_try_to_restore;
+	}
+
+	return 0;
+
+err_try_to_restore:
+
+	/* Revert logic to restore previous state of app entries */
+	if (!del)
+		setdel = dcb_ieee_delapp;
+	else
+		setdel = dcb_ieee_setapp;
+
+	dsa_switch_for_each_user_port_continue_reverse(other_dp, ds) {
+		struct net_device *user = other_dp->user;
+
+		if (!user || user == dev)
+			continue;
+
+		restore_err = setdel(user, app);
+		if (restore_err)
+			netdev_err(user, "Failed to restore DSCP prio entry configuration\n");
+	}
+
+	return err;
+}
+
 static int __maybe_unused
 dsa_user_dcbnl_add_dscp_prio(struct net_device *dev, struct dcb_app *app)
 {
@@ -2213,6 +2312,17 @@ dsa_user_dcbnl_add_dscp_prio(struct net_device *dev, struct dcb_app *app)
 
 	err = ds->ops->port_add_dscp_prio(ds, port, dscp, new_prio);
 	if (err) {
+		dcb_ieee_delapp(dev, app);
+		return err;
+	}
+
+	if (!ds->dscp_prio_mapping_is_global)
+		return 0;
+
+	err = dsa_user_dcbnl_ieee_global_dscp_setdel(dev, app, false);
+	if (err) {
+		if (ds->ops->port_del_dscp_prio)
+			ds->ops->port_del_dscp_prio(ds, port, dscp, new_prio);
 		dcb_ieee_delapp(dev, app);
 		return err;
 	}
@@ -2283,6 +2393,18 @@ dsa_user_dcbnl_del_dscp_prio(struct net_device *dev, struct dcb_app *app)
 
 	err = ds->ops->port_del_dscp_prio(ds, port, dscp, app->priority);
 	if (err) {
+		dcb_ieee_setapp(dev, app);
+		return err;
+	}
+
+	if (!ds->dscp_prio_mapping_is_global)
+		return 0;
+
+	err = dsa_user_dcbnl_ieee_global_dscp_setdel(dev, app, true);
+	if (err) {
+		if (ds->ops->port_add_dscp_prio)
+			ds->ops->port_add_dscp_prio(ds, port, dscp,
+						    app->priority);
 		dcb_ieee_setapp(dev, app);
 		return err;
 	}
@@ -2399,6 +2521,8 @@ static const struct ethtool_ops dsa_user_ethtool_ops = {
 static const struct dcbnl_rtnl_ops __maybe_unused dsa_user_dcbnl_ops = {
 	.ieee_setapp		= dsa_user_dcbnl_ieee_setapp,
 	.ieee_delapp		= dsa_user_dcbnl_ieee_delapp,
+	.dcbnl_setapptrust	= dsa_user_dcbnl_set_apptrust,
+	.dcbnl_getapptrust	= dsa_user_dcbnl_get_apptrust,
 };
 
 static void dsa_user_get_stats64(struct net_device *dev,
@@ -2452,7 +2576,7 @@ static const struct net_device_ops dsa_user_netdev_ops = {
 	.ndo_fill_forward_path	= dsa_user_fill_forward_path,
 };
 
-static struct device_type dsa_type = {
+static const struct device_type dsa_type = {
 	.name	= "dsa",
 };
 
@@ -2468,7 +2592,7 @@ EXPORT_SYMBOL_GPL(dsa_port_phylink_mac_change);
 static void dsa_user_phylink_fixed_state(struct phylink_config *config,
 					 struct phylink_link_state *state)
 {
-	struct dsa_port *dp = container_of(config, struct dsa_port, pl_config);
+	struct dsa_port *dp = dsa_phylink_to_port(config);
 	struct dsa_switch *ds = dp->ds;
 
 	/* No need to check that this operation is valid, the callback would
@@ -2559,11 +2683,12 @@ void dsa_user_setup_tagger(struct net_device *user)
 
 	user->features = conduit->vlan_features | NETIF_F_HW_TC;
 	user->hw_features |= NETIF_F_HW_TC;
-	user->features |= NETIF_F_LLTX;
 	if (user->needed_tailroom)
 		user->features &= ~(NETIF_F_SG | NETIF_F_FRAGLIST);
 	if (ds->needs_standalone_vlan_filtering)
 		user->features |= NETIF_F_HW_VLAN_CTAG_FILTER;
+
+	user->lltx = true;
 }
 
 int dsa_user_suspend(struct net_device *user_dev)
@@ -2648,11 +2773,7 @@ int dsa_user_create(struct dsa_port *port)
 	user_dev->vlan_features = conduit->vlan_features;
 
 	p = netdev_priv(user_dev);
-	user_dev->tstats = netdev_alloc_pcpu_stats(struct pcpu_sw_netstats);
-	if (!user_dev->tstats) {
-		free_netdev(user_dev);
-		return -ENOMEM;
-	}
+	user_dev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS;
 
 	ret = gro_cells_init(&p->gcells, user_dev);
 	if (ret)
@@ -2718,7 +2839,6 @@ out_phy:
 out_gcells:
 	gro_cells_destroy(&p->gcells);
 out_free:
-	free_percpu(user_dev->tstats);
 	free_netdev(user_dev);
 	port->user = NULL;
 	return ret;
@@ -2739,7 +2859,6 @@ void dsa_user_destroy(struct net_device *user_dev)
 
 	dsa_port_phylink_destroy(dp);
 	gro_cells_destroy(&p->gcells);
-	free_percpu(user_dev->tstats);
 	free_netdev(user_dev);
 }
 
@@ -2805,12 +2924,6 @@ int dsa_user_change_conduit(struct net_device *dev, struct net_device *conduit,
 			    ERR_PTR(err));
 	}
 
-	/* If the port doesn't have its own MAC address and relies on the DSA
-	 * conduit's one, inherit it again from the new DSA conduit.
-	 */
-	if (is_zero_ether_addr(dp->mac))
-		eth_hw_addr_inherit(dev, conduit);
-
 	return 0;
 
 out_revert_conduit_link:
@@ -2829,13 +2942,14 @@ EXPORT_SYMBOL_GPL(dsa_user_dev_check);
 static int dsa_user_changeupper(struct net_device *dev,
 				struct netdev_notifier_changeupper_info *info)
 {
-	struct dsa_port *dp = dsa_user_to_port(dev);
 	struct netlink_ext_ack *extack;
 	int err = NOTIFY_DONE;
+	struct dsa_port *dp;
 
 	if (!dsa_user_dev_check(dev))
 		return err;
 
+	dp = dsa_user_to_port(dev);
 	extack = netdev_notifier_info_to_extack(&info->info);
 
 	if (netif_is_bridge_master(info->upper_dev)) {
@@ -2888,10 +3002,12 @@ static int dsa_user_changeupper(struct net_device *dev,
 static int dsa_user_prechangeupper(struct net_device *dev,
 				   struct netdev_notifier_changeupper_info *info)
 {
-	struct dsa_port *dp = dsa_user_to_port(dev);
+	struct dsa_port *dp;
 
 	if (!dsa_user_dev_check(dev))
 		return NOTIFY_DONE;
+
+	dp = dsa_user_to_port(dev);
 
 	if (netif_is_bridge_master(info->upper_dev) && !info->linking)
 		dsa_port_pre_bridge_leave(dp, info->upper_dev);

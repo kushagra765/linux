@@ -17,6 +17,7 @@ bcachefs-y		:=	\
 	btree_journal_iter.o	\
 	btree_key_cache.o	\
 	btree_locking.o		\
+	btree_node_scan.o	\
 	btree_trans_commit.o	\
 	btree_update.o		\
 	btree_update_interior.o	\
@@ -27,16 +28,18 @@ bcachefs-y		:=	\
 	checksum.o		\
 	clock.o			\
 	compress.o		\
-	counters.o		\
+	darray.o		\
+	data_update.o		\
 	debug.o			\
 	dirent.o		\
+	disk_accounting.o	\
 	disk_groups.o		\
-	data_update.o		\
 	ec.o			\
 	errcode.o		\
 	error.o			\
 	extents.o		\
 	extent_update.o		\
+	eytzinger.o		\
 	fs.o			\
 	fs-common.o		\
 	fs-ioctl.o		\
@@ -66,10 +69,14 @@ bcachefs-y		:=	\
 	printbuf.o		\
 	quota.o			\
 	rebalance.o		\
+	rcu_pending.o		\
 	recovery.o		\
+	recovery_passes.o	\
 	reflink.o		\
 	replicas.o		\
 	sb-clean.o		\
+	sb-counters.o		\
+	sb-downgrade.o		\
 	sb-errors.o		\
 	sb-members.o		\
 	siphash.o		\
@@ -80,6 +87,8 @@ bcachefs-y		:=	\
 	super-io.o		\
 	sysfs.o			\
 	tests.o			\
+	time_stats.o		\
+	thread_with_file.o	\
 	trace.o			\
 	two_state_shared_lock.o	\
 	util.o			\
@@ -87,3 +96,6 @@ bcachefs-y		:=	\
 	xattr.o
 
 obj-$(CONFIG_MEAN_AND_VARIANCE_UNIT_TEST)   += mean_and_variance_test.o
+
+# Silence "note: xyz changed in GCC X.X" messages
+subdir-ccflags-y += $(call cc-disable-warning, psabi)

@@ -14,7 +14,6 @@
 #include <linux/random.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
-#include <linux/timekeeper_internal.h>
 
 #include <asm/abi.h>
 #include <asm/mips-cps.h>
@@ -24,7 +23,7 @@
 #include <vdso/vsyscall.h>
 
 /* Kernel-provided data used by the VDSO. */
-static union mips_vdso_data mips_vdso_data __page_aligned_data;
+static union vdso_data_store mips_vdso_data __page_aligned_data;
 struct vdso_data *vdso_data = mips_vdso_data.data;
 
 /*

@@ -12,6 +12,7 @@
 #include <asm/pgalloc.h>
 #include <asm/kfence.h>
 #include <asm/page.h>
+#include <asm/asm.h>
 #include <asm/set_memory.h>
 
 static inline unsigned long sske_frame(unsigned long addr, unsigned char skey)
@@ -75,7 +76,7 @@ static void pgt_set(unsigned long *old, unsigned long new, unsigned long addr,
 			break;
 		}
 		table = (unsigned long *)((unsigned long)old & mask);
-		crdte(*old, new, table, dtt, addr, S390_lowcore.kernel_asce.val);
+		crdte(*old, new, table, dtt, addr, get_lowcore()->kernel_asce.val);
 	} else if (MACHINE_HAS_IDTE) {
 		cspg(old, *old, new);
 	} else {
@@ -185,7 +186,7 @@ static int walk_pmd_level(pud_t *pudp, unsigned long addr, unsigned long end,
 		if (pmd_none(*pmdp))
 			return -EINVAL;
 		next = pmd_addr_end(addr, end);
-		if (pmd_large(*pmdp)) {
+		if (pmd_leaf(*pmdp)) {
 			need_split  = !!(flags & SET_MEMORY_4K);
 			need_split |= !!(addr & ~PMD_MASK);
 			need_split |= !!(addr + PMD_SIZE > next);
@@ -274,7 +275,7 @@ static int walk_pud_level(p4d_t *p4d, unsigned long addr, unsigned long end,
 		if (pud_none(*pudp))
 			return -EINVAL;
 		next = pud_addr_end(addr, end);
-		if (pud_large(*pudp)) {
+		if (pud_leaf(*pudp)) {
 			need_split  = !!(flags & SET_MEMORY_4K);
 			need_split |= !!(addr & ~PUD_MASK);
 			need_split |= !!(addr + PUD_SIZE > next);
@@ -404,6 +405,33 @@ int set_direct_map_invalid_noflush(struct page *page)
 int set_direct_map_default_noflush(struct page *page)
 {
 	return __set_memory((unsigned long)page_to_virt(page), 1, SET_MEMORY_DEF);
+}
+
+int set_direct_map_valid_noflush(struct page *page, unsigned nr, bool valid)
+{
+	unsigned long flags;
+
+	if (valid)
+		flags = SET_MEMORY_DEF;
+	else
+		flags = SET_MEMORY_INV;
+
+	return __set_memory((unsigned long)page_to_virt(page), nr, flags);
+}
+
+bool kernel_page_present(struct page *page)
+{
+	unsigned long addr;
+	unsigned int cc;
+
+	addr = (unsigned long)page_address(page);
+	asm volatile(
+		"	lra	%[addr],0(%[addr])\n"
+		CC_IPM(cc)
+		: CC_OUT(cc, cc), [addr] "+a" (addr)
+		:
+		: CC_CLOBBER);
+	return CC_TRANSFORM(cc) == 0;
 }
 
 #if defined(CONFIG_DEBUG_PAGEALLOC) || defined(CONFIG_KFENCE)

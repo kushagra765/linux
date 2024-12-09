@@ -18,6 +18,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/nvmem-provider.h>
+#include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/property.h>
@@ -173,6 +174,10 @@ AT24_CHIP_DATA(at24_data_24mac402, 48 / 8,
 	AT24_FLAG_MAC | AT24_FLAG_READONLY);
 AT24_CHIP_DATA(at24_data_24mac602, 64 / 8,
 	AT24_FLAG_MAC | AT24_FLAG_READONLY);
+AT24_CHIP_DATA(at24_data_24aa025e48, 48 / 8,
+	AT24_FLAG_READONLY);
+AT24_CHIP_DATA(at24_data_24aa025e64, 64 / 8,
+	AT24_FLAG_READONLY);
 /* spd is a 24c02 in memory DIMMs */
 AT24_CHIP_DATA(at24_data_spd, 2048 / 8,
 	AT24_FLAG_READONLY | AT24_FLAG_IRUGO);
@@ -202,6 +207,8 @@ AT24_CHIP_DATA(at24_data_24cs64, 16,
 	AT24_FLAG_ADDR16 | AT24_FLAG_SERIAL | AT24_FLAG_READONLY);
 AT24_CHIP_DATA(at24_data_24c128, 131072 / 8, AT24_FLAG_ADDR16);
 AT24_CHIP_DATA(at24_data_24c256, 262144 / 8, AT24_FLAG_ADDR16);
+/* M24256E Additional Write lockable page (M24256E-F order codes) */
+AT24_CHIP_DATA(at24_data_24256e_wlp, 64, AT24_FLAG_ADDR16);
 AT24_CHIP_DATA(at24_data_24c512, 524288 / 8, AT24_FLAG_ADDR16);
 AT24_CHIP_DATA(at24_data_24c1024, 1048576 / 8, AT24_FLAG_ADDR16);
 AT24_CHIP_DATA_BS(at24_data_24c1025, 1048576 / 8, AT24_FLAG_ADDR16, 2);
@@ -217,6 +224,8 @@ static const struct i2c_device_id at24_ids[] = {
 	{ "24cs02",	(kernel_ulong_t)&at24_data_24cs02 },
 	{ "24mac402",	(kernel_ulong_t)&at24_data_24mac402 },
 	{ "24mac602",	(kernel_ulong_t)&at24_data_24mac602 },
+	{ "24aa025e48",	(kernel_ulong_t)&at24_data_24aa025e48 },
+	{ "24aa025e64",	(kernel_ulong_t)&at24_data_24aa025e64 },
 	{ "spd",	(kernel_ulong_t)&at24_data_spd },
 	{ "24c02-vaio",	(kernel_ulong_t)&at24_data_24c02_vaio },
 	{ "24c04",	(kernel_ulong_t)&at24_data_24c04 },
@@ -233,6 +242,7 @@ static const struct i2c_device_id at24_ids[] = {
 	{ "24cs64",	(kernel_ulong_t)&at24_data_24cs64 },
 	{ "24c128",	(kernel_ulong_t)&at24_data_24c128 },
 	{ "24c256",	(kernel_ulong_t)&at24_data_24c256 },
+	{ "24256e-wl",	(kernel_ulong_t)&at24_data_24256e_wlp },
 	{ "24c512",	(kernel_ulong_t)&at24_data_24c512 },
 	{ "24c1024",	(kernel_ulong_t)&at24_data_24c1024 },
 	{ "24c1025",	(kernel_ulong_t)&at24_data_24c1025 },
@@ -242,7 +252,7 @@ static const struct i2c_device_id at24_ids[] = {
 };
 MODULE_DEVICE_TABLE(i2c, at24_ids);
 
-static const struct of_device_id at24_of_match[] = {
+static const struct of_device_id __maybe_unused at24_of_match[] = {
 	{ .compatible = "atmel,24c00",		.data = &at24_data_24c00 },
 	{ .compatible = "atmel,24c01",		.data = &at24_data_24c01 },
 	{ .compatible = "atmel,24cs01",		.data = &at24_data_24cs01 },
@@ -269,6 +279,9 @@ static const struct of_device_id at24_of_match[] = {
 	{ .compatible = "atmel,24c1024",	.data = &at24_data_24c1024 },
 	{ .compatible = "atmel,24c1025",	.data = &at24_data_24c1025 },
 	{ .compatible = "atmel,24c2048",	.data = &at24_data_24c2048 },
+	{ .compatible = "microchip,24aa025e48",	.data = &at24_data_24aa025e48 },
+	{ .compatible = "microchip,24aa025e64",	.data = &at24_data_24aa025e64 },
+	{ .compatible = "st,24256e-wl",		.data = &at24_data_24256e_wlp },
 	{ /* END OF LIST */ },
 };
 MODULE_DEVICE_TABLE(of, at24_of_match);
@@ -439,12 +452,9 @@ static int at24_read(void *priv, unsigned int off, void *val, size_t count)
 	if (off + count > at24->byte_len)
 		return -EINVAL;
 
-	ret = pm_runtime_get_sync(dev);
-	if (ret < 0) {
-		pm_runtime_put_noidle(dev);
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret)
 		return ret;
-	}
-
 	/*
 	 * Read data from chip, protecting against concurrent updates
 	 * from this host, but not from other I2C masters.
@@ -486,12 +496,9 @@ static int at24_write(void *priv, unsigned int off, void *val, size_t count)
 	if (off + count > at24->byte_len)
 		return -EINVAL;
 
-	ret = pm_runtime_get_sync(dev);
-	if (ret < 0) {
-		pm_runtime_put_noidle(dev);
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret)
 		return ret;
-	}
-
 	/*
 	 * Write data to chip, protecting against concurrent updates
 	 * from this host, but not from other I2C masters.
@@ -561,6 +568,31 @@ static unsigned int at24_get_offset_adj(u8 flags, unsigned int byte_len)
 	} else {
 		return 0;
 	}
+}
+
+static void at24_probe_temp_sensor(struct i2c_client *client)
+{
+	struct at24_data *at24 = i2c_get_clientdata(client);
+	struct i2c_board_info info = { .type = "jc42" };
+	int ret;
+	u8 val;
+
+	/*
+	 * Byte 2 has value 11 for DDR3, earlier versions don't
+	 * support the thermal sensor present flag
+	 */
+	ret = at24_read(at24, 2, &val, 1);
+	if (ret || val != 11)
+		return;
+
+	/* Byte 32, bit 7 is set if temp sensor is present */
+	ret = at24_read(at24, 32, &val, 1);
+	if (ret || !(val & BIT(7)))
+		return;
+
+	info.addr = 0x18 | (client->addr & 7);
+
+	i2c_new_client_device(client->adapter, &info);
 }
 
 static int at24_probe(struct i2c_client *client)
@@ -738,15 +770,6 @@ static int at24_probe(struct i2c_client *client)
 	}
 	pm_runtime_enable(dev);
 
-	at24->nvmem = devm_nvmem_register(dev, &nvmem_config);
-	if (IS_ERR(at24->nvmem)) {
-		pm_runtime_disable(dev);
-		if (!pm_runtime_status_suspended(dev))
-			regulator_disable(at24->vcc_reg);
-		return dev_err_probe(dev, PTR_ERR(at24->nvmem),
-				     "failed to register nvmem\n");
-	}
-
 	/*
 	 * Perform a one-byte test read to verify that the chip is functional,
 	 * unless powering on the device is to be avoided during probe (i.e.
@@ -761,6 +784,19 @@ static int at24_probe(struct i2c_client *client)
 			return -ENODEV;
 		}
 	}
+
+	at24->nvmem = devm_nvmem_register(dev, &nvmem_config);
+	if (IS_ERR(at24->nvmem)) {
+		pm_runtime_disable(dev);
+		if (!pm_runtime_status_suspended(dev))
+			regulator_disable(at24->vcc_reg);
+		return dev_err_probe(dev, PTR_ERR(at24->nvmem),
+				     "failed to register nvmem\n");
+	}
+
+	/* If this a SPD EEPROM, probe for DDR3 thermal sensor */
+	if (cdata == &at24_data_spd)
+		at24_probe_temp_sensor(client);
 
 	pm_runtime_idle(dev);
 
@@ -812,7 +848,7 @@ static struct i2c_driver at24_driver = {
 	.driver = {
 		.name = "at24",
 		.pm = &at24_pm_ops,
-		.of_match_table = at24_of_match,
+		.of_match_table = of_match_ptr(at24_of_match),
 		.acpi_match_table = ACPI_PTR(at24_acpi_ids),
 	},
 	.probe = at24_probe,

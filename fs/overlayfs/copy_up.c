@@ -16,7 +16,6 @@
 #include <linux/sched/signal.h>
 #include <linux/cred.h>
 #include <linux/namei.h>
-#include <linux/fdtable.h>
 #include <linux/ratelimit.h>
 #include <linux/exportfs.h>
 #include "overlayfs.h"
@@ -114,13 +113,13 @@ int ovl_copy_xattr(struct super_block *sb, const struct path *oldpath, struct de
 		if (ovl_is_private_xattr(sb, name))
 			continue;
 
-		error = security_inode_copy_up_xattr(name);
-		if (error < 0 && error != -EOPNOTSUPP)
-			break;
-		if (error == 1) {
+		error = security_inode_copy_up_xattr(old, name);
+		if (error == -ECANCELED) {
 			error = 0;
 			continue; /* Discard */
 		}
+		if (error < 0 && error != -EOPNOTSUPP)
+			break;
 
 		if (is_posix_acl_xattr(name)) {
 			error = ovl_copy_acl(OVL_FS(sb), oldpath, new, name);
@@ -230,8 +229,37 @@ static int ovl_copy_fileattr(struct inode *inode, const struct path *old,
 	return ovl_real_fileattr_set(new, &newfa);
 }
 
+static int ovl_verify_area(loff_t pos, loff_t pos2, loff_t len, loff_t totlen)
+{
+	loff_t tmp;
+
+	if (pos != pos2)
+		return -EIO;
+	if (pos < 0 || len < 0 || totlen < 0)
+		return -EIO;
+	if (check_add_overflow(pos, len, &tmp))
+		return -EIO;
+	return 0;
+}
+
+static int ovl_sync_file(struct path *path)
+{
+	struct file *new_file;
+	int err;
+
+	new_file = ovl_path_open(path, O_LARGEFILE | O_RDONLY);
+	if (IS_ERR(new_file))
+		return PTR_ERR(new_file);
+
+	err = vfs_fsync(new_file, 0);
+	fput(new_file);
+
+	return err;
+}
+
 static int ovl_copy_up_file(struct ovl_fs *ofs, struct dentry *dentry,
-			    struct file *new_file, loff_t len)
+			    struct file *new_file, loff_t len,
+			    bool datasync)
 {
 	struct path datapath;
 	struct file *old_file;
@@ -244,7 +272,8 @@ static int ovl_copy_up_file(struct ovl_fs *ofs, struct dentry *dentry,
 	int error = 0;
 
 	ovl_path_lowerdata(dentry, &datapath);
-	if (WARN_ON(datapath.dentry == NULL))
+	if (WARN_ON_ONCE(datapath.dentry == NULL) ||
+	    WARN_ON_ONCE(len < 0))
 		return -EIO;
 
 	old_file = ovl_path_open(&datapath, O_LARGEFILE | O_RDONLY);
@@ -252,12 +281,16 @@ static int ovl_copy_up_file(struct ovl_fs *ofs, struct dentry *dentry,
 		return PTR_ERR(old_file);
 
 	/* Try to use clone_file_range to clone up within the same fs */
-	ovl_start_write(dentry);
-	cloned = do_clone_file_range(old_file, 0, new_file, 0, len, 0);
-	ovl_end_write(dentry);
+	cloned = vfs_clone_file_range(old_file, 0, new_file, 0, len, 0);
 	if (cloned == len)
 		goto out_fput;
+
 	/* Couldn't clone, so now we try to copy the data */
+	error = rw_verify_area(READ, old_file, &old_pos, len);
+	if (!error)
+		error = rw_verify_area(WRITE, new_file, &new_pos, len);
+	if (error)
+		goto out_fput;
 
 	/* Check if lower fs supports seek operation */
 	if (old_file->f_mode & FMODE_LSEEK)
@@ -265,7 +298,7 @@ static int ovl_copy_up_file(struct ovl_fs *ofs, struct dentry *dentry,
 
 	while (len) {
 		size_t this_len = OVL_COPY_UP_CHUNK_SIZE;
-		long bytes;
+		ssize_t bytes;
 
 		if (len < this_len)
 			this_len = len;
@@ -309,11 +342,13 @@ static int ovl_copy_up_file(struct ovl_fs *ofs, struct dentry *dentry,
 			}
 		}
 
-		ovl_start_write(dentry);
+		error = ovl_verify_area(old_pos, new_pos, this_len, len);
+		if (error)
+			break;
+
 		bytes = do_splice_direct(old_file, &old_pos,
 					 new_file, &new_pos,
 					 this_len, SPLICE_F_MOVE);
-		ovl_end_write(dentry);
 		if (bytes <= 0) {
 			error = bytes;
 			break;
@@ -322,7 +357,8 @@ static int ovl_copy_up_file(struct ovl_fs *ofs, struct dentry *dentry,
 
 		len -= bytes;
 	}
-	if (!error && ovl_should_sync(ofs))
+	/* call fsync once, either now or later along with metadata */
+	if (!error && ovl_should_sync(ofs) && datasync)
 		error = vfs_fsync(new_file, 0);
 out_fput:
 	fput(old_file);
@@ -554,6 +590,7 @@ struct ovl_copy_up_ctx {
 	bool indexed;
 	bool metacopy;
 	bool metacopy_digest;
+	bool metadata_fsync;
 };
 
 static int ovl_link_up(struct ovl_copy_up_ctx *c)
@@ -614,7 +651,8 @@ static int ovl_copy_up_data(struct ovl_copy_up_ctx *c, const struct path *temp)
 	if (IS_ERR(new_file))
 		return PTR_ERR(new_file);
 
-	err = ovl_copy_up_file(ofs, c->dentry, new_file, c->stat.size);
+	err = ovl_copy_up_file(ofs, c->dentry, new_file, c->stat.size,
+			       !c->metadata_fsync);
 	fput(new_file);
 
 	return err;
@@ -681,6 +719,10 @@ static int ovl_copy_up_metadata(struct ovl_copy_up_ctx *c, struct dentry *temp)
 		err = ovl_set_attr(ofs, temp, &c->stat);
 	inode_unlock(temp->d_inode);
 
+	/* fsync metadata before moving it into upper dir */
+	if (!err && ovl_should_sync(ofs) && c->metadata_fsync)
+		err = ovl_sync_file(&upperpath);
+
 	return err;
 }
 
@@ -722,7 +764,7 @@ static int ovl_copy_up_workdir(struct ovl_copy_up_ctx *c)
 	struct inode *inode;
 	struct inode *udir = d_inode(c->destdir), *wdir = d_inode(c->workdir);
 	struct path path = { .mnt = ovl_upper_mnt(ofs) };
-	struct dentry *temp, *upper;
+	struct dentry *temp, *upper, *trap;
 	struct ovl_cu_creds cc;
 	int err;
 	struct ovl_cattr cattr = {
@@ -759,11 +801,13 @@ static int ovl_copy_up_workdir(struct ovl_copy_up_ctx *c)
 	 * temp wasn't moved before copy up completion or cleanup.
 	 */
 	ovl_start_write(c->dentry);
-	if (lock_rename(c->workdir, c->destdir) != NULL ||
-	    temp->d_parent != c->workdir) {
+	trap = lock_rename(c->workdir, c->destdir);
+	if (trap || temp->d_parent != c->workdir) {
 		/* temp or workdir moved underneath us? abort without cleanup */
 		dput(temp);
 		err = -EIO;
+		if (IS_ERR(trap))
+			goto out;
 		goto unlock;
 	} else if (err) {
 		goto cleanup;
@@ -804,6 +848,7 @@ static int ovl_copy_up_workdir(struct ovl_copy_up_ctx *c)
 		ovl_set_flag(OVL_WHITEOUTS, inode);
 unlock:
 	unlock_rename(c->workdir, c->destdir);
+out:
 	ovl_end_write(c->dentry);
 
 	return err;
@@ -837,7 +882,8 @@ static int ovl_copy_up_tmpfile(struct ovl_copy_up_ctx *c)
 
 	temp = tmpfile->f_path.dentry;
 	if (!c->metacopy && c->stat.size) {
-		err = ovl_copy_up_file(ofs, c->dentry, tmpfile, c->stat.size);
+		err = ovl_copy_up_file(ofs, c->dentry, tmpfile, c->stat.size,
+				       !c->metadata_fsync);
 		if (err)
 			goto out_fput;
 	}
@@ -930,6 +976,13 @@ static int ovl_do_copy_up(struct ovl_copy_up_ctx *c)
 		err = -EIO;
 		goto out_free_fh;
 	} else {
+		/*
+		 * c->dentry->d_name is stabilzed by ovl_copy_up_start(),
+		 * because if we got here, it means that c->dentry has no upper
+		 * alias and changing ->d_name means going through ovl_rename()
+		 * that will call ovl_copy_up() on source and target dentry.
+		 */
+		c->destname = c->dentry->d_name;
 		/*
 		 * Mark parent "impure" because it may now contain non-pure
 		 * upper
@@ -1105,12 +1158,22 @@ static int ovl_copy_up_one(struct dentry *parent, struct dentry *dentry,
 	    !kgid_has_mapping(current_user_ns(), ctx.stat.gid))
 		return -EOVERFLOW;
 
+	/*
+	 * With metacopy disabled, we fsync after final metadata copyup, for
+	 * both regular files and directories to get atomic copyup semantics
+	 * on filesystems that do not use strict metadata ordering (e.g. ubifs).
+	 *
+	 * With metacopy enabled we want to avoid fsync on all meta copyup
+	 * that will hurt performance of workloads such as chown -R, so we
+	 * only fsync on data copyup as legacy behavior.
+	 */
+	ctx.metadata_fsync = !OVL_FS(dentry->d_sb)->config.metacopy &&
+			     (S_ISREG(ctx.stat.mode) || S_ISDIR(ctx.stat.mode));
 	ctx.metacopy = ovl_need_meta_copy_up(dentry, ctx.stat.mode, flags);
 
 	if (parent) {
 		ovl_path_upper(parent, &parentpath);
 		ctx.destdir = parentpath.dentry;
-		ctx.destname = dentry->d_name;
 
 		err = vfs_getattr(&parentpath, &ctx.pstat,
 				  STATX_ATIME | STATX_MTIME,
@@ -1196,7 +1259,7 @@ static int ovl_copy_up_flags(struct dentry *dentry, int flags)
 		dput(parent);
 		dput(next);
 	}
-	revert_creds(old_cred);
+	ovl_revert_creds(old_cred);
 
 	return err;
 }

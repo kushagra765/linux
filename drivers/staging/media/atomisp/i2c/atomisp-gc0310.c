@@ -4,16 +4,6 @@
  *
  * Copyright (c) 2013 Intel Corporation. All Rights Reserved.
  * Copyright (c) 2023 Hans de Goede <hdegoede@redhat.com>
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License version
- * 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
  */
 
 #include <linux/delay.h>
@@ -361,7 +351,7 @@ gc0310_get_pad_format(struct gc0310_device *dev,
 		      unsigned int pad, enum v4l2_subdev_format_whence which)
 {
 	if (which == V4L2_SUBDEV_FORMAT_TRY)
-		return v4l2_subdev_get_try_format(&dev->sd, state, pad);
+		return v4l2_subdev_state_get_format(state, pad);
 
 	return &dev->mode.fmt;
 }
@@ -496,9 +486,17 @@ error_power_down:
 	return ret;
 }
 
-static int gc0310_g_frame_interval(struct v4l2_subdev *sd,
-				   struct v4l2_subdev_frame_interval *interval)
+static int gc0310_get_frame_interval(struct v4l2_subdev *sd,
+				     struct v4l2_subdev_state *sd_state,
+				     struct v4l2_subdev_frame_interval *interval)
 {
+	/*
+	 * FIXME: Implement support for V4L2_SUBDEV_FORMAT_TRY, using the V4L2
+	 * subdev active state API.
+	 */
+	if (interval->which != V4L2_SUBDEV_FORMAT_ACTIVE)
+		return -EINVAL;
+
 	interval->interval.numerator = 1;
 	interval->interval.denominator = GC0310_FPS;
 
@@ -545,7 +543,6 @@ static const struct v4l2_subdev_sensor_ops gc0310_sensor_ops = {
 
 static const struct v4l2_subdev_video_ops gc0310_video_ops = {
 	.s_stream = gc0310_s_stream,
-	.g_frame_interval = gc0310_g_frame_interval,
 };
 
 static const struct v4l2_subdev_pad_ops gc0310_pad_ops = {
@@ -553,6 +550,7 @@ static const struct v4l2_subdev_pad_ops gc0310_pad_ops = {
 	.enum_frame_size = gc0310_enum_frame_size,
 	.get_fmt = gc0310_get_fmt,
 	.set_fmt = gc0310_set_fmt,
+	.get_frame_interval = gc0310_get_frame_interval,
 };
 
 static const struct v4l2_subdev_ops gc0310_ops = {

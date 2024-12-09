@@ -20,11 +20,18 @@ struct snapshot_t {
 };
 
 struct snapshot_table {
+	struct rcu_head		rcu;
+	size_t			nr;
+#ifndef RUST_BINDGEN
 	DECLARE_FLEX_ARRAY(struct snapshot_t, s);
+#else
+	struct snapshot_t	s[0];
+#endif
 };
 
 typedef struct {
-	u32		subvol;
+	/* we can't have padding in this struct: */
+	u64		subvol;
 	u64		inum;
 } subvol_inum;
 

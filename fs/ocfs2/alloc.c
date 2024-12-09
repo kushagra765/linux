@@ -4767,7 +4767,7 @@ bail:
 }
 
 /*
- * Allcate and add clusters into the extent b-tree.
+ * Allocate and add clusters into the extent b-tree.
  * The new clusters(clusters_to_add) will be inserted at logical_offset.
  * The extent b-tree's root is specified by et, and
  * it is not limited to the file storage. Any extent tree can use this
@@ -6934,7 +6934,7 @@ static int ocfs2_grab_eof_pages(struct inode *inode, loff_t start, loff_t end,
  * nonzero data on subsequent file extends.
  *
  * We need to call this before i_size is updated on the inode because
- * otherwise block_write_full_page() will skip writeout of pages past
+ * otherwise block_write_full_folio() will skip writeout of pages past
  * i_size.
  */
 int ocfs2_zero_range_for_truncate(struct inode *inode, handle_t *handle,

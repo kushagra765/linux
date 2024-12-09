@@ -26,7 +26,7 @@ static DEFINE_IDR(memstick_host_idr);
 static DEFINE_SPINLOCK(memstick_host_lock);
 
 static int memstick_dev_match(struct memstick_dev *card,
-			      struct memstick_device_id *id)
+			      const struct memstick_device_id *id)
 {
 	if (id->match_flags & MEMSTICK_MATCH_ALL) {
 		if ((id->type == card->id.type)
@@ -38,14 +38,13 @@ static int memstick_dev_match(struct memstick_dev *card,
 	return 0;
 }
 
-static int memstick_bus_match(struct device *dev, struct device_driver *drv)
+static int memstick_bus_match(struct device *dev, const struct device_driver *drv)
 {
 	struct memstick_dev *card = container_of(dev, struct memstick_dev,
 						 dev);
-	struct memstick_driver *ms_drv = container_of(drv,
-						      struct memstick_driver,
-						      driver);
-	struct memstick_device_id *ids = ms_drv->id_table;
+	const struct memstick_driver *ms_drv = container_of_const(drv, struct memstick_driver,
+								  driver);
+	const struct memstick_device_id *ids = ms_drv->id_table;
 
 	if (ids) {
 		while (ids->match_flags) {
@@ -164,7 +163,7 @@ static struct attribute *memstick_dev_attrs[] = {
 };
 ATTRIBUTE_GROUPS(memstick_dev);
 
-static struct bus_type memstick_bus_type = {
+static const struct bus_type memstick_bus_type = {
 	.name           = "memstick",
 	.dev_groups	= memstick_dev_groups,
 	.match          = memstick_bus_match,

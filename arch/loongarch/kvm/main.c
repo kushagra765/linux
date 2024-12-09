@@ -9,6 +9,8 @@
 #include <asm/cacheflush.h>
 #include <asm/cpufeature.h>
 #include <asm/kvm_csr.h>
+#include <asm/kvm_eiointc.h>
+#include <asm/kvm_pch_pic.h>
 #include "trace.h"
 
 unsigned long vpid_mask;
@@ -242,6 +244,7 @@ void kvm_check_vpid(struct kvm_vcpu *vcpu)
 		kvm_update_vpid(vcpu, cpu);
 		trace_kvm_vpid_change(vcpu, vcpu->arch.vpid);
 		vcpu->cpu = cpu;
+		kvm_clear_request(KVM_REQ_TLB_FLUSH_GPA, vcpu);
 	}
 
 	/* Restore GSTAT(0x50).vpid */
@@ -260,7 +263,7 @@ long kvm_arch_dev_ioctl(struct file *filp,
 	return -ENOIOCTLCMD;
 }
 
-int kvm_arch_hardware_enable(void)
+int kvm_arch_enable_virtualization_cpu(void)
 {
 	unsigned long env, gcfg = 0;
 
@@ -287,7 +290,6 @@ int kvm_arch_hardware_enable(void)
 	if (env & CSR_GCFG_MATC_ROOT)
 		gcfg |= CSR_GCFG_MATC_ROOT;
 
-	gcfg |= CSR_GCFG_TIT;
 	write_csr_gcfg(gcfg);
 
 	kvm_flush_tlb_all();
@@ -300,7 +302,7 @@ int kvm_arch_hardware_enable(void)
 	return 0;
 }
 
-void kvm_arch_hardware_disable(void)
+void kvm_arch_disable_virtualization_cpu(void)
 {
 	write_csr_gcfg(0);
 	write_csr_gstat(0);
@@ -313,7 +315,7 @@ void kvm_arch_hardware_disable(void)
 
 static int kvm_loongarch_env_init(void)
 {
-	int cpu, order;
+	int cpu, order, ret;
 	void *addr;
 	struct kvm_context *context;
 
@@ -368,7 +370,20 @@ static int kvm_loongarch_env_init(void)
 
 	kvm_init_gcsr_flag();
 
-	return 0;
+	/* Register LoongArch IPI interrupt controller interface. */
+	ret = kvm_loongarch_register_ipi_device();
+	if (ret)
+		return ret;
+
+	/* Register LoongArch EIOINTC interrupt controller interface. */
+	ret = kvm_loongarch_register_eiointc_device();
+	if (ret)
+		return ret;
+
+	/* Register LoongArch PCH-PIC interrupt controller interface. */
+	ret = kvm_loongarch_register_pch_pic_device();
+
+	return ret;
 }
 
 static void kvm_loongarch_env_exit(void)

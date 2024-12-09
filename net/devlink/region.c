@@ -77,7 +77,7 @@ static int devlink_nl_region_snapshot_id_put(struct sk_buff *msg,
 
 	snap_attr = nla_nest_start_noflag(msg, DEVLINK_ATTR_REGION_SNAPSHOT);
 	if (!snap_attr)
-		return -EINVAL;
+		return -EMSGSIZE;
 
 	err = nla_put_u32(msg, DEVLINK_ATTR_REGION_SNAPSHOT_ID, snapshot->id);
 	if (err)
@@ -102,7 +102,7 @@ static int devlink_nl_region_snapshots_id_put(struct sk_buff *msg,
 	snapshots_attr = nla_nest_start_noflag(msg,
 					       DEVLINK_ATTR_REGION_SNAPSHOTS);
 	if (!snapshots_attr)
-		return -EINVAL;
+		return -EMSGSIZE;
 
 	list_for_each_entry(snapshot, &region->snapshot_list, list) {
 		err = devlink_nl_region_snapshot_id_put(msg, devlink, snapshot);
@@ -145,9 +145,7 @@ static int devlink_nl_region_fill(struct sk_buff *msg, struct devlink *devlink,
 	if (err)
 		goto nla_put_failure;
 
-	err = nla_put_u64_64bit(msg, DEVLINK_ATTR_REGION_SIZE,
-				region->size,
-				DEVLINK_ATTR_PAD);
+	err = devlink_nl_put_u64(msg, DEVLINK_ATTR_REGION_SIZE, region->size);
 	if (err)
 		goto nla_put_failure;
 
@@ -210,8 +208,8 @@ devlink_nl_region_notify_build(struct devlink_region *region,
 		if (err)
 			goto out_cancel_msg;
 	} else {
-		err = nla_put_u64_64bit(msg, DEVLINK_ATTR_REGION_SIZE,
-					region->size, DEVLINK_ATTR_PAD);
+		err = devlink_nl_put_u64(msg, DEVLINK_ATTR_REGION_SIZE,
+					 region->size);
 		if (err)
 			goto out_cancel_msg;
 	}
@@ -234,15 +232,15 @@ static void devlink_nl_region_notify(struct devlink_region *region,
 	struct sk_buff *msg;
 
 	WARN_ON(cmd != DEVLINK_CMD_REGION_NEW && cmd != DEVLINK_CMD_REGION_DEL);
-	if (!xa_get_mark(&devlinks, devlink->index, DEVLINK_REGISTERED))
+
+	if (!__devl_is_registered(devlink) || !devlink_nl_notify_need(devlink))
 		return;
 
 	msg = devlink_nl_region_notify_build(region, snapshot, cmd, 0, 0);
 	if (IS_ERR(msg))
 		return;
 
-	genlmsg_multicast_netns(&devlink_nl_family, devlink_net(devlink), msg,
-				0, DEVLINK_MCGRP_CONFIG, GFP_KERNEL);
+	devlink_nl_notify_send(devlink, msg);
 }
 
 void devlink_regions_notify_register(struct devlink *devlink)
@@ -773,8 +771,7 @@ static int devlink_nl_cmd_region_read_chunk_fill(struct sk_buff *msg,
 	if (err)
 		goto nla_put_failure;
 
-	err = nla_put_u64_64bit(msg, DEVLINK_ATTR_REGION_CHUNK_ADDR, addr,
-				DEVLINK_ATTR_PAD);
+	err = devlink_nl_put_u64(msg, DEVLINK_ATTR_REGION_CHUNK_ADDR, addr);
 	if (err)
 		goto nla_put_failure;
 
@@ -883,7 +880,8 @@ int devlink_nl_region_read_dumpit(struct sk_buff *skb,
 
 	start_offset = state->start_offset;
 
-	devlink = devlink_get_from_attrs_lock(sock_net(cb->skb->sk), attrs);
+	devlink = devlink_get_from_attrs_lock(sock_net(cb->skb->sk), attrs,
+					      false);
 	if (IS_ERR(devlink))
 		return PTR_ERR(devlink);
 

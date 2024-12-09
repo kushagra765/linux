@@ -276,8 +276,6 @@ static struct snd_soc_dai_link acp5x_8821_35l41_dai[] = {
 		.dai_fmt = SND_SOC_DAIFMT_I2S |
 			   SND_SOC_DAIFMT_NB_NF |
 			   SND_SOC_DAIFMT_CBC_CFC,
-		.dpcm_playback = 1,
-		.dpcm_capture = 1,
 		.ops = &acp5x_8821_ops,
 		.init = acp5x_8821_init,
 		SND_SOC_DAILINK_REG(acp5x_i2s, nau8821, platform),
@@ -288,7 +286,6 @@ static struct snd_soc_dai_link acp5x_8821_35l41_dai[] = {
 		.dai_fmt = SND_SOC_DAIFMT_I2S |
 			   SND_SOC_DAIFMT_NB_NF |
 			   SND_SOC_DAIFMT_CBC_CFC,
-		.dpcm_playback = 1,
 		.playback_only = 1,
 		.ops = &acp5x_cs35l41_play_ops,
 		SND_SOC_DAILINK_REG(acp5x_bt, cs35l41, platform),
@@ -375,8 +372,6 @@ static struct snd_soc_dai_link acp5x_8821_98388_dai[] = {
 		.dai_fmt = SND_SOC_DAIFMT_I2S |
 			   SND_SOC_DAIFMT_NB_NF |
 			   SND_SOC_DAIFMT_CBC_CFC,
-		.dpcm_playback = 1,
-		.dpcm_capture = 1,
 		.ops = &acp5x_8821_ops,
 		.init = acp5x_8821_init,
 		SND_SOC_DAILINK_REG(acp5x_i2s, nau8821, platform),
@@ -387,7 +382,6 @@ static struct snd_soc_dai_link acp5x_8821_98388_dai[] = {
 		.dai_fmt = SND_SOC_DAIFMT_I2S |
 			   SND_SOC_DAIFMT_NB_NF |
 			   SND_SOC_DAIFMT_CBC_CFC,
-		.dpcm_playback = 1,
 		.playback_only = 1,
 		.ops = &acp5x_max98388_play_ops,
 		SND_SOC_DAILINK_REG(acp5x_bt, max98388, platform),
@@ -439,7 +433,15 @@ static const struct dmi_system_id acp5x_vg_quirk_table[] = {
 		.matches = {
 			DMI_EXACT_MATCH(DMI_BOARD_VENDOR, "Valve"),
 			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "Jupiter"),
-		}
+		},
+		.driver_data = (void *)&acp5x_8821_35l41_card,
+	},
+	{
+		.matches = {
+			DMI_EXACT_MATCH(DMI_BOARD_VENDOR, "Valve"),
+			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "Galileo"),
+		},
+		.driver_data = (void *)&acp5x_8821_98388_card,
 	},
 	{}
 };
@@ -452,25 +454,15 @@ static int acp5x_probe(struct platform_device *pdev)
 	struct snd_soc_card *card;
 	int ret;
 
-	card = (struct snd_soc_card *)device_get_match_data(dev);
-	if (!card) {
-		/*
-		 * This is normally the result of directly probing the driver
-		 * in pci-acp5x through platform_device_register_full(), which
-		 * is necessary for the CS35L41 variant, as it doesn't support
-		 * ACPI probing and relies on DMI quirks.
-		 */
-		dmi_id = dmi_first_match(acp5x_vg_quirk_table);
-		if (!dmi_id)
-			return -ENODEV;
-
-		card = &acp5x_8821_35l41_card;
-	}
+	dmi_id = dmi_first_match(acp5x_vg_quirk_table);
+	if (!dmi_id || !dmi_id->driver_data)
+		return -ENODEV;
 
 	machine = devm_kzalloc(dev, sizeof(*machine), GFP_KERNEL);
 	if (!machine)
 		return -ENOMEM;
 
+	card = dmi_id->driver_data;
 	card->dev = dev;
 	platform_set_drvdata(pdev, card);
 	snd_soc_card_set_drvdata(card, machine);
@@ -482,17 +474,10 @@ static int acp5x_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static const struct acpi_device_id acp5x_acpi_match[] = {
-	{ "AMDI8821", (kernel_ulong_t)&acp5x_8821_98388_card },
-	{},
-};
-MODULE_DEVICE_TABLE(acpi, acp5x_acpi_match);
-
 static struct platform_driver acp5x_mach_driver = {
 	.driver = {
 		.name = DRV_NAME,
 		.pm = &snd_soc_pm_ops,
-		.acpi_match_table = acp5x_acpi_match,
 	},
 	.probe = acp5x_probe,
 };

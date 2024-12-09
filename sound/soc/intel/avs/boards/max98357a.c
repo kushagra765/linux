@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //
-// Copyright(c) 2021-2022 Intel Corporation. All rights reserved.
+// Copyright(c) 2021-2022 Intel Corporation
 //
 // Authors: Cezary Rojewski <cezary.rojewski@intel.com>
 //          Amadeusz Slawinski <amadeuszx.slawinski@linux.intel.com>
@@ -82,7 +82,7 @@ static int avs_create_dai_link(struct device *dev, const char *platform_name, in
 	dl->be_hw_params_fixup = avs_max98357a_be_fixup;
 	dl->nonatomic = 1;
 	dl->no_pcm = 1;
-	dl->dpcm_playback = 1;
+	dl->playback_only = 1;
 
 	*dai_link = dl;
 
@@ -135,15 +135,24 @@ static int avs_max98357a_probe(struct platform_device *pdev)
 	return devm_snd_soc_register_card(dev, card);
 }
 
+static const struct platform_device_id avs_max98357a_driver_ids[] = {
+	{
+		.name = "avs_max98357a",
+	},
+	{},
+};
+MODULE_DEVICE_TABLE(platform, avs_max98357a_driver_ids);
+
 static struct platform_driver avs_max98357a_driver = {
 	.probe = avs_max98357a_probe,
 	.driver = {
 		.name = "avs_max98357a",
 		.pm = &snd_soc_pm_ops,
 	},
+	.id_table = avs_max98357a_driver_ids,
 };
 
 module_platform_driver(avs_max98357a_driver)
 
+MODULE_DESCRIPTION("Intel max98357a machine driver");
 MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:avs_max98357a");

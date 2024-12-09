@@ -8,38 +8,42 @@
  * Inspired by CCAN's darray
  */
 
-#include "util.h"
 #include <linux/slab.h>
 
-#define DARRAY(type)							\
+#define DARRAY_PREALLOCATED(_type, _nr)					\
 struct {								\
 	size_t nr, size;						\
-	type *data;							\
+	_type *data;							\
+	_type preallocated[_nr];					\
 }
 
-typedef DARRAY(void) darray_void;
+#define DARRAY(_type) DARRAY_PREALLOCATED(_type, 0)
 
-static inline int __darray_make_room(darray_void *d, size_t t_size, size_t more, gfp_t gfp)
-{
-	if (d->nr + more > d->size) {
-		size_t new_size = roundup_pow_of_two(d->nr + more);
-		void *data = krealloc_array(d->data, new_size, t_size, gfp);
+typedef DARRAY(char)	darray_char;
+typedef DARRAY(char *) darray_str;
 
-		if (!data)
-			return -ENOMEM;
+int __bch2_darray_resize_noprof(darray_char *, size_t, size_t, gfp_t);
 
-		d->data	= data;
-		d->size = new_size;
-	}
+#define __bch2_darray_resize(...)	alloc_hooks(__bch2_darray_resize_noprof(__VA_ARGS__))
 
-	return 0;
-}
+#define __darray_resize(_d, _element_size, _new_size, _gfp)		\
+	(unlikely((_new_size) > (_d)->size)				\
+	 ? __bch2_darray_resize((_d), (_element_size), (_new_size), (_gfp))\
+	 : 0)
+
+#define darray_resize_gfp(_d, _new_size, _gfp)				\
+	__darray_resize((darray_char *) (_d), sizeof((_d)->data[0]), (_new_size), _gfp)
+
+#define darray_resize(_d, _new_size)					\
+	darray_resize_gfp(_d, _new_size, GFP_KERNEL)
 
 #define darray_make_room_gfp(_d, _more, _gfp)				\
-	__darray_make_room((darray_void *) (_d), sizeof((_d)->data[0]), (_more), _gfp)
+	darray_resize_gfp((_d), (_d)->nr + (_more), _gfp)
 
 #define darray_make_room(_d, _more)					\
 	darray_make_room_gfp(_d, _more, GFP_KERNEL)
+
+#define darray_room(_d)		((_d).size - (_d).nr)
 
 #define darray_top(_d)		((_d).data[(_d).nr])
 
@@ -72,21 +76,27 @@ static inline int __darray_make_room(darray_void *d, size_t t_size, size_t more,
 #define darray_remove_item(_d, _pos)					\
 	array_remove_item((_d)->data, (_d)->nr, (_pos) - (_d)->data)
 
+#define __darray_for_each(_d, _i)						\
+	for ((_i) = (_d).data; _i < (_d).data + (_d).nr; _i++)
+
 #define darray_for_each(_d, _i)						\
-	for (_i = (_d).data; _i < (_d).data + (_d).nr; _i++)
+	for (typeof(&(_d).data[0]) _i = (_d).data; _i < (_d).data + (_d).nr; _i++)
 
 #define darray_for_each_reverse(_d, _i)					\
-	for (_i = (_d).data + (_d).nr - 1; _i >= (_d).data; --_i)
+	for (typeof(&(_d).data[0]) _i = (_d).data + (_d).nr - 1; _i >= (_d).data; --_i)
 
 #define darray_init(_d)							\
 do {									\
-	(_d)->data = NULL;						\
-	(_d)->nr = (_d)->size = 0;					\
+	(_d)->nr = 0;							\
+	(_d)->size = ARRAY_SIZE((_d)->preallocated);			\
+	(_d)->data = (_d)->size ? (_d)->preallocated : NULL;		\
 } while (0)
 
 #define darray_exit(_d)							\
 do {									\
-	kfree((_d)->data);						\
+	if (!ARRAY_SIZE((_d)->preallocated) ||				\
+	    (_d)->data != (_d)->preallocated)				\
+		kvfree((_d)->data);					\
 	darray_init(_d);						\
 } while (0)
 

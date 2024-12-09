@@ -574,7 +574,7 @@ static int sa_format_cmdl_gen(struct sa_cmdl_cfg *cfg, u8 *cmdl,
 	/* Clear the command label */
 	memzero_explicit(cmdl, (SA_MAX_CMDL_WORDS * sizeof(u32)));
 
-	/* Iniialize the command update structure */
+	/* Initialize the command update structure */
 	memzero_explicit(upd_info, sizeof(*upd_info));
 
 	if (cfg->enc_eng_id && cfg->auth_eng_id) {
@@ -1869,9 +1869,8 @@ static int sa_aead_setkey(struct crypto_aead *authenc,
 	crypto_aead_set_flags(ctx->fallback.aead,
 			      crypto_aead_get_flags(authenc) &
 			      CRYPTO_TFM_REQ_MASK);
-	crypto_aead_setkey(ctx->fallback.aead, key, keylen);
 
-	return 0;
+	return crypto_aead_setkey(ctx->fallback.aead, key, keylen);
 }
 
 static int sa_aead_setauthsize(struct crypto_aead *tfm, unsigned int authsize)
@@ -2490,11 +2489,12 @@ static void sa_ul_remove(struct platform_device *pdev)
 
 static struct platform_driver sa_ul_driver = {
 	.probe = sa_ul_probe,
-	.remove_new = sa_ul_remove,
+	.remove = sa_ul_remove,
 	.driver = {
 		   .name = "saul-crypto",
 		   .of_match_table = of_match,
 		   },
 };
 module_platform_driver(sa_ul_driver);
+MODULE_DESCRIPTION("K3 SA2UL crypto accelerator driver");
 MODULE_LICENSE("GPL v2");

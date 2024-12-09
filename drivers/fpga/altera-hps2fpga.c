@@ -191,7 +191,7 @@ err:
 	return ret;
 }
 
-static int alt_fpga_bridge_remove(struct platform_device *pdev)
+static void alt_fpga_bridge_remove(struct platform_device *pdev)
 {
 	struct fpga_bridge *bridge = platform_get_drvdata(pdev);
 	struct altera_hps2fpga_data *priv = bridge->priv;
@@ -199,8 +199,6 @@ static int alt_fpga_bridge_remove(struct platform_device *pdev)
 	fpga_bridge_unregister(bridge);
 
 	clk_disable_unprepare(priv->clk);
-
-	return 0;
 }
 
 MODULE_DEVICE_TABLE(of, altera_fpga_of_match);

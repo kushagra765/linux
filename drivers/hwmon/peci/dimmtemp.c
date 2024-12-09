@@ -47,7 +47,7 @@
 #define GET_TEMP_MAX(x)		(((x) & DIMM_TEMP_MAX) >> 8)
 #define GET_TEMP_CRIT(x)	(((x) & DIMM_TEMP_CRIT) >> 16)
 
-#define NO_DIMM_RETRY_COUNT_MAX	5
+#define NO_DIMM_RETRY_COUNT_MAX	120
 
 struct peci_dimmtemp;
 
@@ -666,4 +666,4 @@ MODULE_AUTHOR("Jae Hyun Yoo <jae.hyun.yoo@linux.intel.com>");
 MODULE_AUTHOR("Iwona Winiarska <iwona.winiarska@intel.com>");
 MODULE_DESCRIPTION("PECI dimmtemp driver");
 MODULE_LICENSE("GPL");
-MODULE_IMPORT_NS(PECI_CPU);
+MODULE_IMPORT_NS("PECI_CPU");

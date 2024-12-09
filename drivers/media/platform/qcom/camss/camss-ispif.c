@@ -270,7 +270,7 @@ static int ispif_vfe_reset(struct ispif_device *ispif, u8 vfe_id)
 	unsigned long time;
 	u32 val;
 
-	if (vfe_id > camss->res->vfe_num - 1) {
+	if (vfe_id >= camss->res->vfe_num) {
 		dev_err(camss->dev,
 			"Error: asked reset for invalid VFE%d\n", vfe_id);
 		return -ENOENT;
@@ -830,6 +830,7 @@ static int ispif_set_stream(struct v4l2_subdev *sd, int enable)
 		ispif_select_cid(ispif, intf, cid, vfe, 1);
 		ispif_config_irq(ispif, intf, vfe, 1);
 		if (camss->res->version == CAMSS_8x96 ||
+		    camss->res->version == CAMSS_8x53 ||
 		    camss->res->version == CAMSS_660)
 			ispif_config_pack(ispif,
 					  line->fmt[MSM_ISPIF_PAD_SINK].code,
@@ -848,6 +849,7 @@ static int ispif_set_stream(struct v4l2_subdev *sd, int enable)
 
 		mutex_lock(&ispif->config_lock);
 		if (camss->res->version == CAMSS_8x96 ||
+		    camss->res->version == CAMSS_8x53 ||
 		    camss->res->version == CAMSS_660)
 			ispif_config_pack(ispif,
 					  line->fmt[MSM_ISPIF_PAD_SINK].code,
@@ -866,7 +868,7 @@ static int ispif_set_stream(struct v4l2_subdev *sd, int enable)
 /*
  * __ispif_get_format - Get pointer to format structure
  * @ispif: ISPIF line
- * @cfg: V4L2 subdev pad configuration
+ * @sd_state: V4L2 subdev state
  * @pad: pad from which format is requested
  * @which: TRY or ACTIVE format
  *
@@ -879,8 +881,7 @@ __ispif_get_format(struct ispif_line *line,
 		   enum v4l2_subdev_format_whence which)
 {
 	if (which == V4L2_SUBDEV_FORMAT_TRY)
-		return v4l2_subdev_get_try_format(&line->subdev, sd_state,
-						  pad);
+		return v4l2_subdev_state_get_format(sd_state, pad);
 
 	return &line->fmt[pad];
 }
@@ -888,7 +889,7 @@ __ispif_get_format(struct ispif_line *line,
 /*
  * ispif_try_format - Handle try format by pad subdev method
  * @ispif: ISPIF line
- * @cfg: V4L2 subdev pad configuration
+ * @sd_state: V4L2 subdev state
  * @pad: pad on which format is requested
  * @fmt: pointer to v4l2 format structure
  * @which: wanted subdev format
@@ -936,7 +937,7 @@ static void ispif_try_format(struct ispif_line *line,
 /*
  * ispif_enum_mbus_code - Handle pixel format enumeration
  * @sd: ISPIF V4L2 subdevice
- * @cfg: V4L2 subdev pad configuration
+ * @sd_state: V4L2 subdev state
  * @code: pointer to v4l2_subdev_mbus_code_enum structure
  * return -EINVAL or zero on success
  */
@@ -969,7 +970,7 @@ static int ispif_enum_mbus_code(struct v4l2_subdev *sd,
 /*
  * ispif_enum_frame_size - Handle frame size enumeration
  * @sd: ISPIF V4L2 subdevice
- * @cfg: V4L2 subdev pad configuration
+ * @sd_state: V4L2 subdev state
  * @fse: pointer to v4l2_subdev_frame_size_enum structure
  * return -EINVAL or zero on success
  */
@@ -1006,7 +1007,7 @@ static int ispif_enum_frame_size(struct v4l2_subdev *sd,
 /*
  * ispif_get_format - Handle get format by pads subdev method
  * @sd: ISPIF V4L2 subdevice
- * @cfg: V4L2 subdev pad configuration
+ * @sd_state: V4L2 subdev state
  * @fmt: pointer to v4l2 subdev format structure
  *
  * Return -EINVAL or zero on success
@@ -1030,7 +1031,7 @@ static int ispif_get_format(struct v4l2_subdev *sd,
 /*
  * ispif_set_format - Handle set format by pads subdev method
  * @sd: ISPIF V4L2 subdevice
- * @cfg: V4L2 subdev pad configuration
+ * @sd_state: V4L2 subdev state
  * @fmt: pointer to v4l2 subdev format structure
  *
  * Return -EINVAL or zero on success
@@ -1112,6 +1113,7 @@ int msm_ispif_subdev_init(struct camss *camss,
 	if (camss->res->version == CAMSS_8x16)
 		ispif->line_num = 2;
 	else if (camss->res->version == CAMSS_8x96 ||
+		 camss->res->version == CAMSS_8x53 ||
 		 camss->res->version == CAMSS_660)
 		ispif->line_num = 4;
 	else
@@ -1131,6 +1133,7 @@ int msm_ispif_subdev_init(struct camss *camss,
 			ispif->line[i].nformats =
 					ARRAY_SIZE(ispif_formats_8x16);
 		} else if (camss->res->version == CAMSS_8x96 ||
+			   camss->res->version == CAMSS_8x53 ||
 			   camss->res->version == CAMSS_660) {
 			ispif->line[i].formats = ispif_formats_8x96;
 			ispif->line[i].nformats =
@@ -1163,6 +1166,7 @@ int msm_ispif_subdev_init(struct camss *camss,
 		ret = devm_request_irq(dev, ispif->irq, ispif_isr_8x16,
 			       IRQF_TRIGGER_RISING, ispif->irq_name, ispif);
 	else if (camss->res->version == CAMSS_8x96 ||
+		 camss->res->version == CAMSS_8x53 ||
 		 camss->res->version == CAMSS_660)
 		ret = devm_request_irq(dev, ispif->irq, ispif_isr_8x96,
 			       IRQF_TRIGGER_RISING, ispif->irq_name, ispif);

@@ -6,26 +6,26 @@
 #ifndef BTRFS_CTREE_H
 #define BTRFS_CTREE_H
 
+#include "linux/cleanup.h"
 #include <linux/pagemap.h>
+#include <linux/spinlock.h>
+#include <linux/rbtree.h>
+#include <linux/mutex.h>
+#include <linux/wait.h>
+#include <linux/list.h>
+#include <linux/atomic.h>
+#include <linux/xarray.h>
+#include <linux/refcount.h>
+#include <uapi/linux/btrfs_tree.h>
 #include "locking.h"
 #include "fs.h"
 #include "accessors.h"
+#include "extent-io-tree.h"
 
+struct extent_buffer;
+struct btrfs_block_rsv;
 struct btrfs_trans_handle;
-struct btrfs_transaction;
-struct btrfs_pending_snapshot;
-struct btrfs_delayed_ref_root;
-struct btrfs_space_info;
 struct btrfs_block_group;
-struct btrfs_ordered_sum;
-struct btrfs_ref;
-struct btrfs_bio;
-struct btrfs_ioctl_encoded_io_args;
-struct btrfs_device;
-struct btrfs_fs_devices;
-struct btrfs_balance_control;
-struct btrfs_delayed_root;
-struct reloc_control;
 
 /* Read ahead values for struct btrfs_path.reada */
 enum {
@@ -84,6 +84,9 @@ struct btrfs_path {
 	/* Stop search if any locks need to be taken (for read) */
 	unsigned int nowait:1;
 };
+
+#define BTRFS_PATH_AUTO_FREE(path_name)					\
+	struct btrfs_path *path_name __free(btrfs_free_path) = NULL
 
 /*
  * The state of btrfs root
@@ -212,8 +215,6 @@ struct btrfs_root {
 
 	u64 last_trans;
 
-	u32 type;
-
 	u64 free_objectid;
 
 	struct btrfs_key defrag_progress;
@@ -224,18 +225,17 @@ struct btrfs_root {
 
 	struct list_head root_list;
 
-	spinlock_t log_extents_lock[2];
-	struct list_head logged_list[2];
-
-	spinlock_t inode_lock;
-	/* red-black tree that keeps track of in-memory inodes */
-	struct rb_root inode_tree;
+	/*
+	 * Xarray that keeps track of in-memory inodes, protected by the lock
+	 * @inode_lock.
+	 */
+	struct xarray inodes;
 
 	/*
-	 * radix tree that keeps track of delayed nodes of every inode,
-	 * protected by inode_lock
+	 * Xarray that keeps track of delayed nodes of every inode, protected
+	 * by @inode_lock.
 	 */
-	struct radix_tree_root delayed_nodes_tree;
+	struct xarray delayed_nodes;
 	/*
 	 * right now this just gets used so that a root has its own devid
 	 * for stat.  It may be used for more later
@@ -360,6 +360,16 @@ static inline void btrfs_set_root_last_log_commit(struct btrfs_root *root, int c
 	WRITE_ONCE(root->last_log_commit, commit_id);
 }
 
+static inline u64 btrfs_get_root_last_trans(const struct btrfs_root *root)
+{
+	return READ_ONCE(root->last_trans);
+}
+
+static inline void btrfs_set_root_last_trans(struct btrfs_root *root, u64 transid)
+{
+	WRITE_ONCE(root->last_trans, transid);
+}
+
 /*
  * Structure that conveys information about an extent that is going to replace
  * all the extents in a file range.
@@ -453,6 +463,8 @@ struct btrfs_file_private {
 	void *filldir_buf;
 	u64 last_index;
 	struct extent_state *llseek_cached_state;
+	/* Task that allocated this structure. */
+	struct task_struct *owner_task;
 };
 
 static inline u32 BTRFS_LEAF_DATA_SIZE(const struct btrfs_fs_info *info)
@@ -483,8 +495,7 @@ static inline gfp_t btrfs_alloc_write_mask(struct address_space *mapping)
 	return mapping_gfp_constraint(mapping, ~__GFP_FS);
 }
 
-int btrfs_error_unpin_extent_range(struct btrfs_fs_info *fs_info,
-				   u64 start, u64 end);
+void btrfs_error_unpin_extent_range(struct btrfs_fs_info *fs_info, u64 start, u64 end);
 int btrfs_discard_extent(struct btrfs_fs_info *fs_info, u64 bytenr,
 			 u64 num_bytes, u64 *actual_bytes);
 int btrfs_trim_fs(struct btrfs_fs_info *fs_info, struct fstrim_range *range);
@@ -533,7 +544,7 @@ int btrfs_previous_item(struct btrfs_root *root,
 int btrfs_previous_extent_item(struct btrfs_root *root,
 			struct btrfs_path *path, u64 min_objectid);
 void btrfs_set_item_key_safe(struct btrfs_trans_handle *trans,
-			     struct btrfs_path *path,
+			     const struct btrfs_path *path,
 			     const struct btrfs_key *new_key);
 struct extent_buffer *btrfs_root_node(struct btrfs_root *root);
 int btrfs_find_next_key(struct btrfs_root *root, struct btrfs_path *path,
@@ -561,15 +572,15 @@ int btrfs_copy_root(struct btrfs_trans_handle *trans,
 		      struct btrfs_root *root,
 		      struct extent_buffer *buf,
 		      struct extent_buffer **cow_ret, u64 new_root_objectid);
-int btrfs_block_can_be_shared(struct btrfs_trans_handle *trans,
-			      struct btrfs_root *root,
-			      struct extent_buffer *buf);
+bool btrfs_block_can_be_shared(struct btrfs_trans_handle *trans,
+			       struct btrfs_root *root,
+			       struct extent_buffer *buf);
 int btrfs_del_ptr(struct btrfs_trans_handle *trans, struct btrfs_root *root,
 		  struct btrfs_path *path, int level, int slot);
 void btrfs_extend_item(struct btrfs_trans_handle *trans,
-		       struct btrfs_path *path, u32 data_size);
+		       const struct btrfs_path *path, u32 data_size);
 void btrfs_truncate_item(struct btrfs_trans_handle *trans,
-			 struct btrfs_path *path, u32 new_size, int from_end);
+			 const struct btrfs_path *path, u32 new_size, int from_end);
 int btrfs_split_item(struct btrfs_trans_handle *trans,
 		     struct btrfs_root *root,
 		     struct btrfs_path *path,
@@ -593,6 +604,7 @@ int btrfs_search_slot_for_read(struct btrfs_root *root,
 void btrfs_release_path(struct btrfs_path *p);
 struct btrfs_path *btrfs_alloc_path(void);
 void btrfs_free_path(struct btrfs_path *p);
+DEFINE_FREE(btrfs_free_path, struct btrfs_path *, btrfs_free_path(_T))
 
 int btrfs_del_items(struct btrfs_trans_handle *trans, struct btrfs_root *root,
 		   struct btrfs_path *path, int slot, int nr);
@@ -732,16 +744,11 @@ const char *btrfs_super_csum_driver(u16 csum_type);
 size_t __attribute_const__ btrfs_get_num_csums(void);
 
 /*
- * We use page status Private2 to indicate there is an ordered extent with
+ * We use folio flag owner_2 to indicate there is an ordered extent with
  * unfinished IO.
- *
- * Rename the Private2 accessors to Ordered, to improve readability.
  */
-#define PageOrdered(page)		PagePrivate2(page)
-#define SetPageOrdered(page)		SetPagePrivate2(page)
-#define ClearPageOrdered(page)		ClearPagePrivate2(page)
-#define folio_test_ordered(folio)	folio_test_private_2(folio)
-#define folio_set_ordered(folio)	folio_set_private_2(folio)
-#define folio_clear_ordered(folio)	folio_clear_private_2(folio)
+#define folio_test_ordered(folio)	folio_test_owner_2(folio)
+#define folio_set_ordered(folio)	folio_set_owner_2(folio)
+#define folio_clear_ordered(folio)	folio_clear_owner_2(folio)
 
 #endif

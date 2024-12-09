@@ -347,14 +347,12 @@ static const struct file_operations gpio_mockup_debugfs_ops = {
 	.open = gpio_mockup_debugfs_open,
 	.read = gpio_mockup_debugfs_read,
 	.write = gpio_mockup_debugfs_write,
-	.llseek = no_llseek,
 	.release = single_release,
 };
 
 static void gpio_mockup_debugfs_setup(struct device *dev,
 				      struct gpio_mockup_chip *chip)
 {
-	struct device *child __free(put_device) = NULL;
 	struct gpio_mockup_dbgfs_private *priv;
 	struct gpio_chip *gc;
 	const char *devname;
@@ -367,7 +365,7 @@ static void gpio_mockup_debugfs_setup(struct device *dev,
 	 * There can only be a single GPIO device per platform device in
 	 * gpio-mockup so using device_find_any_child() is OK.
 	 */
-	child = device_find_any_child(dev);
+	struct device *child __free(put_device) = device_find_any_child(dev);
 	if (!child)
 		return;
 

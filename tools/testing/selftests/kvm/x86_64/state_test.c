@@ -6,7 +6,6 @@
  *
  * Tests for vCPU state save/restore, including nested guest state.
  */
-#define _GNU_SOURCE /* for program_invocation_short_name */
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -145,11 +144,6 @@ static void __attribute__((__flatten__)) guest_code(void *arg)
 		uint8_t buffer[4096];
 
 		memset(buffer, 0xcc, sizeof(buffer));
-
-		set_cr4(get_cr4() | X86_CR4_OSXSAVE);
-		GUEST_ASSERT(this_cpu_has(X86_FEATURE_OSXSAVE));
-
-		xsetbv(0, xgetbv(0) | supported_xcr0);
 
 		/*
 		 * Modify state for all supported xfeatures to take them out of

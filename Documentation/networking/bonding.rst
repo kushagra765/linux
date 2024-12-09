@@ -444,6 +444,18 @@ arp_missed_max
 
 	The default value is 2, and the allowable range is 1 - 255.
 
+coupled_control
+
+    Specifies whether the LACP state machine's MUX in the 802.3ad mode
+    should have separate Collecting and Distributing states.
+
+    This is by implementing the independent control state machine per
+    IEEE 802.1AX-2008 5.4.15 in addition to the existing coupled control
+    state machine.
+
+    The default value is 1. This setting does not separate the Collecting
+    and Distributing states, maintaining the bond in coupled control.
+
 downdelay
 
 	Specifies the time, in milliseconds, to wait before disabling
@@ -2903,6 +2915,17 @@ To restore your slaves' MAC addresses, you need to detach them
 from the bond (``ifenslave -d bond0 eth0``). The bonding driver will
 then restore the MAC addresses that the slaves had before they were
 enslaved.
+
+9.  What bonding modes support native XDP?
+------------------------------------------
+
+  * balance-rr (0)
+  * active-backup (1)
+  * balance-xor (2)
+  * 802.3ad (4)
+
+Note that the vlan+srcmac hash policy does not support native XDP.
+For other bonding modes, the XDP program must be loaded with generic mode.
 
 16. Resources and Links
 =======================

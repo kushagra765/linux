@@ -17,7 +17,7 @@
 #include <linux/input/mt.h>
 #include <linux/input/touchscreen.h>
 #include <linux/regulator/consumer.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 
 #define HIDEEP_TS_NAME			"HiDeep Touchscreen"
 #define HIDEEP_I2C_NAME			"hideep_ts"
@@ -928,8 +928,7 @@ static ssize_t hideep_fw_version_show(struct device *dev,
 	ssize_t len;
 
 	mutex_lock(&ts->dev_mutex);
-	len = scnprintf(buf, PAGE_SIZE, "%04x\n",
-			be16_to_cpu(ts->dwz_info.release_ver));
+	len = sysfs_emit(buf, "%04x\n", be16_to_cpu(ts->dwz_info.release_ver));
 	mutex_unlock(&ts->dev_mutex);
 
 	return len;
@@ -943,8 +942,7 @@ static ssize_t hideep_product_id_show(struct device *dev,
 	ssize_t len;
 
 	mutex_lock(&ts->dev_mutex);
-	len = scnprintf(buf, PAGE_SIZE, "%04x\n",
-			be16_to_cpu(ts->dwz_info.product_id));
+	len = sysfs_emit(buf, "%04x\n", be16_to_cpu(ts->dwz_info.product_id));
 	mutex_unlock(&ts->dev_mutex);
 
 	return len;
@@ -1097,7 +1095,7 @@ static int hideep_probe(struct i2c_client *client)
 }
 
 static const struct i2c_device_id hideep_i2c_id[] = {
-	{ HIDEEP_I2C_NAME, 0 },
+	{ HIDEEP_I2C_NAME },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, hideep_i2c_id);

@@ -30,6 +30,7 @@
 
 MODULE_ALIAS("platform:mmp-camera");
 MODULE_AUTHOR("Jonathan Corbet <corbet@lwn.net>");
+MODULE_DESCRIPTION("Support for the camera device found on Marvell MMP processors");
 MODULE_LICENSE("GPL");
 
 static char *mcam_clks[] = {"axi", "func", "phy"};
@@ -358,7 +359,7 @@ MODULE_DEVICE_TABLE(of, mmpcam_of_match);
 
 static struct platform_driver mmpcam_driver = {
 	.probe		= mmpcam_probe,
-	.remove_new	= mmpcam_remove,
+	.remove		= mmpcam_remove,
 	.driver = {
 		.name	= "mmp-camera",
 		.of_match_table = mmpcam_of_match,

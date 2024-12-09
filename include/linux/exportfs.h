@@ -158,6 +158,20 @@ struct fid {
 
 #define EXPORT_FH_CONNECTABLE	0x1 /* Encode file handle with parent */
 #define EXPORT_FH_FID		0x2 /* File handle may be non-decodeable */
+#define EXPORT_FH_DIR_ONLY	0x4 /* Only decode file handle for a directory */
+
+/*
+ * Filesystems use only lower 8 bits of file_handle type for fid_type.
+ * name_to_handle_at() uses upper 16 bits of type as user flags to be
+ * interpreted by open_by_handle_at().
+ */
+#define FILEID_USER_FLAGS_MASK	0xffff0000
+#define FILEID_USER_FLAGS(type) ((type) & FILEID_USER_FLAGS_MASK)
+
+/* Flags supported in encoded handle_type that is exported to user */
+#define FILEID_IS_CONNECTABLE	0x10000
+#define FILEID_IS_DIR		0x20000
+#define FILEID_VALID_USER_FLAGS	(FILEID_IS_CONNECTABLE | FILEID_IS_DIR)
 
 /**
  * struct export_operations - for nfsd to communicate with file systems
@@ -249,19 +263,6 @@ struct export_operations {
 	unsigned long	flags;
 };
 
-/**
- * exportfs_lock_op_is_async() - export op supports async lock operation
- * @export_ops:	the nfs export operations to check
- *
- * Returns true if the nfs export_operations structure has
- * EXPORT_OP_ASYNC_LOCK in their flags set
- */
-static inline bool
-exportfs_lock_op_is_async(const struct export_operations *export_ops)
-{
-	return export_ops->flags & EXPORT_OP_ASYNC_LOCK;
-}
-
 extern int exportfs_encode_inode_fh(struct inode *inode, struct fid *fid,
 				    int *max_len, struct inode *parent,
 				    int flags);
@@ -305,6 +306,7 @@ static inline int exportfs_encode_fid(struct inode *inode, struct fid *fid,
 extern struct dentry *exportfs_decode_fh_raw(struct vfsmount *mnt,
 					     struct fid *fid, int fh_len,
 					     int fileid_type,
+					     unsigned int flags,
 					     int (*acceptable)(void *, struct dentry *),
 					     void *context);
 extern struct dentry *exportfs_decode_fh(struct vfsmount *mnt, struct fid *fid,

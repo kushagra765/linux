@@ -326,14 +326,12 @@ err_mbox:
 	return ret;
 }
 
-static int qcom_ipcc_remove(struct platform_device *pdev)
+static void qcom_ipcc_remove(struct platform_device *pdev)
 {
 	struct qcom_ipcc *ipcc = platform_get_drvdata(pdev);
 
 	disable_irq_wake(ipcc->irq);
 	irq_domain_remove(ipcc->irq_domain);
-
-	return 0;
 }
 
 static const struct of_device_id qcom_ipcc_of_match[] = {

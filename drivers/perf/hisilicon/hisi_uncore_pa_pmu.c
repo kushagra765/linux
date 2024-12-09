@@ -514,14 +514,13 @@ static int hisi_pa_pmu_probe(struct platform_device *pdev)
 	return ret;
 }
 
-static int hisi_pa_pmu_remove(struct platform_device *pdev)
+static void hisi_pa_pmu_remove(struct platform_device *pdev)
 {
 	struct hisi_pmu *pa_pmu = platform_get_drvdata(pdev);
 
 	perf_pmu_unregister(&pa_pmu->pmu);
 	cpuhp_state_remove_instance_nocalls(CPUHP_AP_PERF_ARM_HISI_PA_ONLINE,
 					    &pa_pmu->node);
-	return 0;
 }
 
 static const struct acpi_device_id hisi_pa_pmu_acpi_match[] = {

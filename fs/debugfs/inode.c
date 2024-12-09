@@ -14,7 +14,8 @@
 
 #include <linux/module.h>
 #include <linux/fs.h>
-#include <linux/mount.h>
+#include <linux/fs_context.h>
+#include <linux/fs_parser.h>
 #include <linux/pagemap.h>
 #include <linux/init.h>
 #include <linux/kobject.h>
@@ -23,7 +24,6 @@
 #include <linux/fsnotify.h>
 #include <linux/string.h>
 #include <linux/seq_file.h>
-#include <linux/parser.h>
 #include <linux/magic.h>
 #include <linux/slab.h>
 #include <linux/security.h>
@@ -77,7 +77,7 @@ static struct inode *debugfs_get_inode(struct super_block *sb)
 	return inode;
 }
 
-struct debugfs_mount_opts {
+struct debugfs_fs_info {
 	kuid_t uid;
 	kgid_t gid;
 	umode_t mode;
@@ -89,67 +89,58 @@ enum {
 	Opt_uid,
 	Opt_gid,
 	Opt_mode,
-	Opt_err
+	Opt_source,
 };
 
-static const match_table_t tokens = {
-	{Opt_uid, "uid=%u"},
-	{Opt_gid, "gid=%u"},
-	{Opt_mode, "mode=%o"},
-	{Opt_err, NULL}
+static const struct fs_parameter_spec debugfs_param_specs[] = {
+	fsparam_gid	("gid",		Opt_gid),
+	fsparam_u32oct	("mode",	Opt_mode),
+	fsparam_uid	("uid",		Opt_uid),
+	fsparam_string	("source",	Opt_source),
+	{}
 };
 
-struct debugfs_fs_info {
-	struct debugfs_mount_opts mount_opts;
-};
-
-static int debugfs_parse_options(char *data, struct debugfs_mount_opts *opts)
+static int debugfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 {
-	substring_t args[MAX_OPT_ARGS];
-	int option;
-	int token;
-	kuid_t uid;
-	kgid_t gid;
-	char *p;
+	struct debugfs_fs_info *opts = fc->s_fs_info;
+	struct fs_parse_result result;
+	int opt;
 
-	opts->opts = 0;
-	opts->mode = DEBUGFS_DEFAULT_MODE;
-
-	while ((p = strsep(&data, ",")) != NULL) {
-		if (!*p)
-			continue;
-
-		token = match_token(p, tokens, args);
-		switch (token) {
-		case Opt_uid:
-			if (match_int(&args[0], &option))
-				return -EINVAL;
-			uid = make_kuid(current_user_ns(), option);
-			if (!uid_valid(uid))
-				return -EINVAL;
-			opts->uid = uid;
-			break;
-		case Opt_gid:
-			if (match_int(&args[0], &option))
-				return -EINVAL;
-			gid = make_kgid(current_user_ns(), option);
-			if (!gid_valid(gid))
-				return -EINVAL;
-			opts->gid = gid;
-			break;
-		case Opt_mode:
-			if (match_octal(&args[0], &option))
-				return -EINVAL;
-			opts->mode = option & S_IALLUGO;
-			break;
+	opt = fs_parse(fc, debugfs_param_specs, param, &result);
+	if (opt < 0) {
 		/*
-		 * We might like to report bad mount options here;
-		 * but traditionally debugfs has ignored all mount options
-		 */
-		}
+                * We might like to report bad mount options here; but
+                * traditionally debugfs has ignored all mount options
+                */
+		if (opt == -ENOPARAM)
+			return 0;
 
-		opts->opts |= BIT(token);
+		return opt;
 	}
+
+	switch (opt) {
+	case Opt_uid:
+		opts->uid = result.uid;
+		break;
+	case Opt_gid:
+		opts->gid = result.gid;
+		break;
+	case Opt_mode:
+		opts->mode = result.uint_32 & S_IALLUGO;
+		break;
+	case Opt_source:
+		if (fc->source)
+			return invalfc(fc, "Multiple sources specified");
+		fc->source = param->string;
+		param->string = NULL;
+		break;
+	/*
+	 * We might like to report bad mount options here;
+	 * but traditionally debugfs has ignored all mount options
+	 */
+	}
+
+	opts->opts |= BIT(opt);
 
 	return 0;
 }
@@ -158,23 +149,22 @@ static void _debugfs_apply_options(struct super_block *sb, bool remount)
 {
 	struct debugfs_fs_info *fsi = sb->s_fs_info;
 	struct inode *inode = d_inode(sb->s_root);
-	struct debugfs_mount_opts *opts = &fsi->mount_opts;
 
 	/*
 	 * On remount, only reset mode/uid/gid if they were provided as mount
 	 * options.
 	 */
 
-	if (!remount || opts->opts & BIT(Opt_mode)) {
+	if (!remount || fsi->opts & BIT(Opt_mode)) {
 		inode->i_mode &= ~S_IALLUGO;
-		inode->i_mode |= opts->mode;
+		inode->i_mode |= fsi->mode;
 	}
 
-	if (!remount || opts->opts & BIT(Opt_uid))
-		inode->i_uid = opts->uid;
+	if (!remount || fsi->opts & BIT(Opt_uid))
+		inode->i_uid = fsi->uid;
 
-	if (!remount || opts->opts & BIT(Opt_gid))
-		inode->i_gid = opts->gid;
+	if (!remount || fsi->opts & BIT(Opt_gid))
+		inode->i_gid = fsi->gid;
 }
 
 static void debugfs_apply_options(struct super_block *sb)
@@ -187,35 +177,33 @@ static void debugfs_apply_options_remount(struct super_block *sb)
 	_debugfs_apply_options(sb, true);
 }
 
-static int debugfs_remount(struct super_block *sb, int *flags, char *data)
+static int debugfs_reconfigure(struct fs_context *fc)
 {
-	int err;
-	struct debugfs_fs_info *fsi = sb->s_fs_info;
+	struct super_block *sb = fc->root->d_sb;
+	struct debugfs_fs_info *sb_opts = sb->s_fs_info;
+	struct debugfs_fs_info *new_opts = fc->s_fs_info;
 
 	sync_filesystem(sb);
-	err = debugfs_parse_options(data, &fsi->mount_opts);
-	if (err)
-		goto fail;
 
+	/* structure copy of new mount options to sb */
+	*sb_opts = *new_opts;
 	debugfs_apply_options_remount(sb);
 
-fail:
-	return err;
+	return 0;
 }
 
 static int debugfs_show_options(struct seq_file *m, struct dentry *root)
 {
 	struct debugfs_fs_info *fsi = root->d_sb->s_fs_info;
-	struct debugfs_mount_opts *opts = &fsi->mount_opts;
 
-	if (!uid_eq(opts->uid, GLOBAL_ROOT_UID))
+	if (!uid_eq(fsi->uid, GLOBAL_ROOT_UID))
 		seq_printf(m, ",uid=%u",
-			   from_kuid_munged(&init_user_ns, opts->uid));
-	if (!gid_eq(opts->gid, GLOBAL_ROOT_GID))
+			   from_kuid_munged(&init_user_ns, fsi->uid));
+	if (!gid_eq(fsi->gid, GLOBAL_ROOT_GID))
 		seq_printf(m, ",gid=%u",
-			   from_kgid_munged(&init_user_ns, opts->gid));
-	if (opts->mode != DEBUGFS_DEFAULT_MODE)
-		seq_printf(m, ",mode=%o", opts->mode);
+			   from_kgid_munged(&init_user_ns, fsi->gid));
+	if (fsi->mode != DEBUGFS_DEFAULT_MODE)
+		seq_printf(m, ",mode=%o", fsi->mode);
 
 	return 0;
 }
@@ -229,7 +217,6 @@ static void debugfs_free_inode(struct inode *inode)
 
 static const struct super_operations debugfs_super_operations = {
 	.statfs		= simple_statfs,
-	.remount_fs	= debugfs_remount,
 	.show_options	= debugfs_show_options,
 	.free_inode	= debugfs_free_inode,
 };
@@ -263,26 +250,14 @@ static const struct dentry_operations debugfs_dops = {
 	.d_automount = debugfs_automount,
 };
 
-static int debug_fill_super(struct super_block *sb, void *data, int silent)
+static int debugfs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
 	static const struct tree_descr debug_files[] = {{""}};
-	struct debugfs_fs_info *fsi;
 	int err;
 
-	fsi = kzalloc(sizeof(struct debugfs_fs_info), GFP_KERNEL);
-	sb->s_fs_info = fsi;
-	if (!fsi) {
-		err = -ENOMEM;
-		goto fail;
-	}
-
-	err = debugfs_parse_options(data, &fsi->mount_opts);
+	err = simple_fill_super(sb, DEBUGFS_MAGIC, debug_files);
 	if (err)
-		goto fail;
-
-	err  =  simple_fill_super(sb, DEBUGFS_MAGIC, debug_files);
-	if (err)
-		goto fail;
+		return err;
 
 	sb->s_op = &debugfs_super_operations;
 	sb->s_d_op = &debugfs_dops;
@@ -290,27 +265,48 @@ static int debug_fill_super(struct super_block *sb, void *data, int silent)
 	debugfs_apply_options(sb);
 
 	return 0;
-
-fail:
-	kfree(fsi);
-	sb->s_fs_info = NULL;
-	return err;
 }
 
-static struct dentry *debug_mount(struct file_system_type *fs_type,
-			int flags, const char *dev_name,
-			void *data)
+static int debugfs_get_tree(struct fs_context *fc)
 {
 	if (!(debugfs_allow & DEBUGFS_ALLOW_API))
-		return ERR_PTR(-EPERM);
+		return -EPERM;
 
-	return mount_single(fs_type, flags, data, debug_fill_super);
+	return get_tree_single(fc, debugfs_fill_super);
+}
+
+static void debugfs_free_fc(struct fs_context *fc)
+{
+	kfree(fc->s_fs_info);
+}
+
+static const struct fs_context_operations debugfs_context_ops = {
+	.free		= debugfs_free_fc,
+	.parse_param	= debugfs_parse_param,
+	.get_tree	= debugfs_get_tree,
+	.reconfigure	= debugfs_reconfigure,
+};
+
+static int debugfs_init_fs_context(struct fs_context *fc)
+{
+	struct debugfs_fs_info *fsi;
+
+	fsi = kzalloc(sizeof(struct debugfs_fs_info), GFP_KERNEL);
+	if (!fsi)
+		return -ENOMEM;
+
+	fsi->mode = DEBUGFS_DEFAULT_MODE;
+
+	fc->s_fs_info = fsi;
+	fc->ops = &debugfs_context_ops;
+	return 0;
 }
 
 static struct file_system_type debug_fs_type = {
 	.owner =	THIS_MODULE,
 	.name =		"debugfs",
-	.mount =	debug_mount,
+	.init_fs_context = debugfs_init_fs_context,
+	.parameters =	debugfs_param_specs,
 	.kill_sb =	kill_litter_super,
 };
 MODULE_ALIAS_FS("debugfs");
@@ -416,7 +412,7 @@ static struct dentry *end_creating(struct dentry *dentry)
 static struct dentry *__debugfs_create_file(const char *name, umode_t mode,
 				struct dentry *parent, void *data,
 				const struct file_operations *proxy_fops,
-				const struct file_operations *real_fops)
+				const void *real_fops)
 {
 	struct dentry *dentry;
 	struct inode *inode;
@@ -454,49 +450,38 @@ static struct dentry *__debugfs_create_file(const char *name, umode_t mode,
 	return end_creating(dentry);
 }
 
-/**
- * debugfs_create_file - create a file in the debugfs filesystem
- * @name: a pointer to a string containing the name of the file to create.
- * @mode: the permission that the file should have.
- * @parent: a pointer to the parent dentry for this file.  This should be a
- *          directory dentry if set.  If this parameter is NULL, then the
- *          file will be created in the root of the debugfs filesystem.
- * @data: a pointer to something that the caller will want to get to later
- *        on.  The inode.i_private pointer will point to this value on
- *        the open() call.
- * @fops: a pointer to a struct file_operations that should be used for
- *        this file.
- *
- * This is the basic "create a file" function for debugfs.  It allows for a
- * wide range of flexibility in creating a file, or a directory (if you want
- * to create a directory, the debugfs_create_dir() function is
- * recommended to be used instead.)
- *
- * This function will return a pointer to a dentry if it succeeds.  This
- * pointer must be passed to the debugfs_remove() function when the file is
- * to be removed (no automatic cleanup happens if your module is unloaded,
- * you are responsible here.)  If an error occurs, ERR_PTR(-ERROR) will be
- * returned.
- *
- * If debugfs is not enabled in the kernel, the value -%ENODEV will be
- * returned.
- *
- * NOTE: it's expected that most callers should _ignore_ the errors returned
- * by this function. Other debugfs functions handle the fact that the "dentry"
- * passed to them could be an error and they don't crash in that case.
- * Drivers should generally work fine even if debugfs fails to init anyway.
- */
-struct dentry *debugfs_create_file(const char *name, umode_t mode,
-				   struct dentry *parent, void *data,
-				   const struct file_operations *fops)
+struct dentry *debugfs_create_file_full(const char *name, umode_t mode,
+					struct dentry *parent, void *data,
+					const struct file_operations *fops)
 {
+	if (WARN_ON((unsigned long)fops &
+		    (DEBUGFS_FSDATA_IS_SHORT_FOPS_BIT |
+		     DEBUGFS_FSDATA_IS_REAL_FOPS_BIT)))
+		return ERR_PTR(-EINVAL);
 
 	return __debugfs_create_file(name, mode, parent, data,
 				fops ? &debugfs_full_proxy_file_operations :
 					&debugfs_noop_file_operations,
 				fops);
 }
-EXPORT_SYMBOL_GPL(debugfs_create_file);
+EXPORT_SYMBOL_GPL(debugfs_create_file_full);
+
+struct dentry *debugfs_create_file_short(const char *name, umode_t mode,
+					 struct dentry *parent, void *data,
+					 const struct debugfs_short_fops *fops)
+{
+	if (WARN_ON((unsigned long)fops &
+		    (DEBUGFS_FSDATA_IS_SHORT_FOPS_BIT |
+		     DEBUGFS_FSDATA_IS_REAL_FOPS_BIT)))
+		return ERR_PTR(-EINVAL);
+
+	return __debugfs_create_file(name, mode, parent, data,
+				fops ? &debugfs_full_proxy_file_operations :
+					&debugfs_noop_file_operations,
+				(const void *)((unsigned long)fops |
+					       DEBUGFS_FSDATA_IS_SHORT_FOPS_BIT));
+}
+EXPORT_SYMBOL_GPL(debugfs_create_file_short);
 
 /**
  * debugfs_create_file_unsafe - create a file in the debugfs filesystem
@@ -751,13 +736,28 @@ static void __debugfs_file_removed(struct dentry *dentry)
 	if ((unsigned long)fsd & DEBUGFS_FSDATA_IS_REAL_FOPS_BIT)
 		return;
 
-	/* if we hit zero, just wait for all to finish */
-	if (!refcount_dec_and_test(&fsd->active_users)) {
-		wait_for_completion(&fsd->active_users_drained);
+	/* if this was the last reference, we're done */
+	if (refcount_dec_and_test(&fsd->active_users))
 		return;
-	}
 
-	/* if we didn't hit zero, try to cancel any we can */
+	/*
+	 * If there's still a reference, the code that obtained it can
+	 * be in different states:
+	 *  - The common case of not using cancellations, or already
+	 *    after debugfs_leave_cancellation(), where we just need
+	 *    to wait for debugfs_file_put() which signals the completion;
+	 *  - inside a cancellation section, i.e. between
+	 *    debugfs_enter_cancellation() and debugfs_leave_cancellation(),
+	 *    in which case we need to trigger the ->cancel() function,
+	 *    and then wait for debugfs_file_put() just like in the
+	 *    previous case;
+	 *  - before debugfs_enter_cancellation() (but obviously after
+	 *    debugfs_file_get()), in which case we may not see the
+	 *    cancellation in the list on the first round of the loop,
+	 *    but debugfs_enter_cancellation() signals the completion
+	 *    after adding it, so this code gets woken up to call the
+	 *    ->cancel() function.
+	 */
 	while (refcount_read(&fsd->active_users)) {
 		struct debugfs_cancellation *c;
 

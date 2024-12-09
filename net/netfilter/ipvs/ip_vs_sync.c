@@ -51,7 +51,7 @@
 #include <linux/kernel.h>
 #include <linux/sched/signal.h>
 
-#include <asm/unaligned.h>		/* Used for ntoh_seq and hton_seq */
+#include <linux/unaligned.h>		/* Used for ntoh_seq and hton_seq */
 
 #include <net/ip.h>
 #include <net/sock.h>
@@ -1365,7 +1365,7 @@ static int set_mcast_if(struct sock *sk, struct net_device *dev)
 		struct ipv6_pinfo *np = inet6_sk(sk);
 
 		/* IPV6_MULTICAST_IF */
-		np->mcast_oif = dev->ifindex;
+		WRITE_ONCE(np->mcast_oif, dev->ifindex);
 	}
 #endif
 	release_sock(sk);

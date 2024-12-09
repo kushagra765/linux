@@ -1033,9 +1033,7 @@ static int kbd_led_trigger_activate(struct led_classdev *cdev)
 
 	tasklet_disable(&keyboard_tasklet);
 	if (ledstate != -1U)
-		led_trigger_event(&trigger->trigger,
-				  ledstate & trigger->mask ?
-					LED_FULL : LED_OFF);
+		led_set_brightness(cdev, ledstate & trigger->mask ? LED_FULL : LED_OFF);
 	tasklet_enable(&keyboard_tasklet);
 
 	return 0;
@@ -1772,12 +1770,10 @@ int vt_do_diacrit(unsigned int cmd, void __user *udp, int perm)
 			return -EINVAL;
 
 		if (ct) {
-
-			dia = memdup_user(a->kbdiacr,
-					sizeof(struct kbdiacr) * ct);
+			dia = memdup_array_user(a->kbdiacr,
+						ct, sizeof(struct kbdiacr));
 			if (IS_ERR(dia))
 				return PTR_ERR(dia);
-
 		}
 
 		spin_lock_irqsave(&kbd_event_lock, flags);
@@ -1811,8 +1807,8 @@ int vt_do_diacrit(unsigned int cmd, void __user *udp, int perm)
 			return -EINVAL;
 
 		if (ct) {
-			buf = memdup_user(a->kbdiacruc,
-					  ct * sizeof(struct kbdiacruc));
+			buf = memdup_array_user(a->kbdiacruc,
+						ct, sizeof(struct kbdiacruc));
 			if (IS_ERR(buf))
 				return PTR_ERR(buf);
 		} 

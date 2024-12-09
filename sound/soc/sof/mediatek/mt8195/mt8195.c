@@ -82,7 +82,7 @@ static void mt8195_dsp_handle_request(struct mtk_adsp_ipc *ipc)
 	}
 }
 
-static struct mtk_adsp_ipc_ops dsp_ops = {
+static const struct mtk_adsp_ipc_ops dsp_ops = {
 	.handle_reply		= mt8195_dsp_handle_reply,
 	.handle_request		= mt8195_dsp_handle_request,
 };
@@ -95,29 +95,6 @@ static int platform_parse_resource(struct platform_device *pdev, void *data)
 	struct device *dev = &pdev->dev;
 	struct mtk_adsp_chip_info *adsp = data;
 	int ret;
-
-	mem_region = of_parse_phandle(dev->of_node, "memory-region", 0);
-	if (!mem_region) {
-		dev_err(dev, "no dma memory-region phandle\n");
-		return -ENODEV;
-	}
-
-	ret = of_address_to_resource(mem_region, 0, &res);
-	of_node_put(mem_region);
-	if (ret) {
-		dev_err(dev, "of_address_to_resource dma failed\n");
-		return ret;
-	}
-
-	dev_dbg(dev, "DMA %pR\n", &res);
-
-	adsp->pa_shared_dram = (phys_addr_t)res.start;
-	adsp->shared_size = resource_size(&res);
-	if (adsp->pa_shared_dram & DRAM_REMAP_MASK) {
-		dev_err(dev, "adsp shared dma memory(%#x) is not 4K-aligned\n",
-			(u32)adsp->pa_shared_dram);
-		return -EINVAL;
-	}
 
 	ret = of_reserved_mem_device_init(dev);
 	if (ret) {
@@ -238,26 +215,6 @@ static int adsp_memory_remap_init(struct device *dev, struct mtk_adsp_chip_info 
 	return 0;
 }
 
-static int adsp_shared_base_ioremap(struct platform_device *pdev, void *data)
-{
-	struct device *dev = &pdev->dev;
-	struct mtk_adsp_chip_info *adsp = data;
-
-	/* remap shared-dram base to be non-cachable */
-	adsp->shared_dram = devm_ioremap(dev, adsp->pa_shared_dram,
-					 adsp->shared_size);
-	if (!adsp->shared_dram) {
-		dev_err(dev, "failed to ioremap base %pa size %#x\n",
-			adsp->shared_dram, adsp->shared_size);
-		return -ENOMEM;
-	}
-
-	dev_dbg(dev, "shared-dram vbase=%p, phy addr :%pa,  size=%#x\n",
-		adsp->shared_dram, &adsp->pa_shared_dram, adsp->shared_size);
-
-	return 0;
-}
-
 static int mt8195_run(struct snd_sof_dev *sdev)
 {
 	u32 adsp_bootup_addr;
@@ -337,12 +294,6 @@ static int mt8195_dsp_probe(struct snd_sof_dev *sdev)
 		goto err_adsp_sram_power_off;
 	}
 	priv->adsp->va_dram = sdev->bar[SOF_FW_BLK_TYPE_SRAM];
-
-	ret = adsp_shared_base_ioremap(pdev, priv->adsp);
-	if (ret) {
-		dev_err(sdev->dev, "adsp_shared_base_ioremap fail!\n");
-		goto err_adsp_sram_power_off;
-	}
 
 	sdev->bar[DSP_REG_BAR] = priv->adsp->va_cfgreg;
 
@@ -554,7 +505,7 @@ static struct snd_soc_dai_driver mt8195_dai[] = {
 };
 
 /* mt8195 ops */
-static struct snd_sof_dsp_ops sof_mt8195_ops = {
+static const struct snd_sof_dsp_ops sof_mt8195_ops = {
 	/* probe and remove */
 	.probe		= mt8195_dsp_probe,
 	.remove		= mt8195_dsp_remove,
@@ -622,7 +573,10 @@ static struct snd_sof_dsp_ops sof_mt8195_ops = {
 static struct snd_sof_of_mach sof_mt8195_machs[] = {
 	{
 		.compatible = "google,tomato",
-		.sof_tplg_filename = "sof-mt8195-mt6359-rt1019-rt5682-dts.tplg"
+		.sof_tplg_filename = "sof-mt8195-mt6359-rt1019-rt5682.tplg"
+	}, {
+		.compatible = "google,dojo",
+		.sof_tplg_filename = "sof-mt8195-mt6359-max98390-rt5682.tplg"
 	}, {
 		.compatible = "mediatek,mt8195",
 		.sof_tplg_filename = "sof-mt8195.tplg"
@@ -658,7 +612,7 @@ MODULE_DEVICE_TABLE(of, sof_of_mt8195_ids);
 /* DT driver definition */
 static struct platform_driver snd_sof_of_mt8195_driver = {
 	.probe = sof_of_probe,
-	.remove_new = sof_of_remove,
+	.remove = sof_of_remove,
 	.shutdown = sof_of_shutdown,
 	.driver = {
 	.name = "sof-audio-of-mt8195",
@@ -668,6 +622,7 @@ static struct platform_driver snd_sof_of_mt8195_driver = {
 };
 module_platform_driver(snd_sof_of_mt8195_driver);
 
-MODULE_IMPORT_NS(SND_SOC_SOF_XTENSA);
-MODULE_IMPORT_NS(SND_SOC_SOF_MTK_COMMON);
 MODULE_LICENSE("Dual BSD/GPL");
+MODULE_DESCRIPTION("SOF support for MTL 8195 platforms");
+MODULE_IMPORT_NS("SND_SOC_SOF_XTENSA");
+MODULE_IMPORT_NS("SND_SOC_SOF_MTK_COMMON");

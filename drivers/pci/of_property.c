@@ -126,7 +126,7 @@ static int of_pci_prop_ranges(struct pci_dev *pdev, struct of_changeset *ocs,
 		if (of_pci_get_addr_flags(&res[j], &flags))
 			continue;
 
-		val64 = res[j].start;
+		val64 = pci_bus_address(pdev, &res[j] - pdev->resource);
 		of_pci_set_address(pdev, rp[i].parent_addr, val64, 0, flags,
 				   false);
 		if (pci_is_bridge(pdev)) {
@@ -181,6 +181,26 @@ static int of_pci_prop_interrupts(struct pci_dev *pdev,
 		return 0;
 
 	return of_changeset_add_prop_u32(ocs, np, "interrupts", (u32)pin);
+}
+
+static int of_pci_prop_intr_ctrl(struct pci_dev *pdev, struct of_changeset *ocs,
+				 struct device_node *np)
+{
+	int ret;
+	u8 pin;
+
+	ret = pci_read_config_byte(pdev, PCI_INTERRUPT_PIN, &pin);
+	if (ret != 0)
+		return ret;
+
+	if (!pin)
+		return 0;
+
+	ret = of_changeset_add_prop_u32(ocs, np, "#interrupt-cells", 1);
+	if (ret)
+		return ret;
+
+	return of_changeset_add_prop_bool(ocs, np, "interrupt-controller");
 }
 
 static int of_pci_prop_intr_map(struct pci_dev *pdev, struct of_changeset *ocs,
@@ -238,6 +258,8 @@ static int of_pci_prop_intr_map(struct pci_dev *pdev, struct of_changeset *ocs,
 		return 0;
 
 	int_map = kcalloc(map_sz, sizeof(u32), GFP_KERNEL);
+	if (!int_map)
+		return -ENOMEM;
 	mapp = int_map;
 
 	list_for_each_entry(child, &pdev->subordinate->devices, bus_list) {
@@ -332,6 +354,10 @@ int of_pci_add_properties(struct pci_dev *pdev, struct of_changeset *ocs,
 			return ret;
 
 		ret = of_pci_prop_intr_map(pdev, ocs, np);
+		if (ret)
+			return ret;
+	} else {
+		ret = of_pci_prop_intr_ctrl(pdev, ocs, np);
 		if (ret)
 			return ret;
 	}

@@ -327,8 +327,8 @@ int pci_iov_add_virtfn(struct pci_dev *dev, int id)
 		virtfn->resource[i].name = pci_name(virtfn);
 		virtfn->resource[i].flags = res->flags;
 		size = pci_iov_resource_size(dev, i + PCI_IOV_RESOURCES);
-		virtfn->resource[i].start = res->start + size * id;
-		virtfn->resource[i].end = virtfn->resource[i].start + size - 1;
+		resource_set_range(&virtfn->resource[i],
+				   res->start + size * id, size);
 		rc = request_resource(res, &virtfn->resource[i]);
 		BUG_ON(rc);
 	}
@@ -745,6 +745,7 @@ static int sriov_init(struct pci_dev *dev, int pos)
 	u16 ctrl, total;
 	struct pci_sriov *iov;
 	struct resource *res;
+	const char *res_name;
 	struct pci_dev *pdev;
 
 	pci_read_config_word(dev, pos + PCI_SRIOV_CTRL, &ctrl);
@@ -785,6 +786,8 @@ found:
 	nres = 0;
 	for (i = 0; i < PCI_SRIOV_NUM_BARS; i++) {
 		res = &dev->resource[i + PCI_IOV_RESOURCES];
+		res_name = pci_resource_name(dev, i + PCI_IOV_RESOURCES);
+
 		/*
 		 * If it is already FIXED, don't change it, something
 		 * (perhaps EA or header fixups) wants it this way.
@@ -801,9 +804,9 @@ found:
 			goto failed;
 		}
 		iov->barsz[i] = resource_size(res);
-		res->end = res->start + resource_size(res) * total - 1;
-		pci_info(dev, "VF(n) BAR%d space: %pR (contains BAR%d for %d VFs)\n",
-			 i, res, i, total);
+		resource_set_size(res, resource_size(res) * total);
+		pci_info(dev, "%s %pR: contains BAR %d for %d VFs\n",
+			 res_name, res, i, total);
 		i += bar64;
 		nres++;
 	}

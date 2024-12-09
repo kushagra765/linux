@@ -6,6 +6,8 @@
 #include <linux/debugfs.h>
 #include <linux/slab.h>
 
+#include <drm/drm_managed.h>
+
 #include "dpu_core_irq.h"
 #include "dpu_kms.h"
 #include "dpu_hw_interrupts.h"
@@ -221,9 +223,11 @@ static void dpu_core_irq_callback_handler(struct dpu_kms *dpu_kms, unsigned int 
 
 	VERB("IRQ=[%d, %d]\n", DPU_IRQ_REG(irq_idx), DPU_IRQ_BIT(irq_idx));
 
-	if (!irq_entry->cb)
+	if (!irq_entry->cb) {
 		DRM_ERROR("no registered cb, IRQ=[%d, %d]\n",
 			  DPU_IRQ_REG(irq_idx), DPU_IRQ_BIT(irq_idx));
+		return;
+	}
 
 	atomic_inc(&irq_entry->count);
 
@@ -233,6 +237,11 @@ static void dpu_core_irq_callback_handler(struct dpu_kms *dpu_kms, unsigned int 
 	irq_entry->cb(irq_entry->arg);
 }
 
+/**
+ * dpu_core_irq - core IRQ handler
+ * @kms:		MSM KMS handle
+ * @return:		interrupt handling status
+ */
 irqreturn_t dpu_core_irq(struct msm_kms *kms)
 {
 	struct dpu_kms *dpu_kms = to_dpu_kms(kms);
@@ -438,6 +447,12 @@ static void dpu_disable_all_irqs(struct dpu_kms *dpu_kms)
 	wmb();
 }
 
+/**
+ * dpu_core_irq_read - IRQ helper function for reading IRQ status
+ * @dpu_kms:		DPU handle
+ * @irq_idx:		irq index
+ * @return:		non-zero if irq detected; otherwise no irq detected
+ */
 u32 dpu_core_irq_read(struct dpu_kms *dpu_kms,
 		      unsigned int irq_idx)
 {
@@ -472,8 +487,15 @@ u32 dpu_core_irq_read(struct dpu_kms *dpu_kms,
 	return intr_status;
 }
 
-struct dpu_hw_intr *dpu_hw_intr_init(void __iomem *addr,
-		const struct dpu_mdss_cfg *m)
+/**
+ * dpu_hw_intr_init(): Initializes the interrupts hw object
+ * @dev:  Corresponding device for devres management
+ * @addr: mapped register io address of MDP
+ * @m:    pointer to MDSS catalog data
+ */
+struct dpu_hw_intr *dpu_hw_intr_init(struct drm_device *dev,
+				     void __iomem *addr,
+				     const struct dpu_mdss_cfg *m)
 {
 	struct dpu_hw_intr *intr;
 	unsigned int i;
@@ -481,7 +503,7 @@ struct dpu_hw_intr *dpu_hw_intr_init(void __iomem *addr,
 	if (!addr || !m)
 		return ERR_PTR(-EINVAL);
 
-	intr = kzalloc(sizeof(*intr), GFP_KERNEL);
+	intr = drmm_kzalloc(dev, sizeof(*intr), GFP_KERNEL);
 	if (!intr)
 		return ERR_PTR(-ENOMEM);
 
@@ -512,11 +534,17 @@ struct dpu_hw_intr *dpu_hw_intr_init(void __iomem *addr,
 	return intr;
 }
 
-void dpu_hw_intr_destroy(struct dpu_hw_intr *intr)
-{
-	kfree(intr);
-}
-
+/**
+ * dpu_core_irq_register_callback - For registering callback function on IRQ
+ *                             interrupt
+ * @dpu_kms:		DPU handle
+ * @irq_idx:		irq index
+ * @irq_cb:		IRQ callback function.
+ * @irq_arg:		IRQ callback argument.
+ * @return:		0 for success registering callback, otherwise failure
+ *
+ * This function supports registration of multiple callbacks for each interrupt.
+ */
 int dpu_core_irq_register_callback(struct dpu_kms *dpu_kms,
 				   unsigned int irq_idx,
 				   void (*irq_cb)(void *arg),
@@ -527,14 +555,14 @@ int dpu_core_irq_register_callback(struct dpu_kms *dpu_kms,
 	int ret;
 
 	if (!irq_cb) {
-		DPU_ERROR("invalid IRQ=[%d, %d] irq_cb:%ps\n",
-			  DPU_IRQ_REG(irq_idx), DPU_IRQ_BIT(irq_idx), irq_cb);
+		DPU_ERROR("IRQ=[%d, %d] NULL callback\n",
+			  DPU_IRQ_REG(irq_idx), DPU_IRQ_BIT(irq_idx));
 		return -EINVAL;
 	}
 
 	if (!dpu_core_irq_is_valid(irq_idx)) {
-		DPU_ERROR("invalid IRQ=[%d, %d]\n",
-			  DPU_IRQ_REG(irq_idx), DPU_IRQ_BIT(irq_idx));
+		DPU_ERROR("invalid IRQ=[%d, %d] irq_cb:%ps\n",
+			  DPU_IRQ_REG(irq_idx), DPU_IRQ_BIT(irq_idx), irq_cb);
 		return -EINVAL;
 	}
 
@@ -567,6 +595,15 @@ int dpu_core_irq_register_callback(struct dpu_kms *dpu_kms,
 	return 0;
 }
 
+/**
+ * dpu_core_irq_unregister_callback - For unregistering callback function on IRQ
+ *                             interrupt
+ * @dpu_kms:		DPU handle
+ * @irq_idx:		irq index
+ * @return:		0 for success registering callback, otherwise failure
+ *
+ * This function supports registration of multiple callbacks for each interrupt.
+ */
 int dpu_core_irq_unregister_callback(struct dpu_kms *dpu_kms,
 				     unsigned int irq_idx)
 {
@@ -628,6 +665,11 @@ static int dpu_debugfs_core_irq_show(struct seq_file *s, void *v)
 
 DEFINE_SHOW_ATTRIBUTE(dpu_debugfs_core_irq);
 
+/**
+ * dpu_debugfs_core_irq_init - register core irq debugfs
+ * @dpu_kms: pointer to kms
+ * @parent: debugfs directory root
+ */
 void dpu_debugfs_core_irq_init(struct dpu_kms *dpu_kms,
 		struct dentry *parent)
 {
@@ -636,6 +678,11 @@ void dpu_debugfs_core_irq_init(struct dpu_kms *dpu_kms,
 }
 #endif
 
+/**
+ * dpu_core_irq_preinstall - perform pre-installation of core IRQ handler
+ * @kms:		MSM KMS handle
+ * @return:		none
+ */
 void dpu_core_irq_preinstall(struct msm_kms *kms)
 {
 	struct dpu_kms *dpu_kms = to_dpu_kms(kms);
@@ -653,6 +700,11 @@ void dpu_core_irq_preinstall(struct msm_kms *kms)
 	}
 }
 
+/**
+ * dpu_core_irq_uninstall - uninstall core IRQ handler
+ * @kms:		MSM KMS handle
+ * @return:		none
+ */
 void dpu_core_irq_uninstall(struct msm_kms *kms)
 {
 	struct dpu_kms *dpu_kms = to_dpu_kms(kms);

@@ -26,7 +26,6 @@
 #include <media/v4l2-cci.h>
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
-#include <media/v4l2-event.h>
 #include <media/v4l2-fwnode.h>
 #include <media/v4l2-mediabus.h>
 
@@ -162,8 +161,8 @@ static const struct cci_reg_sequence imx219_common_regs[] = {
 	{ IMX219_REG_MODE_SELECT, 0x00 },	/* Mode Select */
 
 	/* To Access Addresses 3000-5fff, send the following commands */
-	{ CCI_REG8(0x30eb), 0x0c },
 	{ CCI_REG8(0x30eb), 0x05 },
+	{ CCI_REG8(0x30eb), 0x0c },
 	{ CCI_REG8(0x300a), 0xff },
 	{ CCI_REG8(0x300b), 0xff },
 	{ CCI_REG8(0x30eb), 0x05 },
@@ -374,7 +373,7 @@ static int imx219_set_ctrl(struct v4l2_ctrl *ctrl)
 	int ret = 0;
 
 	state = v4l2_subdev_get_locked_active_state(&imx219->sd);
-	format = v4l2_subdev_get_pad_format(&imx219->sd, state, 0);
+	format = v4l2_subdev_state_get_format(state, 0);
 
 	if (ctrl->id == V4L2_CID_VBLANK) {
 		int exposure_max, exposure_def;
@@ -551,8 +550,7 @@ static int imx219_init_controls(struct imx219 *imx219)
 
 	if (ctrl_hdlr->error) {
 		ret = ctrl_hdlr->error;
-		dev_err(&client->dev, "%s control init failed (%d)\n",
-			__func__, ret);
+		dev_err_probe(&client->dev, ret, "Control init failed\n");
 		goto error;
 	}
 
@@ -593,8 +591,8 @@ static int imx219_set_framefmt(struct imx219 *imx219,
 	u64 bin_h, bin_v;
 	int ret = 0;
 
-	format = v4l2_subdev_get_pad_format(&imx219->sd, state, 0);
-	crop = v4l2_subdev_get_pad_crop(&imx219->sd, state, 0);
+	format = v4l2_subdev_state_get_format(state, 0);
+	crop = v4l2_subdev_state_get_crop(state, 0);
 
 	switch (format->code) {
 	case MEDIA_BUS_FMT_SRGGB8_1X8:
@@ -826,7 +824,7 @@ static int imx219_set_pad_format(struct v4l2_subdev *sd,
 
 	imx219_update_pad_format(imx219, mode, &fmt->format, fmt->format.code);
 
-	format = v4l2_subdev_get_pad_format(sd, state, 0);
+	format = v4l2_subdev_state_get_format(state, 0);
 	*format = fmt->format;
 
 	/*
@@ -836,7 +834,7 @@ static int imx219_set_pad_format(struct v4l2_subdev *sd,
 	bin_h = min(IMX219_PIXEL_ARRAY_WIDTH / format->width, 2U);
 	bin_v = min(IMX219_PIXEL_ARRAY_HEIGHT / format->height, 2U);
 
-	crop = v4l2_subdev_get_pad_crop(sd, state, 0);
+	crop = v4l2_subdev_state_get_crop(state, 0);
 	crop->width = format->width * bin_h;
 	crop->height = format->height * bin_v;
 	crop->left = (IMX219_NATIVE_WIDTH - crop->width) / 2;
@@ -880,7 +878,7 @@ static int imx219_get_selection(struct v4l2_subdev *sd,
 {
 	switch (sel->target) {
 	case V4L2_SEL_TGT_CROP: {
-		sel->r = *v4l2_subdev_get_pad_crop(sd, state, 0);
+		sel->r = *v4l2_subdev_state_get_crop(state, 0);
 		return 0;
 	}
 
@@ -905,8 +903,8 @@ static int imx219_get_selection(struct v4l2_subdev *sd,
 	return -EINVAL;
 }
 
-static int imx219_init_cfg(struct v4l2_subdev *sd,
-			   struct v4l2_subdev_state *state)
+static int imx219_init_state(struct v4l2_subdev *sd,
+			     struct v4l2_subdev_state *state)
 {
 	struct v4l2_subdev_format fmt = {
 		.which = V4L2_SUBDEV_FORMAT_TRY,
@@ -923,17 +921,11 @@ static int imx219_init_cfg(struct v4l2_subdev *sd,
 	return 0;
 }
 
-static const struct v4l2_subdev_core_ops imx219_core_ops = {
-	.subscribe_event = v4l2_ctrl_subdev_subscribe_event,
-	.unsubscribe_event = v4l2_event_subdev_unsubscribe,
-};
-
 static const struct v4l2_subdev_video_ops imx219_video_ops = {
 	.s_stream = imx219_set_stream,
 };
 
 static const struct v4l2_subdev_pad_ops imx219_pad_ops = {
-	.init_cfg = imx219_init_cfg,
 	.enum_mbus_code = imx219_enum_mbus_code,
 	.get_fmt = v4l2_subdev_get_fmt,
 	.set_fmt = imx219_set_pad_format,
@@ -942,11 +934,13 @@ static const struct v4l2_subdev_pad_ops imx219_pad_ops = {
 };
 
 static const struct v4l2_subdev_ops imx219_subdev_ops = {
-	.core = &imx219_core_ops,
 	.video = &imx219_video_ops,
 	.pad = &imx219_pad_ops,
 };
 
+static const struct v4l2_subdev_internal_ops imx219_internal_ops = {
+	.init_state = imx219_init_state,
+};
 
 /* -----------------------------------------------------------------------------
  * Power management
@@ -1022,17 +1016,15 @@ static int imx219_identify_module(struct imx219 *imx219)
 	u64 val;
 
 	ret = cci_read(imx219->regmap, IMX219_REG_CHIP_ID, &val, NULL);
-	if (ret) {
-		dev_err(&client->dev, "failed to read chip id %x\n",
-			IMX219_CHIP_ID);
-		return ret;
-	}
+	if (ret)
+		return dev_err_probe(&client->dev, ret,
+				     "failed to read chip id %x\n",
+				     IMX219_CHIP_ID);
 
-	if (val != IMX219_CHIP_ID) {
-		dev_err(&client->dev, "chip id mismatch: %x!=%llx\n",
-			IMX219_CHIP_ID, val);
-		return -EIO;
-	}
+	if (val != IMX219_CHIP_ID)
+		return dev_err_probe(&client->dev, -EIO,
+				     "chip id mismatch: %x!=%llx\n",
+				     IMX219_CHIP_ID, val);
 
 	return 0;
 }
@@ -1046,35 +1038,36 @@ static int imx219_check_hwcfg(struct device *dev, struct imx219 *imx219)
 	int ret = -EINVAL;
 
 	endpoint = fwnode_graph_get_next_endpoint(dev_fwnode(dev), NULL);
-	if (!endpoint) {
-		dev_err(dev, "endpoint node not found\n");
-		return -EINVAL;
-	}
+	if (!endpoint)
+		return dev_err_probe(dev, -EINVAL, "endpoint node not found\n");
 
 	if (v4l2_fwnode_endpoint_alloc_parse(endpoint, &ep_cfg)) {
-		dev_err(dev, "could not parse endpoint\n");
+		dev_err_probe(dev, -EINVAL, "could not parse endpoint\n");
 		goto error_out;
 	}
 
 	/* Check the number of MIPI CSI2 data lanes */
 	if (ep_cfg.bus.mipi_csi2.num_data_lanes != 2 &&
 	    ep_cfg.bus.mipi_csi2.num_data_lanes != 4) {
-		dev_err(dev, "only 2 or 4 data lanes are currently supported\n");
+		dev_err_probe(dev, -EINVAL,
+			      "only 2 or 4 data lanes are currently supported\n");
 		goto error_out;
 	}
 	imx219->lanes = ep_cfg.bus.mipi_csi2.num_data_lanes;
 
 	/* Check the link frequency set in device tree */
 	if (!ep_cfg.nr_of_link_frequencies) {
-		dev_err(dev, "link-frequency property not found in DT\n");
+		dev_err_probe(dev, -EINVAL,
+			      "link-frequency property not found in DT\n");
 		goto error_out;
 	}
 
 	if (ep_cfg.nr_of_link_frequencies != 1 ||
 	   (ep_cfg.link_frequencies[0] != ((imx219->lanes == 2) ?
 	    IMX219_DEFAULT_LINK_FREQ : IMX219_DEFAULT_LINK_FREQ_4LANE))) {
-		dev_err(dev, "Link frequency not supported: %lld\n",
-			ep_cfg.link_frequencies[0]);
+		dev_err_probe(dev, -EINVAL,
+			      "Link frequency not supported: %lld\n",
+			      ep_cfg.link_frequencies[0]);
 		goto error_out;
 	}
 
@@ -1098,37 +1091,32 @@ static int imx219_probe(struct i2c_client *client)
 		return -ENOMEM;
 
 	v4l2_i2c_subdev_init(&imx219->sd, client, &imx219_subdev_ops);
+	imx219->sd.internal_ops = &imx219_internal_ops;
 
 	/* Check the hardware configuration in device tree */
 	if (imx219_check_hwcfg(dev, imx219))
 		return -EINVAL;
 
 	imx219->regmap = devm_cci_regmap_init_i2c(client, 16);
-	if (IS_ERR(imx219->regmap)) {
-		ret = PTR_ERR(imx219->regmap);
-		dev_err(dev, "failed to initialize CCI: %d\n", ret);
-		return ret;
-	}
+	if (IS_ERR(imx219->regmap))
+		return dev_err_probe(dev, PTR_ERR(imx219->regmap),
+				     "failed to initialize CCI\n");
 
 	/* Get system clock (xclk) */
 	imx219->xclk = devm_clk_get(dev, NULL);
-	if (IS_ERR(imx219->xclk)) {
-		dev_err(dev, "failed to get xclk\n");
-		return PTR_ERR(imx219->xclk);
-	}
+	if (IS_ERR(imx219->xclk))
+		return dev_err_probe(dev, PTR_ERR(imx219->xclk),
+				     "failed to get xclk\n");
 
 	imx219->xclk_freq = clk_get_rate(imx219->xclk);
-	if (imx219->xclk_freq != IMX219_XCLK_FREQ) {
-		dev_err(dev, "xclk frequency not supported: %d Hz\n",
-			imx219->xclk_freq);
-		return -EINVAL;
-	}
+	if (imx219->xclk_freq != IMX219_XCLK_FREQ)
+		return dev_err_probe(dev, -EINVAL,
+				     "xclk frequency not supported: %d Hz\n",
+				     imx219->xclk_freq);
 
 	ret = imx219_get_regulators(imx219);
-	if (ret) {
-		dev_err(dev, "failed to get regulators\n");
-		return ret;
-	}
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to get regulators\n");
 
 	/* Request optional enable pin */
 	imx219->reset_gpio = devm_gpiod_get_optional(dev, "reset",
@@ -1171,8 +1159,7 @@ static int imx219_probe(struct i2c_client *client)
 		goto error_power_off;
 
 	/* Initialize subdev */
-	imx219->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE |
-			    V4L2_SUBDEV_FL_HAS_EVENTS;
+	imx219->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
 	imx219->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
 
 	/* Initialize source pad */
@@ -1180,20 +1167,21 @@ static int imx219_probe(struct i2c_client *client)
 
 	ret = media_entity_pads_init(&imx219->sd.entity, 1, &imx219->pad);
 	if (ret) {
-		dev_err(dev, "failed to init entity pads: %d\n", ret);
+		dev_err_probe(dev, ret, "failed to init entity pads\n");
 		goto error_handler_free;
 	}
 
 	imx219->sd.state_lock = imx219->ctrl_handler.lock;
 	ret = v4l2_subdev_init_finalize(&imx219->sd);
 	if (ret < 0) {
-		dev_err(dev, "subdev init error: %d\n", ret);
+		dev_err_probe(dev, ret, "subdev init error\n");
 		goto error_media_entity;
 	}
 
 	ret = v4l2_async_register_subdev_sensor(&imx219->sd);
 	if (ret < 0) {
-		dev_err(dev, "failed to register sensor sub-device: %d\n", ret);
+		dev_err_probe(dev, ret,
+			      "failed to register sensor sub-device\n");
 		goto error_subdev_cleanup;
 	}
 

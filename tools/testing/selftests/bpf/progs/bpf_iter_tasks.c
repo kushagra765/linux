@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Copyright (c) 2020 Facebook */
-#include "bpf_iter.h"
+#include <vmlinux.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
@@ -22,7 +22,7 @@ int dump_task(struct bpf_iter__task *ctx)
 		return 0;
 	}
 
-	if (task->pid != tid)
+	if (task->pid != (pid_t)tid)
 		num_unknown_tid++;
 	else
 		num_known_tid++;

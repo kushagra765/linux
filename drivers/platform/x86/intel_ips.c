@@ -59,9 +59,10 @@
 #include <linux/tick.h>
 #include <linux/timer.h>
 #include <linux/dmi.h>
-#include <drm/i915_drm.h>
+#include <drm/intel/i915_drm.h>
 #include <asm/msr.h>
 #include <asm/processor.h>
+#include <asm/cpu_device_id.h>
 #include "intel_ips.h"
 
 #include <linux/io-64-nonatomic-lo-hi.h>
@@ -1114,39 +1115,6 @@ static int ips_monitor(void *data)
 	return 0;
 }
 
-#if 0
-#define THM_DUMPW(reg) \
-	{ \
-	u16 val = thm_readw(reg); \
-	dev_dbg(ips->dev, #reg ": 0x%04x\n", val); \
-	}
-#define THM_DUMPL(reg) \
-	{ \
-	u32 val = thm_readl(reg); \
-	dev_dbg(ips->dev, #reg ": 0x%08x\n", val); \
-	}
-#define THM_DUMPQ(reg) \
-	{ \
-	u64 val = thm_readq(reg); \
-	dev_dbg(ips->dev, #reg ": 0x%016x\n", val); \
-	}
-
-static void dump_thermal_info(struct ips_driver *ips)
-{
-	u16 ptl;
-
-	ptl = thm_readw(THM_PTL);
-	dev_dbg(ips->dev, "Processor temp limit: %d\n", ptl);
-
-	THM_DUMPW(THM_CTA);
-	THM_DUMPW(THM_TRC);
-	THM_DUMPW(THM_CTV1);
-	THM_DUMPL(THM_STS);
-	THM_DUMPW(THM_PTV);
-	THM_DUMPQ(THM_MGTV);
-}
-#endif
-
 /**
  * ips_irq_handler - handle temperature triggers and other IPS events
  * @irq: irq number
@@ -1317,7 +1285,7 @@ static struct ips_mcp_limits *ips_detect_cpu(struct ips_driver *ips)
 	struct ips_mcp_limits *limits = NULL;
 	u16 tdp;
 
-	if (!(boot_cpu_data.x86 == 6 && boot_cpu_data.x86_model == 37)) {
+	if (!(boot_cpu_data.x86_vfm == INTEL_WESTMERE)) {
 		dev_info(ips->dev, "Non-IPS CPU detected.\n");
 		return NULL;
 	}
@@ -1538,7 +1506,7 @@ static int ips_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	 * IRQ handler for ME interaction
 	 * Note: don't use MSI here as the PCH has bugs.
 	 */
-	ret = pci_alloc_irq_vectors(dev, 1, 1, PCI_IRQ_LEGACY);
+	ret = pci_alloc_irq_vectors(dev, 1, 1, PCI_IRQ_INTX);
 	if (ret < 0)
 		return ret;
 

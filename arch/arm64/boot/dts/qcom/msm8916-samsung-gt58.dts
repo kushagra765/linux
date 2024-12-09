@@ -35,6 +35,26 @@
 		pinctrl-names = "default";
 	};
 
+	i2c-amplifier {
+		compatible = "i2c-gpio";
+		sda-gpios = <&tlmm 55 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		scl-gpios = <&tlmm 56 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+
+		pinctrl-0 = <&amp_i2c_default>;
+		pinctrl-names = "default";
+
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		speaker_codec: audio-codec@34 {
+			compatible = "nxp,tfa9895";
+			reg = <0x34>;
+			vddd-supply = <&pm8916_l5>;
+			sound-name-prefix = "Speaker";
+			#sound-dai-cells = <0>;
+		};
+	};
+
 	vibrator {
 		compatible = "gpio-vibrator";
 		enable-gpios = <&tlmm 76 GPIO_ACTIVE_HIGH>;
@@ -55,6 +75,7 @@
 
 		touchscreen-size-x = <768>;
 		touchscreen-size-y = <1024>;
+		linux,keycodes = <KEY_APPSELECT KEY_BACK>;
 
 		vcca-supply = <&reg_vdd_tsp>;
 		vdd-supply = <&pm8916_l6>;
@@ -62,6 +83,10 @@
 		pinctrl-0 = <&tsp_int_default>;
 		pinctrl-names = "default";
 	};
+};
+
+&gpu {
+	status = "okay";
 };
 
 &mdss {
@@ -94,7 +119,21 @@
 	remote-endpoint = <&panel_in>;
 };
 
+&sound {
+	model = "samsung-a2015";
+	pinctrl-0 = <&cdc_pdm_default &sec_mi2s_default &secondary_mic_default>;
+	pinctrl-1 = <&cdc_pdm_sleep &sec_mi2s_sleep &secondary_mic_default>;
+	pinctrl-names = "default", "sleep";
+};
+
 &tlmm {
+	amp_i2c_default: amp-i2c-default-state {
+		pins = "gpio55", "gpio56";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
 	buckbooster_en_default: buckbooster-en-default-state {
 		pins = "gpio8";
 		function = "gpio";
@@ -121,6 +160,14 @@
 		function = "gpio";
 		drive-strength = <2>;
 		bias-disable;
+	};
+
+	secondary_mic_default: secondary-mic-default-state {
+		pins = "gpio98";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+		output-high;
 	};
 
 	tsp_int_default: tsp-int-default-state {

@@ -254,15 +254,13 @@ static int tegra_vip_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int tegra_vip_remove(struct platform_device *pdev)
+static void tegra_vip_remove(struct platform_device *pdev)
 {
 	struct tegra_vip *vip = platform_get_drvdata(pdev);
 
 	host1x_client_unregister(&vip->client);
 
 	pm_runtime_disable(&pdev->dev);
-
-	return 0;
 }
 
 #if defined(CONFIG_ARCH_TEGRA_2x_SOC)

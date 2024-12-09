@@ -311,7 +311,7 @@ static int vidioc_try_fmt_out(struct mtk_vcodec_enc_ctx *ctx, struct v4l2_format
 	pix_fmt_mp->height = clamp(pix_fmt_mp->height, MTK_VENC_MIN_H, max_height);
 	pix_fmt_mp->width = clamp(pix_fmt_mp->width, MTK_VENC_MIN_W, max_width);
 
-	/* find next closer width align 16, heign align 32, size align
+	/* find next closer width align 16, height align 32, size align
 	 * 64 rectangle
 	 */
 	tmp_w = pix_fmt_mp->width;
@@ -912,7 +912,7 @@ static int vb2ops_venc_start_streaming(struct vb2_queue *q, unsigned int count)
 	return 0;
 
 err_start_stream:
-	for (i = 0; i < q->num_buffers; ++i) {
+	for (i = 0; i < vb2_get_num_buffers(q); ++i) {
 		struct vb2_buffer *buf = vb2_get_buffer(q, i);
 
 		/*
@@ -1009,8 +1009,6 @@ static const struct vb2_ops mtk_venc_vb2_ops = {
 	.buf_out_validate	= vb2ops_venc_buf_out_validate,
 	.buf_prepare		= vb2ops_venc_buf_prepare,
 	.buf_queue		= vb2ops_venc_buf_queue,
-	.wait_prepare		= vb2_ops_wait_prepare,
-	.wait_finish		= vb2_ops_wait_finish,
 	.start_streaming	= vb2ops_venc_start_streaming,
 	.stop_streaming		= vb2ops_venc_stop_streaming,
 };

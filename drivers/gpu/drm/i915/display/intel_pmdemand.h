@@ -20,14 +20,14 @@ struct pmdemand_params {
 	u8 voltage_index;
 	u8 qclk_gv_index;
 	u8 active_pipes;
-	u8 active_dbufs;
+	u8 active_dbufs;	/* pre-Xe3 only */
 	/* Total number of non type C active phys from active_phys_mask */
 	u8 active_phys;
 	u8 plls;
 	u16 cdclk_freq_mhz;
 	/* max from ddi_clocks[] */
 	u16 ddiclk_max;
-	u8 scalers;
+	u8 scalers;		/* pre-Xe3 only */
 };
 
 struct intel_pmdemand_state {
@@ -43,9 +43,8 @@ struct intel_pmdemand_state {
 	struct pmdemand_params params;
 };
 
-#define to_intel_pmdemand_state(x) container_of((x), \
-						struct intel_pmdemand_state, \
-						base)
+#define to_intel_pmdemand_state(global_state) \
+	container_of_const((global_state), struct intel_pmdemand_state, base)
 
 void intel_pmdemand_init_early(struct drm_i915_private *i915);
 int intel_pmdemand_init(struct drm_i915_private *i915);

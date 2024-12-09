@@ -34,6 +34,7 @@
 #include <linux/mii.h>
 #include <linux/of_net.h>
 #include <linux/dmi.h>
+#include <linux/skbuff_ref.h>
 
 #include <asm/irq.h>
 
@@ -2383,7 +2384,7 @@ static int sky2_change_mtu(struct net_device *dev, int new_mtu)
 	u32 imask;
 
 	if (!netif_running(dev)) {
-		dev->mtu = new_mtu;
+		WRITE_ONCE(dev->mtu, new_mtu);
 		netdev_update_features(dev);
 		return 0;
 	}
@@ -2406,7 +2407,7 @@ static int sky2_change_mtu(struct net_device *dev, int new_mtu)
 	sky2_rx_stop(sky2);
 	sky2_rx_clean(sky2);
 
-	dev->mtu = new_mtu;
+	WRITE_ONCE(dev->mtu, new_mtu);
 	netdev_update_features(dev);
 
 	mode = DATA_BLIND_VAL(DATA_BLIND_DEF) |	GM_SMOD_VLAN_ENA;
@@ -3799,8 +3800,7 @@ static void sky2_get_strings(struct net_device *dev, u32 stringset, u8 * data)
 	switch (stringset) {
 	case ETH_SS_STATS:
 		for (i = 0; i < ARRAY_SIZE(sky2_stats); i++)
-			memcpy(data + i * ETH_GSTRING_LEN,
-			       sky2_stats[i].name, ETH_GSTRING_LEN);
+			ethtool_puts(&data, sky2_stats[i].name);
 		break;
 	}
 }

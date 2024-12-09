@@ -306,7 +306,7 @@ static int stm32_timers_probe(struct platform_device *pdev)
 	return ret;
 }
 
-static int stm32_timers_remove(struct platform_device *pdev)
+static void stm32_timers_remove(struct platform_device *pdev)
 {
 	struct stm32_timers *ddata = platform_get_drvdata(pdev);
 
@@ -316,8 +316,6 @@ static int stm32_timers_remove(struct platform_device *pdev)
 	 */
 	of_platform_depopulate(&pdev->dev);
 	stm32_timers_dma_remove(&pdev->dev, ddata);
-
-	return 0;
 }
 
 static const struct of_device_id stm32_timers_of_match[] = {

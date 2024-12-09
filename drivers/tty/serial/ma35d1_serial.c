@@ -558,7 +558,7 @@ static void ma35d1serial_console_write(struct console *co, const char *s, u32 co
 	u32 ier;
 
 	if ((co->index < 0) || (co->index >= MA35_UART_NR)) {
-		pr_warn("Failed to write on ononsole port %x, out of range\n",
+		pr_warn("Failed to write on console port %x, out of range\n",
 			co->index);
 		return;
 	}
@@ -688,12 +688,13 @@ static int ma35d1serial_probe(struct platform_device *pdev)
 	struct uart_ma35d1_port *up;
 	int ret = 0;
 
-	if (pdev->dev.of_node) {
-		ret = of_alias_get_id(pdev->dev.of_node, "serial");
-		if (ret < 0) {
-			dev_err(&pdev->dev, "failed to get alias/pdev id, errno %d\n", ret);
-			return ret;
-		}
+	if (!pdev->dev.of_node)
+		return -ENODEV;
+
+	ret = of_alias_get_id(pdev->dev.of_node, "serial");
+	if (ret < 0) {
+		dev_err(&pdev->dev, "failed to get alias/pdev id, errno %d\n", ret);
+		return ret;
 	}
 	up = &ma35d1serial_ports[ret];
 	up->port.line = ret;
@@ -754,14 +755,13 @@ err_iounmap:
 /*
  * Remove serial ports registered against a platform device.
  */
-static int ma35d1serial_remove(struct platform_device *dev)
+static void ma35d1serial_remove(struct platform_device *dev)
 {
 	struct uart_port *port = platform_get_drvdata(dev);
 	struct uart_ma35d1_port *up = to_ma35d1_uart_port(port);
 
 	uart_remove_one_port(&ma35d1serial_reg, port);
 	clk_disable_unprepare(up->clk);
-	return 0;
 }
 
 static int ma35d1serial_suspend(struct platform_device *dev, pm_message_t state)

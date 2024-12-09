@@ -133,9 +133,36 @@ static void amdgpu_amdkfd_reset_work(struct work_struct *work)
 
 	reset_context.method = AMD_RESET_METHOD_NONE;
 	reset_context.reset_req_dev = adev;
+	reset_context.src = adev->enable_mes ?
+			    AMDGPU_RESET_SRC_MES :
+			    AMDGPU_RESET_SRC_HWS;
 	clear_bit(AMDGPU_NEED_FULL_RESET, &reset_context.flags);
 
 	amdgpu_device_gpu_recover(adev, NULL, &reset_context);
+}
+
+static const struct drm_client_funcs kfd_client_funcs = {
+	.unregister	= drm_client_release,
+};
+
+int amdgpu_amdkfd_drm_client_create(struct amdgpu_device *adev)
+{
+	int ret;
+
+	if (!adev->kfd.init_complete || adev->kfd.client.dev)
+		return 0;
+
+	ret = drm_client_init(&adev->ddev, &adev->kfd.client, "kfd",
+			      &kfd_client_funcs);
+	if (ret) {
+		dev_err(adev->dev, "Failed to init DRM client: %d\n",
+			ret);
+		return ret;
+	}
+
+	drm_client_register(&adev->kfd.client);
+
+	return 0;
 }
 
 void amdgpu_amdkfd_device_init(struct amdgpu_device *adev)
@@ -237,12 +264,13 @@ int amdgpu_amdkfd_resume(struct amdgpu_device *adev, bool run_pm)
 	return r;
 }
 
-int amdgpu_amdkfd_pre_reset(struct amdgpu_device *adev)
+int amdgpu_amdkfd_pre_reset(struct amdgpu_device *adev,
+			    struct amdgpu_reset_context *reset_context)
 {
 	int r = 0;
 
 	if (adev->kfd.dev)
-		r = kgd2kfd_pre_reset(adev->kfd.dev);
+		r = kgd2kfd_pre_reset(adev->kfd.dev, reset_context);
 
 	return r;
 }
@@ -336,15 +364,15 @@ allocate_mem_reserve_bo_failed:
 	return r;
 }
 
-void amdgpu_amdkfd_free_gtt_mem(struct amdgpu_device *adev, void *mem_obj)
+void amdgpu_amdkfd_free_gtt_mem(struct amdgpu_device *adev, void **mem_obj)
 {
-	struct amdgpu_bo *bo = (struct amdgpu_bo *) mem_obj;
+	struct amdgpu_bo **bo = (struct amdgpu_bo **) mem_obj;
 
-	amdgpu_bo_reserve(bo, true);
-	amdgpu_bo_kunmap(bo);
-	amdgpu_bo_unpin(bo);
-	amdgpu_bo_unreserve(bo);
-	amdgpu_bo_unref(&(bo));
+	amdgpu_bo_reserve(*bo, true);
+	amdgpu_bo_kunmap(*bo);
+	amdgpu_bo_unpin(*bo);
+	amdgpu_bo_unreserve(*bo);
+	amdgpu_bo_unref(bo);
 }
 
 int amdgpu_amdkfd_alloc_gws(struct amdgpu_device *adev, size_t size,
@@ -431,6 +459,9 @@ void amdgpu_amdkfd_get_local_mem_info(struct amdgpu_device *adev,
 		else
 			mem_info->local_mem_size_private =
 					KFD_XCP_MEMORY_SIZE(adev, xcp->id);
+	} else if (adev->flags & AMD_IS_APU) {
+		mem_info->local_mem_size_public = (ttm_tt_pages_limit() << PAGE_SHIFT);
+		mem_info->local_mem_size_private = 0;
 	} else {
 		mem_info->local_mem_size_public = adev->gmc.visible_vram_size;
 		mem_info->local_mem_size_private = adev->gmc.real_vram_size -
@@ -684,10 +715,8 @@ err:
 void amdgpu_amdkfd_set_compute_idle(struct amdgpu_device *adev, bool idle)
 {
 	enum amd_powergating_state state = idle ? AMD_PG_STATE_GATE : AMD_PG_STATE_UNGATE;
-	/* Temporary workaround to fix issues observed in some
-	 * compute applications when GFXOFF is enabled on GFX11.
-	 */
-	if (IP_VERSION_MAJ(amdgpu_ip_version(adev, GC_HWIP, 0)) == 11) {
+	if (IP_VERSION_MAJ(amdgpu_ip_version(adev, GC_HWIP, 0)) == 11 &&
+	    ((adev->mes.kiq_version & AMDGPU_MES_VERSION_MASK) <= 64)) {
 		pr_debug("GFXOFF is %s\n", idle ? "enabled" : "disabled");
 		amdgpu_gfx_off_ctrl(adev, idle);
 	} else if ((IP_VERSION_MAJ(amdgpu_ip_version(adev, GC_HWIP, 0)) == 9) &&
@@ -710,35 +739,6 @@ bool amdgpu_amdkfd_is_kfd_vmid(struct amdgpu_device *adev, u32 vmid)
 	return false;
 }
 
-int amdgpu_amdkfd_flush_gpu_tlb_vmid(struct amdgpu_device *adev,
-				     uint16_t vmid)
-{
-	if (adev->family == AMDGPU_FAMILY_AI) {
-		int i;
-
-		for_each_set_bit(i, adev->vmhubs_mask, AMDGPU_MAX_VMHUBS)
-			amdgpu_gmc_flush_gpu_tlb(adev, vmid, i, 0);
-	} else {
-		amdgpu_gmc_flush_gpu_tlb(adev, vmid, AMDGPU_GFXHUB(0), 0);
-	}
-
-	return 0;
-}
-
-int amdgpu_amdkfd_flush_gpu_tlb_pasid(struct amdgpu_device *adev,
-				      uint16_t pasid,
-				      enum TLB_FLUSH_TYPE flush_type,
-				      uint32_t inst)
-{
-	bool all_hub = false;
-
-	if (adev->family == AMDGPU_FAMILY_AI ||
-	    adev->family == AMDGPU_FAMILY_RV)
-		all_hub = true;
-
-	return amdgpu_gmc_flush_gpu_tlb_pasid(adev, pasid, flush_type, all_hub, inst);
-}
-
 bool amdgpu_amdkfd_have_atomics_support(struct amdgpu_device *adev)
 {
 	return adev->have_atomics_support;
@@ -749,9 +749,22 @@ void amdgpu_amdkfd_debug_mem_fence(struct amdgpu_device *adev)
 	amdgpu_device_flush_hdp(adev, NULL);
 }
 
-void amdgpu_amdkfd_ras_poison_consumption_handler(struct amdgpu_device *adev, bool reset)
+bool amdgpu_amdkfd_is_fed(struct amdgpu_device *adev)
 {
-	amdgpu_umc_poison_handler(adev, reset);
+	return amdgpu_ras_get_fed_status(adev);
+}
+
+void amdgpu_amdkfd_ras_pasid_poison_consumption_handler(struct amdgpu_device *adev,
+				enum amdgpu_ras_block block, uint16_t pasid,
+				pasid_notify pasid_fn, void *data, uint32_t reset)
+{
+	amdgpu_umc_pasid_poison_handler(adev, block, pasid, pasid_fn, data, reset);
+}
+
+void amdgpu_amdkfd_ras_poison_consumption_handler(struct amdgpu_device *adev,
+	enum amdgpu_ras_block block, uint32_t reset)
+{
+	amdgpu_umc_pasid_poison_handler(adev, block, 0, NULL, NULL, reset);
 }
 
 int amdgpu_amdkfd_send_close_event_drain_irq(struct amdgpu_device *adev,
@@ -768,14 +781,6 @@ int amdgpu_amdkfd_send_close_event_drain_irq(struct amdgpu_device *adev,
 	amdgpu_amdkfd_interrupt(adev, payload);
 
 	return 0;
-}
-
-bool amdgpu_amdkfd_ras_query_utcl2_poison_status(struct amdgpu_device *adev)
-{
-	if (adev->gfx.ras && adev->gfx.ras->query_utcl2_poison_status)
-		return adev->gfx.ras->query_utcl2_poison_status(adev);
-	else
-		return false;
 }
 
 int amdgpu_amdkfd_check_and_lock_kfd(struct amdgpu_device *adev)
@@ -810,6 +815,8 @@ u64 amdgpu_amdkfd_xcp_memory_size(struct amdgpu_device *adev, int xcp_id)
 		}
 		do_div(tmp, adev->xcp_mgr->num_xcp_per_mem_partition);
 		return ALIGN_DOWN(tmp, PAGE_SIZE);
+	} else if (adev->flags & AMD_IS_APU) {
+		return (ttm_tt_pages_limit() << PAGE_SHIFT);
 	} else {
 		return adev->gmc.real_vram_size;
 	}
@@ -826,6 +833,9 @@ int amdgpu_amdkfd_unmap_hiq(struct amdgpu_device *adev, u32 doorbell_off,
 
 	if (!kiq->pmf || !kiq->pmf->kiq_unmap_queues)
 		return -EINVAL;
+
+	if (!kiq_ring->sched.ready || adev->job_hang)
+		return 0;
 
 	ring_funcs = kzalloc(sizeof(*ring_funcs), GFP_KERNEL);
 	if (!ring_funcs)
@@ -851,8 +861,14 @@ int amdgpu_amdkfd_unmap_hiq(struct amdgpu_device *adev, u32 doorbell_off,
 
 	kiq->pmf->kiq_unmap_queues(kiq_ring, ring, RESET_QUEUES, 0, 0);
 
-	if (kiq_ring->sched.ready && !adev->job_hang)
-		r = amdgpu_ring_test_helper(kiq_ring);
+	/* Submit unmap queue packet */
+	amdgpu_ring_commit(kiq_ring);
+	/*
+	 * Ring test will do a basic scratch register change check. Just run
+	 * this to ensure that unmap queues that is submitted before got
+	 * processed successfully before returning.
+	 */
+	r = amdgpu_ring_test_helper(kiq_ring);
 
 	spin_unlock(&kiq->ring_lock);
 
@@ -861,6 +877,48 @@ free_ring:
 
 free_ring_funcs:
 	kfree(ring_funcs);
+
+	return r;
+}
+
+/* Stop scheduling on KFD */
+int amdgpu_amdkfd_stop_sched(struct amdgpu_device *adev, uint32_t node_id)
+{
+	if (!adev->kfd.init_complete)
+		return 0;
+
+	return kgd2kfd_stop_sched(adev->kfd.dev, node_id);
+}
+
+/* Start scheduling on KFD */
+int amdgpu_amdkfd_start_sched(struct amdgpu_device *adev, uint32_t node_id)
+{
+	if (!adev->kfd.init_complete)
+		return 0;
+
+	return kgd2kfd_start_sched(adev->kfd.dev, node_id);
+}
+
+/* check if there are KFD queues active */
+bool amdgpu_amdkfd_compute_active(struct amdgpu_device *adev, uint32_t node_id)
+{
+	if (!adev->kfd.init_complete)
+		return false;
+
+	return kgd2kfd_compute_active(adev->kfd.dev, node_id);
+}
+
+/* Config CGTT_SQ_CLK_CTRL */
+int amdgpu_amdkfd_config_sq_perfmon(struct amdgpu_device *adev, uint32_t xcp_id,
+	bool core_override_enable, bool reg_override_enable, bool perfmon_override_enable)
+{
+	int r;
+
+	if (!adev->kfd.init_complete)
+		return 0;
+
+	r = psp_config_sq_perfmon(&adev->psp, xcp_id, core_override_enable,
+					reg_override_enable, perfmon_override_enable);
 
 	return r;
 }

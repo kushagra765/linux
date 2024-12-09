@@ -248,7 +248,7 @@ static int __red_change(struct Qdisc *sch, struct nlattr **tb,
 	    tb[TCA_RED_STAB] == NULL)
 		return -EINVAL;
 
-	max_P = tb[TCA_RED_MAX_P] ? nla_get_u32(tb[TCA_RED_MAX_P]) : 0;
+	max_P = nla_get_u32_default(tb[TCA_RED_MAX_P], 0);
 
 	ctl = nla_data(tb[TCA_RED_PARMS]);
 	stab = nla_data(tb[TCA_RED_STAB]);
@@ -548,6 +548,7 @@ static struct Qdisc_ops red_qdisc_ops __read_mostly = {
 	.dump_stats	=	red_dump_stats,
 	.owner		=	THIS_MODULE,
 };
+MODULE_ALIAS_NET_SCH("red");
 
 static int __init red_module_init(void)
 {

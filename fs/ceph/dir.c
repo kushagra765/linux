@@ -141,7 +141,7 @@ __dcache_find_get_entry(struct dentry *parent, u64 idx,
 	if (ptr_pos >= i_size_read(dir))
 		return NULL;
 
-	if (!cache_ctl->page || ptr_pgoff != page_index(cache_ctl->page)) {
+	if (!cache_ctl->page || ptr_pgoff != cache_ctl->page->index) {
 		ceph_readdir_cache_release(cache_ctl);
 		cache_ctl->page = find_lock_page(&dir->i_data, ptr_pgoff);
 		if (!cache_ctl->page) {
@@ -174,7 +174,7 @@ __dcache_find_get_entry(struct dentry *parent, u64 idx,
 /*
  * When possible, we try to satisfy a readdir by peeking at the
  * dcache.  We make this work by carefully ordering dentries on
- * d_child when we initially get results back from the MDS, and
+ * d_children when we initially get results back from the MDS, and
  * falling back to a "normal" sync readdir if any dentries in the dir
  * are dropped.
  *
@@ -207,7 +207,7 @@ static int __dcache_readdir(struct file *file,  struct dir_context *ctx,
 			dentry = __dcache_find_get_entry(parent, idx + step,
 							 &cache_ctl);
 			if (!dentry) {
-				/* use linar search */
+				/* use linear search */
 				idx = 0;
 				break;
 			}
@@ -659,7 +659,7 @@ static bool need_reset_readdir(struct ceph_dir_file_info *dfi, loff_t new_pos)
 		return true;
 	if (is_hash_order(new_pos)) {
 		/* no need to reset last_name for a forward seek when
-		 * dentries are sotred in hash order */
+		 * dentries are sorted in hash order */
 	} else if (dfi->frag != fpos_frag(new_pos)) {
 		return true;
 	}
@@ -707,7 +707,6 @@ static loff_t ceph_dir_llseek(struct file *file, loff_t offset, int whence)
 
 		if (offset != file->f_pos) {
 			file->f_pos = offset;
-			file->f_version = 0;
 			dfi->file_info.flags &= ~CEPH_F_ATEND;
 		}
 		retval = offset;
@@ -1336,8 +1335,12 @@ static int ceph_unlink(struct inode *dir, struct dentry *dentry)
 	struct inode *inode = d_inode(dentry);
 	struct ceph_mds_request *req;
 	bool try_async = ceph_test_mount_opt(fsc, ASYNC_DIROPS);
+	struct dentry *dn;
 	int err = -EROFS;
 	int op;
+	char *path;
+	int pathlen;
+	u64 pathbase;
 
 	if (ceph_snap(dir) == CEPH_SNAPDIR) {
 		/* rmdir .snap/foo is RMSNAP */
@@ -1351,6 +1354,30 @@ static int ceph_unlink(struct inode *dir, struct dentry *dentry)
 			CEPH_MDS_OP_RMDIR : CEPH_MDS_OP_UNLINK;
 	} else
 		goto out;
+
+	dn = d_find_alias(dir);
+	if (!dn) {
+		try_async = false;
+	} else {
+		path = ceph_mdsc_build_path(mdsc, dn, &pathlen, &pathbase, 0);
+		if (IS_ERR(path)) {
+			try_async = false;
+			err = 0;
+		} else {
+			err = ceph_mds_check_access(mdsc, path, MAY_WRITE);
+		}
+		ceph_mdsc_free_path(path, pathlen);
+		dput(dn);
+
+		/* For none EACCES cases will let the MDS do the mds auth check */
+		if (err == -EACCES) {
+			return err;
+		} else if (err < 0) {
+			try_async = false;
+			err = 0;
+		}
+	}
+
 retry:
 	req = ceph_mdsc_create_request(mdsc, op, USE_AUTH_MDS);
 	if (IS_ERR(req)) {
@@ -1561,7 +1588,7 @@ void __ceph_dentry_dir_lease_touch(struct ceph_dentry_info *di)
 	}
 
 	spin_lock(&mdsc->dentry_list_lock);
-	__dentry_dir_lease_touch(mdsc, di),
+	__dentry_dir_lease_touch(mdsc, di);
 	spin_unlock(&mdsc->dentry_list_lock);
 }
 
@@ -1593,10 +1620,12 @@ struct ceph_lease_walk_control {
 	unsigned long dir_lease_ttl;
 };
 
+static int __dir_lease_check(const struct dentry *, struct ceph_lease_walk_control *);
+static int __dentry_lease_check(const struct dentry *);
+
 static unsigned long
 __dentry_leases_walk(struct ceph_mds_client *mdsc,
-		     struct ceph_lease_walk_control *lwc,
-		     int (*check)(struct dentry*, void*))
+		     struct ceph_lease_walk_control *lwc)
 {
 	struct ceph_dentry_info *di, *tmp;
 	struct dentry *dentry, *last = NULL;
@@ -1624,7 +1653,10 @@ __dentry_leases_walk(struct ceph_mds_client *mdsc,
 			goto next;
 		}
 
-		ret = check(dentry, lwc);
+		if (lwc->dir_lease)
+			ret = __dir_lease_check(dentry, lwc);
+		else
+			ret = __dentry_lease_check(dentry);
 		if (ret & TOUCH) {
 			/* move it into tail of dir lease list */
 			__dentry_dir_lease_touch(mdsc, di);
@@ -1681,7 +1713,7 @@ next:
 	return freed;
 }
 
-static int __dentry_lease_check(struct dentry *dentry, void *arg)
+static int __dentry_lease_check(const struct dentry *dentry)
 {
 	struct ceph_dentry_info *di = ceph_dentry(dentry);
 	int ret;
@@ -1696,9 +1728,9 @@ static int __dentry_lease_check(struct dentry *dentry, void *arg)
 	return DELETE;
 }
 
-static int __dir_lease_check(struct dentry *dentry, void *arg)
+static int __dir_lease_check(const struct dentry *dentry,
+			     struct ceph_lease_walk_control *lwc)
 {
-	struct ceph_lease_walk_control *lwc = arg;
 	struct ceph_dentry_info *di = ceph_dentry(dentry);
 
 	int ret = __dir_lease_try_check(dentry);
@@ -1737,7 +1769,7 @@ int ceph_trim_dentries(struct ceph_mds_client *mdsc)
 
 	lwc.dir_lease = false;
 	lwc.nr_to_scan  = CEPH_CAPS_PER_RELEASE * 2;
-	freed = __dentry_leases_walk(mdsc, &lwc, __dentry_lease_check);
+	freed = __dentry_leases_walk(mdsc, &lwc);
 	if (!lwc.nr_to_scan) /* more invalid leases */
 		return -EAGAIN;
 
@@ -1747,7 +1779,7 @@ int ceph_trim_dentries(struct ceph_mds_client *mdsc)
 	lwc.dir_lease = true;
 	lwc.expire_dir_lease = freed < count;
 	lwc.dir_lease_ttl = mdsc->fsc->mount_options->caps_wanted_delay_max * HZ;
-	freed +=__dentry_leases_walk(mdsc, &lwc, __dir_lease_check);
+	freed +=__dentry_leases_walk(mdsc, &lwc);
 	if (!lwc.nr_to_scan) /* more to check */
 		return -EAGAIN;
 
@@ -2026,7 +2058,7 @@ static int ceph_d_delete(const struct dentry *dentry)
 		return 0;
 	if (ceph_snap(d_inode(dentry)) != CEPH_NOSNAP)
 		return 0;
-	/* vaild lease? */
+	/* valid lease? */
 	di = ceph_dentry(dentry);
 	if (di) {
 		if (__dentry_lease_is_valid(di))

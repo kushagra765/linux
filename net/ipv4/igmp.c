@@ -120,12 +120,12 @@
  */
 
 #define IGMP_V1_SEEN(in_dev) \
-	(IPV4_DEVCONF_ALL(dev_net(in_dev->dev), FORCE_IGMP_VERSION) == 1 || \
+	(IPV4_DEVCONF_ALL_RO(dev_net(in_dev->dev), FORCE_IGMP_VERSION) == 1 || \
 	 IN_DEV_CONF_GET((in_dev), FORCE_IGMP_VERSION) == 1 || \
 	 ((in_dev)->mr_v1_seen && \
 	  time_before(jiffies, (in_dev)->mr_v1_seen)))
 #define IGMP_V2_SEEN(in_dev) \
-	(IPV4_DEVCONF_ALL(dev_net(in_dev->dev), FORCE_IGMP_VERSION) == 2 || \
+	(IPV4_DEVCONF_ALL_RO(dev_net(in_dev->dev), FORCE_IGMP_VERSION) == 2 || \
 	 IN_DEV_CONF_GET((in_dev), FORCE_IGMP_VERSION) == 2 || \
 	 ((in_dev)->mr_v2_seen && \
 	  time_before(jiffies, (in_dev)->mr_v2_seen)))
@@ -1437,16 +1437,32 @@ static void ip_mc_hash_remove(struct in_device *in_dev,
 static void ____ip_mc_inc_group(struct in_device *in_dev, __be32 addr,
 				unsigned int mode, gfp_t gfp)
 {
+	struct ip_mc_list __rcu **mc_hash;
 	struct ip_mc_list *im;
 
 	ASSERT_RTNL();
 
-	for_each_pmc_rtnl(in_dev, im) {
-		if (im->multiaddr == addr) {
-			im->users++;
-			ip_mc_add_src(in_dev, &addr, mode, 0, NULL, 0);
-			goto out;
+	mc_hash = rtnl_dereference(in_dev->mc_hash);
+	if (mc_hash) {
+		u32 hash = hash_32((__force u32)addr, MC_HASH_SZ_LOG);
+
+		for (im = rtnl_dereference(mc_hash[hash]);
+		     im;
+		     im = rtnl_dereference(im->next_hash)) {
+			if (im->multiaddr == addr)
+				break;
 		}
+	} else {
+		for_each_pmc_rtnl(in_dev, im) {
+			if (im->multiaddr == addr)
+				break;
+		}
+	}
+
+	if  (im) {
+		im->users++;
+		ip_mc_add_src(in_dev, &addr, mode, 0, NULL, 0);
+		goto out;
 	}
 
 	im = kzalloc(sizeof(*im), gfp);
@@ -1842,7 +1858,8 @@ static struct in_device *ip_mc_find_dev(struct net *net, struct ip_mreqn *imr)
 	if (!dev) {
 		struct rtable *rt = ip_route_output(net,
 						    imr->imr_multiaddr.s_addr,
-						    0, 0, 0);
+						    0, 0, 0,
+						    RT_SCOPE_UNIVERSE);
 		if (!IS_ERR(rt)) {
 			dev = rt->dst.dev;
 			ip_rt_put(rt);

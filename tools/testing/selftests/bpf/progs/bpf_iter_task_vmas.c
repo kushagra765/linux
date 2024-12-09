@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Copyright (c) 2020 Facebook */
-#include "bpf_iter.h"
+#include <vmlinux.h>
 #include <bpf/bpf_helpers.h>
 
 char _license[] SEC("license") = "GPL";
@@ -35,7 +35,7 @@ SEC("iter/task_vma") int proc_maps(struct bpf_iter__task_vma *ctx)
 		return 0;
 
 	file = vma->vm_file;
-	if (task->tgid != pid) {
+	if (task->tgid != (pid_t)pid) {
 		if (one_task)
 			one_task_error = 1;
 		return 0;

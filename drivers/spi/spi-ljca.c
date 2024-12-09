@@ -223,7 +223,7 @@ static int ljca_spi_probe(struct auxiliary_device *auxdev,
 	struct ljca_spi_dev *ljca_spi;
 	int ret;
 
-	controller = devm_spi_alloc_master(&auxdev->dev, sizeof(*ljca_spi));
+	controller = devm_spi_alloc_host(&auxdev->dev, sizeof(*ljca_spi));
 	if (!controller)
 		return -ENOMEM;
 
@@ -294,4 +294,4 @@ MODULE_AUTHOR("Zhifeng Wang <zhifeng.wang@intel.com>");
 MODULE_AUTHOR("Lixu Zhang <lixu.zhang@intel.com>");
 MODULE_DESCRIPTION("Intel La Jolla Cove Adapter USB-SPI driver");
 MODULE_LICENSE("GPL");
-MODULE_IMPORT_NS(LJCA);
+MODULE_IMPORT_NS("LJCA");

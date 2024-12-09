@@ -22,7 +22,7 @@ static void mt76x02_pre_tbtt_tasklet(struct tasklet_struct *t)
 	struct sk_buff *skb;
 	int i;
 
-	if (mt76_hw(dev)->conf.flags & IEEE80211_CONF_OFFCHANNEL)
+	if (dev->mphy.offchannel)
 		return;
 
 	__skb_queue_head_init(&data.q);
@@ -199,13 +199,14 @@ int mt76x02_dma_init(struct mt76x02_dev *dev)
 	for (i = 0; i < IEEE80211_NUM_ACS; i++) {
 		ret = mt76_init_tx_queue(&dev->mphy, i, mt76_ac_to_hwq(i),
 					 MT76x02_TX_RING_SIZE,
-					 MT_TX_RING_BASE, 0);
+					 MT_TX_RING_BASE, NULL, 0);
 		if (ret)
 			return ret;
 	}
 
 	ret = mt76_init_tx_queue(&dev->mphy, MT_TXQ_PSD, MT_TX_HW_QUEUE_MGMT,
-				 MT76x02_PSD_RING_SIZE, MT_TX_RING_BASE, 0);
+				 MT76x02_PSD_RING_SIZE, MT_TX_RING_BASE,
+				 NULL, 0);
 	if (ret)
 		return ret;
 
@@ -238,7 +239,7 @@ int mt76x02_dma_init(struct mt76x02_dev *dev)
 	if (ret)
 		return ret;
 
-	netif_napi_add_tx(&dev->mt76.tx_napi_dev, &dev->mt76.tx_napi,
+	netif_napi_add_tx(dev->mt76.tx_napi_dev, &dev->mt76.tx_napi,
 			  mt76x02_poll_tx);
 	napi_enable(&dev->mt76.tx_napi);
 

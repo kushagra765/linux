@@ -20,6 +20,7 @@
 #include <linux/iommu.h>
 #include <linux/file.h>
 #include <linux/mm.h>
+#include <linux/rcupdate_wait.h>
 
 #include <asm/kvm_ppc.h>
 #include <asm/kvm_book3s.h>
@@ -114,22 +115,19 @@ long kvm_spapr_tce_attach_iommu_group(struct kvm *kvm, int tablefd,
 	struct iommu_table_group *table_group;
 	long i;
 	struct kvmppc_spapr_tce_iommu_table *stit;
-	struct fd f;
+	CLASS(fd, f)(tablefd);
 
-	f = fdget(tablefd);
-	if (!f.file)
+	if (fd_empty(f))
 		return -EBADF;
 
 	rcu_read_lock();
 	list_for_each_entry_rcu(stt, &kvm->arch.spapr_tce_tables, list) {
-		if (stt == f.file->private_data) {
+		if (stt == fd_file(f)->private_data) {
 			found = true;
 			break;
 		}
 	}
 	rcu_read_unlock();
-
-	fdput(f);
 
 	if (!found)
 		return -EINVAL;

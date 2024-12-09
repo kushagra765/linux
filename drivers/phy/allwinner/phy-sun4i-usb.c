@@ -683,7 +683,7 @@ static int sun4i_usb_phy0_vbus_notify(struct notifier_block *nb,
 }
 
 static struct phy *sun4i_usb_phy_xlate(struct device *dev,
-					struct of_phandle_args *args)
+					const struct of_phandle_args *args)
 {
 	struct sun4i_usb_phy_data *data = dev_get_drvdata(dev);
 
@@ -1049,11 +1049,11 @@ static const struct of_device_id sun4i_usb_phy_of_match[] = {
 MODULE_DEVICE_TABLE(of, sun4i_usb_phy_of_match);
 
 static struct platform_driver sun4i_usb_phy_driver = {
-	.probe	= sun4i_usb_phy_probe,
-	.remove_new = sun4i_usb_phy_remove,
+	.probe = sun4i_usb_phy_probe,
+	.remove = sun4i_usb_phy_remove,
 	.driver = {
-		.of_match_table	= sun4i_usb_phy_of_match,
-		.name  = "sun4i-usb-phy",
+		.of_match_table= sun4i_usb_phy_of_match,
+		.name = "sun4i-usb-phy",
 	}
 };
 module_platform_driver(sun4i_usb_phy_driver);

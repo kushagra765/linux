@@ -28,6 +28,8 @@ void wx_mac_set_default_filter(struct wx *wx, u8 *addr);
 void wx_flush_sw_mac_table(struct wx *wx);
 int wx_set_mac(struct net_device *netdev, void *p);
 void wx_disable_rx(struct wx *wx);
+int wx_disable_sec_rx_path(struct wx *wx);
+void wx_enable_sec_rx_path(struct wx *wx);
 void wx_set_rx_mode(struct net_device *netdev);
 int wx_change_mtu(struct net_device *netdev, int new_mtu);
 void wx_disable_rx_queue(struct wx *wx, struct wx_ring *ring);
@@ -41,6 +43,7 @@ int wx_get_pcie_msix_counts(struct wx *wx, u16 *msix_count, u16 max_msix_count);
 int wx_sw_init(struct wx *wx);
 int wx_vlan_rx_add_vid(struct net_device *netdev, __be16 proto, u16 vid);
 int wx_vlan_rx_kill_vid(struct net_device *netdev, __be16 proto, u16 vid);
+int wx_fc_enable(struct wx *wx, bool tx_pause, bool rx_pause);
 void wx_update_stats(struct wx *wx);
 void wx_clear_hw_cntrs(struct wx *wx);
 

@@ -15,6 +15,7 @@
 #define   HEAD_WRAP_COUNT			0xFFE00000
 #define   HEAD_WRAP_ONE				0x00200000
 #define   HEAD_ADDR				0x001FFFFC
+#define   HEAD_WAIT_I8XX			(1 << 0) /* gen2, PRBx_HEAD */
 #define RING_START(base)			_MMIO((base) + 0x38)
 #define RING_CTL(base)				_MMIO((base) + 0x3c)
 #define   RING_CTL_SIZE(size)			((size) - PAGE_SIZE) /* in bytes -> pages */
@@ -26,7 +27,6 @@
 #define   RING_VALID_MASK			0x00000001
 #define   RING_VALID				0x00000001
 #define   RING_INVALID				0x00000000
-#define   RING_WAIT_I8XX			(1 << 0) /* gen2, PRBx_HEAD */
 #define   RING_WAIT				(1 << 11) /* gen3+, PRBx_CTL */
 #define   RING_WAIT_SEMAPHORE			(1 << 10) /* gen6+ */
 #define RING_SYNC_0(base)			_MMIO((base) + 0x40)
@@ -118,9 +118,15 @@
 #define   CCID_EXTENDED_STATE_RESTORE		BIT(2)
 #define   CCID_EXTENDED_STATE_SAVE		BIT(3)
 #define RING_BB_PER_CTX_PTR(base)		_MMIO((base) + 0x1c0) /* gen8+ */
+#define   PER_CTX_BB_FORCE			BIT(2)
+#define   PER_CTX_BB_VALID			BIT(0)
+
 #define RING_INDIRECT_CTX(base)			_MMIO((base) + 0x1c4) /* gen8+ */
 #define RING_INDIRECT_CTX_OFFSET(base)		_MMIO((base) + 0x1c8) /* gen8+ */
 #define ECOSKPD(base)				_MMIO((base) + 0x1d0)
+#define   XEHP_BLITTER_SCHEDULING_MODE_MASK	REG_GENMASK(12, 11)
+#define   XEHP_BLITTER_ROUND_ROBIN_MODE		\
+		REG_FIELD_PREP(XEHP_BLITTER_SCHEDULING_MODE_MASK, 1)
 #define   ECO_CONSTANT_BUFFER_SR_DISABLE	REG_BIT(4)
 #define   ECO_GATING_CX_ONLY			REG_BIT(3)
 #define   GEN6_BLITTER_FBC_NOTIFY		REG_BIT(3)
@@ -257,5 +263,7 @@
 #define VDBOX_CGCTL3F18(base)			_MMIO((base) + 0x3f18)
 #define   ALNUNIT_CLKGATE_DIS			REG_BIT(13)
 
+#define VDBOX_CGCTL3F1C(base)			_MMIO((base) + 0x3f1c)
+#define   MFXPIPE_CLKGATE_DIS			REG_BIT(3)
 
 #endif /* __INTEL_ENGINE_REGS__ */

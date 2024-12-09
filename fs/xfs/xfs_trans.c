@@ -25,6 +25,8 @@
 #include "xfs_dquot.h"
 #include "xfs_icache.h"
 #include "xfs_rtbitmap.h"
+#include "xfs_rtgroup.h"
+#include "xfs_sb.h"
 
 struct kmem_cache	*xfs_trans_cache;
 
@@ -67,7 +69,7 @@ xfs_trans_free(
 	struct xfs_trans	*tp)
 {
 	xfs_extent_busy_sort(&tp->t_busy);
-	xfs_extent_busy_clear(tp->t_mountp, &tp->t_busy, false);
+	xfs_extent_busy_clear(&tp->t_busy, false);
 
 	trace_xfs_trans_free(tp, _RET_IP_);
 	xfs_trans_clear_context(tp);
@@ -163,7 +165,7 @@ xfs_trans_reserve(
 	 * fail if the count would go below zero.
 	 */
 	if (blocks > 0) {
-		error = xfs_mod_fdblocks(mp, -((int64_t)blocks), rsvd);
+		error = xfs_dec_fdblocks(mp, blocks, rsvd);
 		if (error != 0)
 			return -ENOSPC;
 		tp->t_blk_res += blocks;
@@ -210,7 +212,7 @@ xfs_trans_reserve(
 	 * fail if the count would go below zero.
 	 */
 	if (rtextents > 0) {
-		error = xfs_mod_frextents(mp, -((int64_t)rtextents));
+		error = xfs_dec_frextents(mp, rtextents);
 		if (error) {
 			error = -ENOSPC;
 			goto undo_log;
@@ -234,7 +236,7 @@ undo_log:
 
 undo_blocks:
 	if (blocks > 0) {
-		xfs_mod_fdblocks(mp, (int64_t)blocks, rsvd);
+		xfs_add_fdblocks(mp, blocks);
 		tp->t_blk_res = 0;
 	}
 	return error;
@@ -420,6 +422,8 @@ xfs_trans_mod_sb(
 			ASSERT(tp->t_rtx_res_used <= tp->t_rtx_res);
 		}
 		tp->t_frextents_delta += delta;
+		if (xfs_has_rtgroups(mp))
+			flags &= ~XFS_TRANS_SB_DIRTY;
 		break;
 	case XFS_TRANS_SB_RES_FREXTENTS:
 		/*
@@ -429,6 +433,8 @@ xfs_trans_mod_sb(
 		 */
 		ASSERT(delta < 0);
 		tp->t_res_frextents_delta += delta;
+		if (xfs_has_rtgroups(mp))
+			flags &= ~XFS_TRANS_SB_DIRTY;
 		break;
 	case XFS_TRANS_SB_DBLOCKS:
 		tp->t_dblocks_delta += delta;
@@ -454,6 +460,10 @@ xfs_trans_mod_sb(
 		break;
 	case XFS_TRANS_SB_REXTSLOG:
 		tp->t_rextslog_delta += delta;
+		break;
+	case XFS_TRANS_SB_RGCOUNT:
+		ASSERT(delta > 0);
+		tp->t_rgcount_delta += delta;
 		break;
 	default:
 		ASSERT(0);
@@ -497,20 +507,22 @@ xfs_trans_apply_sb_deltas(
 	}
 
 	/*
-	 * Updating frextents requires careful handling because it does not
-	 * behave like the lazysb counters because we cannot rely on log
-	 * recovery in older kenels to recompute the value from the rtbitmap.
-	 * This means that the ondisk frextents must be consistent with the
-	 * rtbitmap.
+	 * sb_frextents was added to the lazy sb counters when the rt groups
+	 * feature was introduced.  This is possible because we know that all
+	 * kernels supporting rtgroups will also recompute frextents from the
+	 * realtime bitmap.
+	 *
+	 * For older file systems, updating frextents requires careful handling
+	 * because we cannot rely on log recovery in older kernels to recompute
+	 * the value from the rtbitmap.  This means that the ondisk frextents
+	 * must be consistent with the rtbitmap.
 	 *
 	 * Therefore, log the frextents change to the ondisk superblock and
 	 * update the incore superblock so that future calls to xfs_log_sb
 	 * write the correct value ondisk.
-	 *
-	 * Don't touch m_frextents because it includes incore reservations,
-	 * and those are handled by the unreserve function.
 	 */
-	if (tp->t_frextents_delta || tp->t_res_frextents_delta) {
+	if ((tp->t_frextents_delta || tp->t_res_frextents_delta) &&
+	    !xfs_has_rtgroups(tp->t_mountp)) {
 		struct xfs_mount	*mp = tp->t_mountp;
 		int64_t			rtxdelta;
 
@@ -536,6 +548,18 @@ xfs_trans_apply_sb_deltas(
 	}
 	if (tp->t_rextsize_delta) {
 		be32_add_cpu(&sbp->sb_rextsize, tp->t_rextsize_delta);
+
+		/*
+		 * Because the ondisk sb records rtgroup size in units of rt
+		 * extents, any time we update the rt extent size we have to
+		 * recompute the ondisk rtgroup block log.  The incore values
+		 * will be recomputed in xfs_trans_unreserve_and_mod_sb.
+		 */
+		if (xfs_has_rtgroups(tp->t_mountp)) {
+			sbp->sb_rgblklog = xfs_compute_rgblklog(
+						be32_to_cpu(sbp->sb_rgextents),
+						be32_to_cpu(sbp->sb_rextsize));
+		}
 		whole = 1;
 	}
 	if (tp->t_rbmblocks_delta) {
@@ -552,6 +576,10 @@ xfs_trans_apply_sb_deltas(
 	}
 	if (tp->t_rextslog_delta) {
 		sbp->sb_rextslog += tp->t_rextslog_delta;
+		whole = 1;
+	}
+	if (tp->t_rgcount_delta) {
+		be32_add_cpu(&sbp->sb_rgcount, tp->t_rgcount_delta);
 		whole = 1;
 	}
 
@@ -593,38 +621,44 @@ xfs_trans_unreserve_and_mod_sb(
 	struct xfs_trans	*tp)
 {
 	struct xfs_mount	*mp = tp->t_mountp;
-	bool			rsvd = (tp->t_flags & XFS_TRANS_RESERVE) != 0;
-	int64_t			blkdelta = 0;
-	int64_t			rtxdelta = 0;
+	int64_t			blkdelta = tp->t_blk_res;
+	int64_t			rtxdelta = tp->t_rtx_res;
 	int64_t			idelta = 0;
 	int64_t			ifreedelta = 0;
-	int			error;
 
-	/* calculate deltas */
-	if (tp->t_blk_res > 0)
-		blkdelta = tp->t_blk_res;
-	if ((tp->t_fdblocks_delta != 0) &&
-	    (xfs_has_lazysbcount(mp) ||
-	     (tp->t_flags & XFS_TRANS_SB_DIRTY)))
+	/*
+	 * Calculate the deltas.
+	 *
+	 * t_fdblocks_delta and t_frextents_delta can be positive or negative:
+	 *
+	 *  - positive values indicate blocks freed in the transaction.
+	 *  - negative values indicate blocks allocated in the transaction
+	 *
+	 * Negative values can only happen if the transaction has a block
+	 * reservation that covers the allocated block.  The end result is
+	 * that the calculated delta values must always be positive and we
+	 * can only put back previous allocated or reserved blocks here.
+	 */
+	ASSERT(tp->t_blk_res || tp->t_fdblocks_delta >= 0);
+	if (xfs_has_lazysbcount(mp) || (tp->t_flags & XFS_TRANS_SB_DIRTY)) {
 	        blkdelta += tp->t_fdblocks_delta;
+		ASSERT(blkdelta >= 0);
+	}
 
-	if (tp->t_rtx_res > 0)
-		rtxdelta = tp->t_rtx_res;
-	if ((tp->t_frextents_delta != 0) &&
-	    (tp->t_flags & XFS_TRANS_SB_DIRTY))
+	ASSERT(tp->t_rtx_res || tp->t_frextents_delta >= 0);
+	if (xfs_has_rtgroups(mp) || (tp->t_flags & XFS_TRANS_SB_DIRTY)) {
 		rtxdelta += tp->t_frextents_delta;
+		ASSERT(rtxdelta >= 0);
+	}
 
-	if (xfs_has_lazysbcount(mp) ||
-	     (tp->t_flags & XFS_TRANS_SB_DIRTY)) {
+	if (xfs_has_lazysbcount(mp) || (tp->t_flags & XFS_TRANS_SB_DIRTY)) {
 		idelta = tp->t_icount_delta;
 		ifreedelta = tp->t_ifree_delta;
 	}
 
 	/* apply the per-cpu counters */
-	if (blkdelta) {
-		error = xfs_mod_fdblocks(mp, blkdelta, rsvd);
-		ASSERT(!error);
-	}
+	if (blkdelta)
+		xfs_add_fdblocks(mp, blkdelta);
 
 	if (idelta)
 		percpu_counter_add_batch(&mp->m_icount, idelta,
@@ -633,10 +667,8 @@ xfs_trans_unreserve_and_mod_sb(
 	if (ifreedelta)
 		percpu_counter_add(&mp->m_ifree, ifreedelta);
 
-	if (rtxdelta) {
-		error = xfs_mod_frextents(mp, rtxdelta);
-		ASSERT(!error);
-	}
+	if (rtxdelta)
+		xfs_add_frextents(mp, rtxdelta);
 
 	if (!(tp->t_flags & XFS_TRANS_SB_DIRTY))
 		return;
@@ -647,23 +679,21 @@ xfs_trans_unreserve_and_mod_sb(
 	mp->m_sb.sb_icount += idelta;
 	mp->m_sb.sb_ifree += ifreedelta;
 	/*
-	 * Do not touch sb_frextents here because we are dealing with incore
-	 * reservation.  sb_frextents is not part of the lazy sb counters so it
-	 * must be consistent with the ondisk rtbitmap and must never include
-	 * incore reservations.
+	 * Do not touch sb_frextents here because it is handled in
+	 * xfs_trans_apply_sb_deltas for file systems where it isn't a lazy
+	 * counter anyway.
 	 */
 	mp->m_sb.sb_dblocks += tp->t_dblocks_delta;
 	mp->m_sb.sb_agcount += tp->t_agcount_delta;
 	mp->m_sb.sb_imax_pct += tp->t_imaxpct_delta;
-	mp->m_sb.sb_rextsize += tp->t_rextsize_delta;
-	if (tp->t_rextsize_delta) {
-		mp->m_rtxblklog = log2_if_power2(mp->m_sb.sb_rextsize);
-		mp->m_rtxblkmask = mask64_if_power2(mp->m_sb.sb_rextsize);
-	}
+	if (tp->t_rextsize_delta)
+		xfs_mount_sb_set_rextsize(mp, &mp->m_sb,
+				mp->m_sb.sb_rextsize + tp->t_rextsize_delta);
 	mp->m_sb.sb_rbmblocks += tp->t_rbmblocks_delta;
 	mp->m_sb.sb_rblocks += tp->t_rblocks_delta;
 	mp->m_sb.sb_rextents += tp->t_rextents_delta;
 	mp->m_sb.sb_rextslog += tp->t_rextslog_delta;
+	mp->m_sb.sb_rgcount += tp->t_rgcount_delta;
 	spin_unlock(&mp->m_sb_lock);
 
 	/*
@@ -672,7 +702,6 @@ xfs_trans_unreserve_and_mod_sb(
 	 */
 	ASSERT(mp->m_sb.sb_imax_pct >= 0);
 	ASSERT(mp->m_sb.sb_rextslog >= 0);
-	return;
 }
 
 /* Add the given log item to the transaction's list of log items. */
@@ -720,135 +749,6 @@ xfs_trans_free_items(
 		if (lip->li_ops->iop_release)
 			lip->li_ops->iop_release(lip);
 	}
-}
-
-static inline void
-xfs_log_item_batch_insert(
-	struct xfs_ail		*ailp,
-	struct xfs_ail_cursor	*cur,
-	struct xfs_log_item	**log_items,
-	int			nr_items,
-	xfs_lsn_t		commit_lsn)
-{
-	int	i;
-
-	spin_lock(&ailp->ail_lock);
-	/* xfs_trans_ail_update_bulk drops ailp->ail_lock */
-	xfs_trans_ail_update_bulk(ailp, cur, log_items, nr_items, commit_lsn);
-
-	for (i = 0; i < nr_items; i++) {
-		struct xfs_log_item *lip = log_items[i];
-
-		if (lip->li_ops->iop_unpin)
-			lip->li_ops->iop_unpin(lip, 0);
-	}
-}
-
-/*
- * Bulk operation version of xfs_trans_committed that takes a log vector of
- * items to insert into the AIL. This uses bulk AIL insertion techniques to
- * minimise lock traffic.
- *
- * If we are called with the aborted flag set, it is because a log write during
- * a CIL checkpoint commit has failed. In this case, all the items in the
- * checkpoint have already gone through iop_committed and iop_committing, which
- * means that checkpoint commit abort handling is treated exactly the same
- * as an iclog write error even though we haven't started any IO yet. Hence in
- * this case all we need to do is iop_committed processing, followed by an
- * iop_unpin(aborted) call.
- *
- * The AIL cursor is used to optimise the insert process. If commit_lsn is not
- * at the end of the AIL, the insert cursor avoids the need to walk
- * the AIL to find the insertion point on every xfs_log_item_batch_insert()
- * call. This saves a lot of needless list walking and is a net win, even
- * though it slightly increases that amount of AIL lock traffic to set it up
- * and tear it down.
- */
-void
-xfs_trans_committed_bulk(
-	struct xfs_ail		*ailp,
-	struct list_head	*lv_chain,
-	xfs_lsn_t		commit_lsn,
-	bool			aborted)
-{
-#define LOG_ITEM_BATCH_SIZE	32
-	struct xfs_log_item	*log_items[LOG_ITEM_BATCH_SIZE];
-	struct xfs_log_vec	*lv;
-	struct xfs_ail_cursor	cur;
-	int			i = 0;
-
-	spin_lock(&ailp->ail_lock);
-	xfs_trans_ail_cursor_last(ailp, &cur, commit_lsn);
-	spin_unlock(&ailp->ail_lock);
-
-	/* unpin all the log items */
-	list_for_each_entry(lv, lv_chain, lv_list) {
-		struct xfs_log_item	*lip = lv->lv_item;
-		xfs_lsn_t		item_lsn;
-
-		if (aborted)
-			set_bit(XFS_LI_ABORTED, &lip->li_flags);
-
-		if (lip->li_ops->flags & XFS_ITEM_RELEASE_WHEN_COMMITTED) {
-			lip->li_ops->iop_release(lip);
-			continue;
-		}
-
-		if (lip->li_ops->iop_committed)
-			item_lsn = lip->li_ops->iop_committed(lip, commit_lsn);
-		else
-			item_lsn = commit_lsn;
-
-		/* item_lsn of -1 means the item needs no further processing */
-		if (XFS_LSN_CMP(item_lsn, (xfs_lsn_t)-1) == 0)
-			continue;
-
-		/*
-		 * if we are aborting the operation, no point in inserting the
-		 * object into the AIL as we are in a shutdown situation.
-		 */
-		if (aborted) {
-			ASSERT(xlog_is_shutdown(ailp->ail_log));
-			if (lip->li_ops->iop_unpin)
-				lip->li_ops->iop_unpin(lip, 1);
-			continue;
-		}
-
-		if (item_lsn != commit_lsn) {
-
-			/*
-			 * Not a bulk update option due to unusual item_lsn.
-			 * Push into AIL immediately, rechecking the lsn once
-			 * we have the ail lock. Then unpin the item. This does
-			 * not affect the AIL cursor the bulk insert path is
-			 * using.
-			 */
-			spin_lock(&ailp->ail_lock);
-			if (XFS_LSN_CMP(item_lsn, lip->li_lsn) > 0)
-				xfs_trans_ail_update(ailp, lip, item_lsn);
-			else
-				spin_unlock(&ailp->ail_lock);
-			if (lip->li_ops->iop_unpin)
-				lip->li_ops->iop_unpin(lip, 0);
-			continue;
-		}
-
-		/* Item is a candidate for bulk AIL insert.  */
-		log_items[i++] = lv->lv_item;
-		if (i >= LOG_ITEM_BATCH_SIZE) {
-			xfs_log_item_batch_insert(ailp, &cur, log_items,
-					LOG_ITEM_BATCH_SIZE, commit_lsn);
-			i = 0;
-		}
-	}
-
-	/* make sure we insert the remainder! */
-	if (i)
-		xfs_log_item_batch_insert(ailp, &cur, log_items, i, commit_lsn);
-
-	spin_lock(&ailp->ail_lock);
-	xfs_trans_ail_cursor_done(&cur);
-	spin_unlock(&ailp->ail_lock);
 }
 
 /*
@@ -1237,6 +1137,68 @@ out_cancel:
 }
 
 /*
+ * Try to reserve more blocks for a transaction.
+ *
+ * This is for callers that need to attach resources to a transaction, scan
+ * those resources to determine the space reservation requirements, and then
+ * modify the attached resources.  In other words, online repair.  This can
+ * fail due to ENOSPC, so the caller must be able to cancel the transaction
+ * without shutting down the fs.
+ */
+int
+xfs_trans_reserve_more(
+	struct xfs_trans	*tp,
+	unsigned int		blocks,
+	unsigned int		rtextents)
+{
+	struct xfs_trans_res	resv = { };
+
+	return xfs_trans_reserve(tp, &resv, blocks, rtextents);
+}
+
+/*
+ * Try to reserve more blocks and file quota for a transaction.  Same
+ * conditions of usage as xfs_trans_reserve_more.
+ */
+int
+xfs_trans_reserve_more_inode(
+	struct xfs_trans	*tp,
+	struct xfs_inode	*ip,
+	unsigned int		dblocks,
+	unsigned int		rblocks,
+	bool			force_quota)
+{
+	struct xfs_trans_res	resv = { };
+	struct xfs_mount	*mp = ip->i_mount;
+	unsigned int		rtx = xfs_extlen_to_rtxlen(mp, rblocks);
+	int			error;
+
+	xfs_assert_ilocked(ip, XFS_ILOCK_EXCL);
+
+	error = xfs_trans_reserve(tp, &resv, dblocks, rtx);
+	if (error)
+		return error;
+
+	if (!XFS_IS_QUOTA_ON(mp) || xfs_is_quota_inode(&mp->m_sb, ip->i_ino))
+		return 0;
+
+	if (tp->t_flags & XFS_TRANS_RESERVE)
+		force_quota = true;
+
+	error = xfs_trans_reserve_quota_nblks(tp, ip, dblocks, rblocks,
+			force_quota);
+	if (!error)
+		return 0;
+
+	/* Quota failed, give back the new reservation. */
+	xfs_add_fdblocks(mp, dblocks);
+	tp->t_blk_res -= dblocks;
+	xfs_add_frextents(mp, rtx);
+	tp->t_rtx_res -= rtx;
+	return error;
+}
+
+/*
  * Allocate an transaction in preparation for inode creation by reserving quota
  * against the given dquots.  Callers are not required to hold any inode locks.
  */
@@ -1326,10 +1288,25 @@ retry:
 	gdqp = (new_gdqp != ip->i_gdquot) ? new_gdqp : NULL;
 	pdqp = (new_pdqp != ip->i_pdquot) ? new_pdqp : NULL;
 	if (udqp || gdqp || pdqp) {
+		xfs_filblks_t	dblocks, rblocks;
 		unsigned int	qflags = XFS_QMOPT_RES_REGBLKS;
+		bool		isrt = XFS_IS_REALTIME_INODE(ip);
 
 		if (force)
 			qflags |= XFS_QMOPT_FORCE_RES;
+
+		if (isrt) {
+			error = xfs_iread_extents(tp, ip, XFS_DATA_FORK);
+			if (error)
+				goto out_cancel;
+		}
+
+		xfs_inode_count_blocks(tp, ip, &dblocks, &rblocks);
+
+		if (isrt)
+			rblocks += ip->i_delayed_blks;
+		else
+			dblocks += ip->i_delayed_blks;
 
 		/*
 		 * Reserve enough quota to handle blocks on disk and reserved
@@ -1338,8 +1315,20 @@ retry:
 		 * though that part is only semi-transactional.
 		 */
 		error = xfs_trans_reserve_quota_bydquots(tp, mp, udqp, gdqp,
-				pdqp, ip->i_nblocks + ip->i_delayed_blks,
-				1, qflags);
+				pdqp, dblocks, 1, qflags);
+		if ((error == -EDQUOT || error == -ENOSPC) && !retried) {
+			xfs_trans_cancel(tp);
+			xfs_blockgc_free_dquots(mp, udqp, gdqp, pdqp, 0);
+			retried = true;
+			goto retry;
+		}
+		if (error)
+			goto out_cancel;
+
+		/* Do the same for realtime. */
+		qflags = XFS_QMOPT_RES_RTBLKS | (qflags & XFS_QMOPT_FORCE_RES);
+		error = xfs_trans_reserve_quota_bydquots(tp, mp, udqp, gdqp,
+				pdqp, rblocks, 0, qflags);
 		if ((error == -EDQUOT || error == -ENOSPC) && !retried) {
 			xfs_trans_cancel(tp);
 			xfs_blockgc_free_dquots(mp, udqp, gdqp, pdqp, 0);
@@ -1368,6 +1357,8 @@ out_cancel:
  * The caller must ensure that the on-disk dquots attached to this inode have
  * already been allocated and initialized.  The ILOCKs will be dropped when the
  * transaction is committed or cancelled.
+ *
+ * Caller is responsible for unlocking the inodes manually upon return
  */
 int
 xfs_trans_alloc_dir(
@@ -1398,8 +1389,8 @@ retry:
 
 	xfs_lock_two_inodes(dp, XFS_ILOCK_EXCL, ip, XFS_ILOCK_EXCL);
 
-	xfs_trans_ijoin(tp, dp, XFS_ILOCK_EXCL);
-	xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
+	xfs_trans_ijoin(tp, dp, 0);
+	xfs_trans_ijoin(tp, ip, 0);
 
 	error = xfs_qm_dqattach_locked(dp, false);
 	if (error) {
@@ -1422,6 +1413,9 @@ retry:
 	if (error == -EDQUOT || error == -ENOSPC) {
 		if (!retried) {
 			xfs_trans_cancel(tp);
+			xfs_iunlock(dp, XFS_ILOCK_EXCL);
+			if (dp != ip)
+				xfs_iunlock(ip, XFS_ILOCK_EXCL);
 			xfs_blockgc_free_quota(dp, 0);
 			retried = true;
 			goto retry;

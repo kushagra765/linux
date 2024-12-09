@@ -528,7 +528,6 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 	case KVM_CAP_ENABLE_CAP:
 	case KVM_CAP_ONE_REG:
 	case KVM_CAP_IOEVENTFD:
-	case KVM_CAP_DEVICE_CTRL:
 	case KVM_CAP_IMMEDIATE_EXIT:
 	case KVM_CAP_SET_GUEST_DEBUG:
 		r = 1;
@@ -578,7 +577,7 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 		break;
 #endif
 
-#ifdef CONFIG_HAVE_KVM_IRQFD
+#ifdef CONFIG_HAVE_KVM_IRQCHIP
 	case KVM_CAP_IRQFD_RESAMPLE:
 		r = !xive_enabled();
 		break;
@@ -613,9 +612,6 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 				r = 8 | 4 | 2 | 1;
 		}
 		break;
-	case KVM_CAP_PPC_RMA:
-		r = 0;
-		break;
 	case KVM_CAP_PPC_HWRNG:
 		r = kvmppc_hwrng_present();
 		break;
@@ -632,13 +628,8 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 		break;
 #endif
 	case KVM_CAP_SYNC_MMU:
-#ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
-		r = hv_enabled;
-#elif defined(KVM_ARCH_WANT_MMU_NOTIFIER)
+		BUILD_BUG_ON(!IS_ENABLED(CONFIG_KVM_GENERIC_MMU_NOTIFIER));
 		r = 1;
-#else
-		r = 0;
-#endif
 		break;
 #ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
 	case KVM_CAP_PPC_HTAB_FD:
@@ -1858,7 +1849,7 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
 
 	kvm_sigset_activate(vcpu);
 
-	if (run->immediate_exit)
+	if (!vcpu->wants_to_run)
 		r = -EINTR;
 	else
 		r = kvmppc_vcpu_run(vcpu);
@@ -1939,54 +1930,48 @@ static int kvm_vcpu_ioctl_enable_cap(struct kvm_vcpu *vcpu,
 #endif
 #ifdef CONFIG_KVM_MPIC
 	case KVM_CAP_IRQ_MPIC: {
-		struct fd f;
+		CLASS(fd, f)(cap->args[0]);
 		struct kvm_device *dev;
 
 		r = -EBADF;
-		f = fdget(cap->args[0]);
-		if (!f.file)
+		if (fd_empty(f))
 			break;
 
 		r = -EPERM;
-		dev = kvm_device_from_filp(f.file);
+		dev = kvm_device_from_filp(fd_file(f));
 		if (dev)
 			r = kvmppc_mpic_connect_vcpu(dev, vcpu, cap->args[1]);
 
-		fdput(f);
 		break;
 	}
 #endif
 #ifdef CONFIG_KVM_XICS
 	case KVM_CAP_IRQ_XICS: {
-		struct fd f;
+		CLASS(fd, f)(cap->args[0]);
 		struct kvm_device *dev;
 
 		r = -EBADF;
-		f = fdget(cap->args[0]);
-		if (!f.file)
+		if (fd_empty(f))
 			break;
 
 		r = -EPERM;
-		dev = kvm_device_from_filp(f.file);
+		dev = kvm_device_from_filp(fd_file(f));
 		if (dev) {
 			if (xics_on_xive())
 				r = kvmppc_xive_connect_vcpu(dev, vcpu, cap->args[1]);
 			else
 				r = kvmppc_xics_connect_vcpu(dev, vcpu, cap->args[1]);
 		}
-
-		fdput(f);
 		break;
 	}
 #endif /* CONFIG_KVM_XICS */
 #ifdef CONFIG_KVM_XIVE
 	case KVM_CAP_PPC_IRQ_XIVE: {
-		struct fd f;
+		CLASS(fd, f)(cap->args[0]);
 		struct kvm_device *dev;
 
 		r = -EBADF;
-		f = fdget(cap->args[0]);
-		if (!f.file)
+		if (fd_empty(f))
 			break;
 
 		r = -ENXIO;
@@ -1994,12 +1979,10 @@ static int kvm_vcpu_ioctl_enable_cap(struct kvm_vcpu *vcpu,
 			break;
 
 		r = -EPERM;
-		dev = kvm_device_from_filp(f.file);
+		dev = kvm_device_from_filp(fd_file(f));
 		if (dev)
 			r = kvmppc_xive_native_connect_vcpu(dev, vcpu,
 							    cap->args[1]);
-
-		fdput(f);
 		break;
 	}
 #endif /* CONFIG_KVM_XIVE */
@@ -2544,9 +2527,8 @@ void kvm_arch_create_vcpu_debugfs(struct kvm_vcpu *vcpu, struct dentry *debugfs_
 		vcpu->kvm->arch.kvm_ops->create_vcpu_debugfs(vcpu, debugfs_dentry);
 }
 
-int kvm_arch_create_vm_debugfs(struct kvm *kvm)
+void kvm_arch_create_vm_debugfs(struct kvm *kvm)
 {
 	if (kvm->arch.kvm_ops->create_vm_debugfs)
 		kvm->arch.kvm_ops->create_vm_debugfs(kvm);
-	return 0;
 }

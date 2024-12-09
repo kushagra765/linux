@@ -44,6 +44,8 @@ static void audit_mnt_flags(struct audit_buffer *ab, unsigned long flags)
 		audit_log_format(ab, ", mand");
 	if (flags & MS_DIRSYNC)
 		audit_log_format(ab, ", dirsync");
+	if (flags & MS_NOSYMFOLLOW)
+		audit_log_format(ab, ", nosymfollow");
 	if (flags & MS_NOATIME)
 		audit_log_format(ab, ", noatime");
 	if (flags & MS_NODIRATIME)
@@ -499,6 +501,10 @@ int aa_move_mount(const struct cred *subj_cred,
 	error = -ENOMEM;
 	if (!to_buffer || !from_buffer)
 		goto out;
+
+	if (!our_mnt(from_path->mnt))
+		/* moving a mount detached from the namespace */
+		from_path = NULL;
 	error = fn_for_each_confined(label, profile,
 			match_mnt(subj_cred, profile, to_path, to_buffer,
 				  from_path, from_buffer,

@@ -68,17 +68,8 @@ struct dpu_hw_intr {
 	struct dpu_hw_intr_entry irq_tbl[DPU_NUM_IRQS];
 };
 
-/**
- * dpu_hw_intr_init(): Initializes the interrupts hw object
- * @addr: mapped register io address of MDP
- * @m:    pointer to MDSS catalog data
- */
-struct dpu_hw_intr *dpu_hw_intr_init(void __iomem *addr,
-		const struct dpu_mdss_cfg *m);
+struct dpu_hw_intr *dpu_hw_intr_init(struct drm_device *dev,
+				     void __iomem *addr,
+				     const struct dpu_mdss_cfg *m);
 
-/**
- * dpu_hw_intr_destroy(): Cleanup interrutps hw object
- * @intr: pointer to interrupts hw object
- */
-void dpu_hw_intr_destroy(struct dpu_hw_intr *intr);
 #endif

@@ -3,6 +3,8 @@
  * Copyright (c) 2020-2022, Linaro Limited
  */
 
+#include <drm/drm_managed.h>
+
 #include <drm/display/drm_dsc_helper.h>
 
 #include "dpu_kms.h"
@@ -188,12 +190,20 @@ static void _setup_dsc_ops(struct dpu_hw_dsc_ops *ops,
 		ops->dsc_bind_pingpong_blk = dpu_hw_dsc_bind_pingpong_blk;
 };
 
-struct dpu_hw_dsc *dpu_hw_dsc_init(const struct dpu_dsc_cfg *cfg,
+/**
+ * dpu_hw_dsc_init() - Initializes the DSC hw driver object.
+ * @dev:  Corresponding device for devres management
+ * @cfg:  DSC catalog entry for which driver object is required
+ * @addr: Mapped register io address of MDP
+ * Return: Error code or allocated dpu_hw_dsc context
+ */
+struct dpu_hw_dsc *dpu_hw_dsc_init(struct drm_device *dev,
+				   const struct dpu_dsc_cfg *cfg,
 				   void __iomem *addr)
 {
 	struct dpu_hw_dsc *c;
 
-	c = kzalloc(sizeof(*c), GFP_KERNEL);
+	c = drmm_kzalloc(dev, sizeof(*c), GFP_KERNEL);
 	if (!c)
 		return ERR_PTR(-ENOMEM);
 
@@ -205,9 +215,4 @@ struct dpu_hw_dsc *dpu_hw_dsc_init(const struct dpu_dsc_cfg *cfg,
 	_setup_dsc_ops(&c->ops, c->caps->features);
 
 	return c;
-}
-
-void dpu_hw_dsc_destroy(struct dpu_hw_dsc *dsc)
-{
-	kfree(dsc);
 }

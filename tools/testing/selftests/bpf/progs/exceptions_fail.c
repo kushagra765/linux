@@ -131,7 +131,7 @@ int reject_subprog_with_lock(void *ctx)
 }
 
 SEC("?tc")
-__failure __msg("bpf_rcu_read_unlock is missing")
+__failure __msg("BPF_EXIT instruction cannot be used inside bpf_rcu_read_lock-ed region")
 int reject_with_rcu_read_lock(void *ctx)
 {
 	bpf_rcu_read_lock();
@@ -147,7 +147,7 @@ __noinline static int throwing_subprog(struct __sk_buff *ctx)
 }
 
 SEC("?tc")
-__failure __msg("bpf_rcu_read_unlock is missing")
+__failure __msg("BPF_EXIT instruction cannot be used inside bpf_rcu_read_lock-ed region")
 int reject_subprog_with_rcu_read_lock(void *ctx)
 {
 	bpf_rcu_read_lock();
@@ -308,7 +308,7 @@ int reject_set_exception_cb_bad_ret1(void *ctx)
 }
 
 SEC("?fentry/bpf_check")
-__failure __msg("At program exit the register R0 has value (0x40; 0x0) should")
+__failure __msg("At program exit the register R1 has smin=64 smax=64 should")
 int reject_set_exception_cb_bad_ret2(void *ctx)
 {
 	bpf_throw(64);

@@ -40,7 +40,7 @@
 #include <asm/time.h>
 #include <asm/serial.h>
 #include <asm/udbg.h>
-#include <asm/code-patching.h>
+#include <asm/text-patching.h>
 #include <asm/cpu_has_feature.h>
 #include <asm/asm-prototypes.h>
 #include <asm/kdump.h>
@@ -176,7 +176,7 @@ void __init emergency_stack_init(void)
 }
 #endif
 
-#ifdef CONFIG_BOOKE_OR_40x
+#ifdef CONFIG_BOOKE
 void __init exc_lvl_early_init(void)
 {
 	unsigned int i, hw_cpu;

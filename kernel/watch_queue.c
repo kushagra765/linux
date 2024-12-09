@@ -270,7 +270,7 @@ long watch_queue_set_size(struct pipe_inode_info *pipe, unsigned int nr_notes)
 		goto error;
 
 	ret = -ENOMEM;
-	pages = kcalloc(sizeof(struct page *), nr_pages, GFP_KERNEL);
+	pages = kcalloc(nr_pages, sizeof(struct page *), GFP_KERNEL);
 	if (!pages)
 		goto error;
 
@@ -663,16 +663,14 @@ struct watch_queue *get_watch_queue(int fd)
 {
 	struct pipe_inode_info *pipe;
 	struct watch_queue *wqueue = ERR_PTR(-EINVAL);
-	struct fd f;
+	CLASS(fd, f)(fd);
 
-	f = fdget(fd);
-	if (f.file) {
-		pipe = get_pipe_info(f.file, false);
+	if (!fd_empty(f)) {
+		pipe = get_pipe_info(fd_file(f), false);
 		if (pipe && pipe->watch_queue) {
 			wqueue = pipe->watch_queue;
 			kref_get(&wqueue->usage);
 		}
-		fdput(f);
 	}
 
 	return wqueue;

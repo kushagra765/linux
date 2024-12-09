@@ -26,12 +26,16 @@ properties:
           - enum:
               - qcom,qcm2290-gpi-dma
               - qcom,qdu1000-gpi-dma
+              - qcom,sar2130p-gpi-dma
               - qcom,sc7280-gpi-dma
+              - qcom,sdx75-gpi-dma
               - qcom,sm6115-gpi-dma
               - qcom,sm6375-gpi-dma
               - qcom,sm8350-gpi-dma
               - qcom,sm8450-gpi-dma
               - qcom,sm8550-gpi-dma
+              - qcom,sm8650-gpi-dma
+              - qcom,x1e80100-gpi-dma
           - const: qcom,sm6350-gpi-dma
       - items:
           - enum:

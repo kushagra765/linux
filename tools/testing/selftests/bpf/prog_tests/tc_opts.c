@@ -2384,15 +2384,12 @@ static int generate_dummy_prog(void)
 		BPF_MOV64_IMM(BPF_REG_0, 0),
 		BPF_EXIT_INSN(),
 	};
-	const size_t prog_insn_cnt = sizeof(prog_insns) / sizeof(struct bpf_insn);
+	const size_t prog_insn_cnt = ARRAY_SIZE(prog_insns);
 	LIBBPF_OPTS(bpf_prog_load_opts, opts);
 	const size_t log_buf_sz = 256;
-	char *log_buf;
+	char log_buf[log_buf_sz];
 	int fd = -1;
 
-	log_buf = malloc(log_buf_sz);
-	if (!ASSERT_OK_PTR(log_buf, "log_buf_alloc"))
-		return fd;
 	opts.log_buf = log_buf;
 	opts.log_size = log_buf_sz;
 
@@ -2402,7 +2399,6 @@ static int generate_dummy_prog(void)
 			   prog_insns, prog_insn_cnt, &opts);
 	ASSERT_STREQ(log_buf, "", "log_0");
 	ASSERT_GE(fd, 0, "prog_fd");
-	free(log_buf);
 	return fd;
 }
 

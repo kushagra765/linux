@@ -129,7 +129,6 @@ struct dmtimer {
 	void __iomem	*func_base;	/* function register base */
 
 	atomic_t enabled;
-	unsigned long rate;
 	unsigned reserved:1;
 	unsigned posted:1;
 	unsigned omap1:1;
@@ -183,7 +182,7 @@ static inline u32 dmtimer_read(struct dmtimer *timer, u32 reg)
  * dmtimer_write - write timer registers in posted and non-posted mode
  * @timer:      timer pointer over which write operation is to perform
  * @reg:        lowest byte holds the register offset
- * @value:      data to write into the register
+ * @val:        data to write into the register
  *
  * The posted mode bit is encoded in reg. Note that in posted mode, the write
  * pending bit must be checked. Otherwise a write on a register which has a
@@ -949,7 +948,7 @@ static int omap_dm_timer_set_int_enable(struct omap_dm_timer *cookie,
 
 /**
  * omap_dm_timer_set_int_disable - disable timer interrupts
- * @timer:	pointer to timer handle
+ * @cookie:	pointer to timer cookie
  * @mask:	bit mask of interrupts to be disabled
  *
  * Disables the specified timer interrupts for a timer.
@@ -1105,8 +1104,12 @@ static int omap_dm_timer_probe(struct platform_device *pdev)
 		return  -ENOMEM;
 
 	timer->irq = platform_get_irq(pdev, 0);
-	if (timer->irq < 0)
-		return timer->irq;
+	if (timer->irq < 0) {
+		if (of_property_read_bool(dev->of_node, "ti,timer-pwm"))
+			dev_info(dev, "Did not find timer interrupt, timer usable in PWM mode only\n");
+		else
+			return timer->irq;
+	}
 
 	timer->io_base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(timer->io_base))
@@ -1292,7 +1295,7 @@ MODULE_DEVICE_TABLE(of, omap_timer_match);
 
 static struct platform_driver omap_dm_timer_driver = {
 	.probe  = omap_dm_timer_probe,
-	.remove_new = omap_dm_timer_remove,
+	.remove = omap_dm_timer_remove,
 	.driver = {
 		.name   = "omap_timer",
 		.of_match_table = omap_timer_match,

@@ -13,7 +13,6 @@
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_irq.h>
-#include <linux/of_gpio.h>
 #include <linux/io.h>
 #include <linux/interrupt.h>
 #include <linux/syscalls.h>
@@ -1779,7 +1778,7 @@ static const struct dev_pm_ops extcon_rtk_type_c_pm_ops = {
 
 static struct platform_driver extcon_rtk_type_c_driver = {
 	.probe		= extcon_rtk_type_c_probe,
-	.remove_new	= extcon_rtk_type_c_remove,
+	.remove		= extcon_rtk_type_c_remove,
 	.driver		= {
 		.name	= "extcon-rtk-type_c",
 		.of_match_table = extcon_rtk_type_c_match,

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //
-// Copyright(c) 2021-2022 Intel Corporation. All rights reserved.
+// Copyright(c) 2021-2022 Intel Corporation
 //
 // Authors: Cezary Rojewski <cezary.rojewski@intel.com>
 //          Amadeusz Slawinski <amadeuszx.slawinski@linux.intel.com>
@@ -80,7 +80,7 @@ static const struct snd_soc_dapm_route card_base_routes[] = {
 	{ "IN1P", NULL, "Headset Mic" },
 };
 
-static struct snd_soc_jack_pin card_jack_pins[] = {
+static const struct snd_soc_jack_pin card_jack_pins[] = {
 	{
 		.pin = "Headphone Jack",
 		.mask = SND_JACK_HEADPHONE,
@@ -242,8 +242,6 @@ static int avs_create_dai_link(struct device *dev, const char *platform_name, in
 	dl->ops = &avs_rt5682_ops;
 	dl->nonatomic = 1;
 	dl->no_pcm = 1;
-	dl->dpcm_capture = 1;
-	dl->dpcm_playback = 1;
 
 	*dai_link = dl;
 
@@ -322,16 +320,25 @@ static int avs_rt5682_probe(struct platform_device *pdev)
 	return devm_snd_soc_register_card(dev, card);
 }
 
+static const struct platform_device_id avs_rt5682_driver_ids[] = {
+	{
+		.name = "avs_rt5682",
+	},
+	{},
+};
+MODULE_DEVICE_TABLE(platform, avs_rt5682_driver_ids);
+
 static struct platform_driver avs_rt5682_driver = {
 	.probe = avs_rt5682_probe,
 	.driver = {
 		.name = "avs_rt5682",
 		.pm = &snd_soc_pm_ops,
 	},
+	.id_table = avs_rt5682_driver_ids,
 };
 
 module_platform_driver(avs_rt5682_driver)
 
+MODULE_DESCRIPTION("Intel rt5682 machine driver");
 MODULE_AUTHOR("Cezary Rojewski <cezary.rojewski@intel.com>");
 MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:avs_rt5682");

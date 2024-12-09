@@ -226,8 +226,8 @@ dphy_pll_get_configure_from_opts(struct imx93_dsi *dsi,
 	unsigned long fout;
 	unsigned long best_fout = 0;
 	unsigned int fvco_div;
-	unsigned int min_n, max_n, n, best_n;
-	unsigned long m, best_m;
+	unsigned int min_n, max_n, n, best_n = UINT_MAX;
+	unsigned long m, best_m = 0;
 	unsigned long min_delta = ULONG_MAX;
 	unsigned long delta;
 	u64 tmp;
@@ -904,7 +904,7 @@ MODULE_DEVICE_TABLE(of, imx93_dsi_dt_ids);
 
 static struct platform_driver imx93_dsi_driver = {
 	.probe	= imx93_dsi_probe,
-	.remove_new = imx93_dsi_remove,
+	.remove = imx93_dsi_remove,
 	.driver	= {
 		.of_match_table = imx93_dsi_dt_ids,
 		.name = "imx93_mipi_dsi",
