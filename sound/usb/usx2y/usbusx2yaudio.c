@@ -28,33 +28,6 @@
 #include "usx2y.h"
 #include "usbusx2y.h"
 
-/* Default value used for nr of packs per urb.
- * 1 to 4 have been tested ok on uhci.
- * To use 3 on ohci, you'd need a patch:
- * look for "0000425-linux-2.6.9-rc4-mm1_ohci-hcd.patch.gz" on
- * "https://bugtrack.alsa-project.org/alsa-bug/bug_view_page.php?bug_id=0000425"
- *
- * 1, 2 and 4 work out of the box on ohci, if I recall correctly.
- * Bigger is safer operation, smaller gives lower latencies.
- */
-#define USX2Y_NRPACKS 4
-
-/* If your system works ok with this module's parameter
- * nrpacks set to 1, you might as well comment
- * this define out, and thereby produce smaller, faster code.
- * You'd also set USX2Y_NRPACKS to 1 then.
- */
-#define USX2Y_NRPACKS_VARIABLE 1
-
-#ifdef USX2Y_NRPACKS_VARIABLE
-static int nrpacks = USX2Y_NRPACKS; /* number of packets per urb */
-#define  nr_of_packs() nrpacks
-module_param(nrpacks, int, 0444);
-MODULE_PARM_DESC(nrpacks, "Number of packets per URB.");
-#else
-#define nr_of_packs() USX2Y_NRPACKS
-#endif
-
 static int usx2y_urb_capt_retire(struct snd_usx2y_substream *subs)
 {
 	struct urb	*urb = subs->completed_urb;
@@ -684,15 +657,13 @@ static int usx2y_rate_set(struct usx2ydev *usx2y, int rate)
 	struct urb *urb;
 
 	if (usx2y->rate != rate) {
-		us = kzalloc(struct_size(us, urb, NOOF_SETRATE_URBS),
-			     GFP_KERNEL);
+		us = kzalloc_flex(*us, urb, NOOF_SETRATE_URBS);
 		if (!us) {
 			err = -ENOMEM;
 			goto cleanup;
 		}
 		us->len = NOOF_SETRATE_URBS;
-		usbdata = kmalloc_array(NOOF_SETRATE_URBS, sizeof(int),
-					GFP_KERNEL);
+		usbdata = kmalloc_objs(int, NOOF_SETRATE_URBS);
 		if (!usbdata) {
 			err = -ENOMEM;
 			goto cleanup;
@@ -778,7 +749,6 @@ static int usx2y_format_set(struct usx2ydev *usx2y, snd_pcm_format_t format)
 static int snd_usx2y_pcm_hw_params(struct snd_pcm_substream *substream,
 				   struct snd_pcm_hw_params *hw_params)
 {
-	int			err = 0;
 	unsigned int		rate = params_rate(hw_params);
 	snd_pcm_format_t	format = params_format(hw_params);
 	struct snd_card *card = substream->pstr->pcm->card;
@@ -787,7 +757,7 @@ static int snd_usx2y_pcm_hw_params(struct snd_pcm_substream *substream,
 	struct snd_pcm_substream *test_substream;
 	int i;
 
-	mutex_lock(&usx2y(card)->pcm_mutex);
+	guard(mutex)(&usx2y(card)->pcm_mutex);
 	dev_dbg(&dev->dev->dev, "%s(%p, %p)\n", __func__, substream, hw_params);
 	/* all pcm substreams off one usx2y have to operate at the same
 	 * rate & format
@@ -804,14 +774,11 @@ static int snd_usx2y_pcm_hw_params(struct snd_pcm_substream *substream,
 		     test_substream->runtime->format != format) ||
 		    (test_substream->runtime->rate &&
 		     test_substream->runtime->rate != rate)) {
-			err = -EINVAL;
-			goto error;
+			return -EINVAL;
 		}
 	}
 
- error:
-	mutex_unlock(&usx2y(card)->pcm_mutex);
-	return err;
+	return 0;
 }
 
 /*
@@ -823,7 +790,7 @@ static int snd_usx2y_pcm_hw_free(struct snd_pcm_substream *substream)
 	struct snd_usx2y_substream *subs = runtime->private_data;
 	struct snd_usx2y_substream *cap_subs, *playback_subs;
 
-	mutex_lock(&subs->usx2y->pcm_mutex);
+	guard(mutex)(&subs->usx2y->pcm_mutex);
 	dev_dbg(&subs->usx2y->dev->dev, "%s(%p)\n", __func__, substream);
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
@@ -843,7 +810,6 @@ static int snd_usx2y_pcm_hw_free(struct snd_pcm_substream *substream)
 			usx2y_urbs_release(subs);
 		}
 	}
-	mutex_unlock(&subs->usx2y->pcm_mutex);
 	return 0;
 }
 
@@ -862,7 +828,7 @@ static int snd_usx2y_pcm_prepare(struct snd_pcm_substream *substream)
 
 	dev_dbg(&usx2y->dev->dev, "%s(%p)\n", __func__, substream);
 
-	mutex_lock(&usx2y->pcm_mutex);
+	guard(mutex)(&usx2y->pcm_mutex);
 	usx2y_subs_prepare(subs);
 	// Start hardware streams
 	// SyncStream first....
@@ -870,25 +836,23 @@ static int snd_usx2y_pcm_prepare(struct snd_pcm_substream *substream)
 		if (usx2y->format != runtime->format) {
 			err = usx2y_format_set(usx2y, runtime->format);
 			if (err < 0)
-				goto up_prepare_mutex;
+				return err;
 		}
 		if (usx2y->rate != runtime->rate) {
 			err = usx2y_rate_set(usx2y, runtime->rate);
 			if (err < 0)
-				goto up_prepare_mutex;
+				return err;
 		}
 		dev_dbg(&usx2y->dev->dev, "%s: starting capture pipe for %s\n",
 			__func__, subs == capsubs ? "self" : "playpipe");
 		err = usx2y_urbs_start(capsubs);
 		if (err < 0)
-			goto up_prepare_mutex;
+			return err;
 	}
 
 	if (subs != capsubs && atomic_read(&subs->state) < STATE_PREPARED)
 		err = usx2y_urbs_start(subs);
 
- up_prepare_mutex:
-	mutex_unlock(&usx2y->pcm_mutex);
 	return err;
 }
 
@@ -978,7 +942,7 @@ static int usx2y_audio_stream_new(struct snd_card *card, int playback_endpoint, 
 
 	for (i = playback_endpoint ? SNDRV_PCM_STREAM_PLAYBACK : SNDRV_PCM_STREAM_CAPTURE;
 	     i <= SNDRV_PCM_STREAM_CAPTURE; ++i) {
-		usx2y_substream[i] = kzalloc(sizeof(struct snd_usx2y_substream), GFP_KERNEL);
+		usx2y_substream[i] = kzalloc_obj(struct snd_usx2y_substream);
 		if (!usx2y_substream[i])
 			return -ENOMEM;
 

@@ -605,6 +605,8 @@ static int netdev_trig_notify(struct notifier_block *nb,
 		trigger_data->net_dev = NULL;
 		break;
 	case NETDEV_UP:
+		trigger_data->hw_control = can_hw_control(trigger_data);
+		fallthrough;
 	case NETDEV_CHANGE:
 		get_device_state(trigger_data);
 		/* Refresh link_speed visibility */
@@ -689,7 +691,7 @@ static int netdev_trig_activate(struct led_classdev *led_cdev)
 	struct device *dev;
 	int rc;
 
-	trigger_data = kzalloc(sizeof(struct led_netdev_data), GFP_KERNEL);
+	trigger_data = kzalloc_obj(struct led_netdev_data);
 	if (!trigger_data)
 		return -ENOMEM;
 

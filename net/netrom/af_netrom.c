@@ -240,7 +240,7 @@ void nr_destroy_socket(struct sock *);
  */
 static void nr_destroy_timer(struct timer_list *t)
 {
-	struct sock *sk = from_timer(sk, t, sk_timer);
+	struct sock *sk = timer_container_of(sk, t, sk_timer);
 	bh_lock_sock(sk);
 	sock_hold(sk);
 	nr_destroy_socket(sk);
@@ -561,7 +561,7 @@ static int nr_release(struct socket *sock)
 	return 0;
 }
 
-static int nr_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
+static int nr_bind(struct socket *sock, struct sockaddr_unsized *uaddr, int addr_len)
 {
 	struct sock *sk = sock->sk;
 	struct nr_sock *nr = nr_sk(sk);
@@ -632,8 +632,8 @@ static int nr_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	return 0;
 }
 
-static int nr_connect(struct socket *sock, struct sockaddr *uaddr,
-	int addr_len, int flags)
+static int nr_connect(struct socket *sock, struct sockaddr_unsized *uaddr,
+		      int addr_len, int flags)
 {
 	struct sock *sk = sock->sk;
 	struct nr_sock *nr = nr_sk(sk);
@@ -1305,7 +1305,7 @@ static int nr_info_show(struct seq_file *seq, void *v)
 		seq_printf(seq, "%-9s ", ax2asc(buf, &nr->user_addr));
 		seq_printf(seq, "%-9s ", ax2asc(buf, &nr->dest_addr));
 		seq_printf(seq,
-"%-9s %-3s  %02X/%02X %02X/%02X %2d %3d %3d %3d %3lu/%03lu %2lu/%02lu %3lu/%03lu %3lu/%03lu %2d/%02d %3d %5d %5d %ld\n",
+"%-9s %-3s  %02X/%02X %02X/%02X %2d %3d %3d %3d %3lu/%03lu %2lu/%02lu %3lu/%03lu %3lu/%03lu %2d/%02d %3d %5d %5d %llu\n",
 			ax2asc(buf, &nr->source_addr),
 			devname,
 			nr->my_index,
@@ -1329,7 +1329,7 @@ static int nr_info_show(struct seq_file *seq, void *v)
 			nr->window,
 			sk_wmem_alloc_get(s),
 			sk_rmem_alloc_get(s),
-			s->sk_socket ? SOCK_INODE(s->sk_socket)->i_ino : 0L);
+			s->sk_socket ? SOCK_INODE(s->sk_socket)->i_ino : (u64)0);
 
 		bh_unlock_sock(s);
 	}
@@ -1401,7 +1401,7 @@ static int __init nr_proto_init(void)
 		goto unregister_proto;
 	}
 
-	dev_nr = kcalloc(nr_ndevs, sizeof(struct net_device *), GFP_KERNEL);
+	dev_nr = kzalloc_objs(struct net_device *, nr_ndevs);
 	if (!dev_nr) {
 		pr_err("NET/ROM: %s - unable to allocate device array\n",
 		       __func__);

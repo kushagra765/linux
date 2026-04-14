@@ -26,7 +26,6 @@
 
 #define DRIVER_NAME "gma500"
 #define DRIVER_DESC "DRM driver for the Intel GMA500, GMA600, GMA3600, GMA3650"
-#define DRIVER_DATE "20140314"
 
 #define DRIVER_MAJOR 1
 #define DRIVER_MINOR 0
@@ -595,6 +594,7 @@ extern void psb_modeset_cleanup(struct drm_device *dev);
 
 /* framebuffer */
 struct drm_framebuffer *psb_framebuffer_create(struct drm_device *dev,
+					       const struct drm_format_info *info,
 					       const struct drm_mode_fb_cmd2 *mode_cmd,
 					       struct drm_gem_object *obj);
 

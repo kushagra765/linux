@@ -49,6 +49,13 @@ extern const struct bnxt_qplib_gid bnxt_qplib_gid_zero;
 #define CHIP_NUM_58818          0xd818
 #define CHIP_NUM_57608          0x1760
 
+#define BNXT_RE_MAX_QPC_COUNT		(64 * 1024)
+#define BNXT_RE_MAX_MRW_COUNT		(64 * 1024)
+#define BNXT_RE_MAX_SRQC_COUNT		(64 * 1024)
+#define BNXT_RE_MAX_CQ_COUNT		(64 * 1024)
+#define BNXT_RE_MAX_MRW_COUNT_64K	(64 * 1024)
+#define BNXT_RE_MAX_MRW_COUNT_256K	(256 * 1024)
+
 #define BNXT_QPLIB_DBR_VALID		(0x1UL << 26)
 #define BNXT_QPLIB_DBR_EPOCH_SHIFT	24
 #define BNXT_QPLIB_DBR_TOGGLE_SHIFT	25
@@ -58,6 +65,7 @@ struct bnxt_qplib_drv_modes {
 	bool db_push;
 	bool dbr_pacing;
 	u32 toggle_bits;
+	u8 roce_mirror;
 };
 
 enum bnxt_re_toggle_modes {
@@ -296,6 +304,7 @@ struct bnxt_qplib_ctx {
 	struct bnxt_qplib_hwq		tim_tbl;
 	struct bnxt_qplib_tqm_ctx	tqm_ctx;
 	struct bnxt_qplib_stats		stats;
+	struct bnxt_qplib_stats		stats3;
 	struct bnxt_qplib_vf_res	vf_res;
 };
 
@@ -424,18 +433,20 @@ int bnxt_qplib_dealloc_dpi(struct bnxt_qplib_res *res,
 void bnxt_qplib_cleanup_res(struct bnxt_qplib_res *res);
 int bnxt_qplib_init_res(struct bnxt_qplib_res *res);
 void bnxt_qplib_free_res(struct bnxt_qplib_res *res);
-int bnxt_qplib_alloc_res(struct bnxt_qplib_res *res, struct pci_dev *pdev,
-			 struct net_device *netdev,
-			 struct bnxt_qplib_dev_attr *dev_attr);
-void bnxt_qplib_free_ctx(struct bnxt_qplib_res *res,
-			 struct bnxt_qplib_ctx *ctx);
-int bnxt_qplib_alloc_ctx(struct bnxt_qplib_res *res,
-			 struct bnxt_qplib_ctx *ctx,
-			 bool virt_fn, bool is_p5);
+int bnxt_qplib_alloc_res(struct bnxt_qplib_res *res, struct net_device *netdev);
+void bnxt_qplib_free_hwctx(struct bnxt_qplib_res *res,
+			   struct bnxt_qplib_ctx *ctx);
+int bnxt_qplib_alloc_hwctx(struct bnxt_qplib_res *res,
+			   struct bnxt_qplib_ctx *ctx);
 int bnxt_qplib_map_db_bar(struct bnxt_qplib_res *res);
 void bnxt_qplib_unmap_db_bar(struct bnxt_qplib_res *res);
 
 int bnxt_qplib_determine_atomics(struct pci_dev *dev);
+int bnxt_qplib_alloc_stats_ctx(struct pci_dev *pdev,
+			       struct bnxt_qplib_chip_ctx *cctx,
+			       struct bnxt_qplib_stats *stats);
+void bnxt_qplib_free_stats_ctx(struct pci_dev *pdev,
+			       struct bnxt_qplib_stats *stats);
 
 static inline void bnxt_qplib_hwq_incr_prod(struct bnxt_qplib_db_info *dbinfo,
 					    struct bnxt_qplib_hwq *hwq, u32 cnt)
@@ -549,6 +560,14 @@ static inline bool _is_ext_stats_supported(u16 dev_cap_flags)
 		CREQ_QUERY_FUNC_RESP_SB_EXT_STATS;
 }
 
+static inline int bnxt_ext_stats_supported(struct bnxt_qplib_chip_ctx *ctx,
+					   u16 flags, bool virtfn)
+{
+	/* ext stats supported if cap flag is set AND is a PF OR a Thor2 VF */
+	return (_is_ext_stats_supported(flags) &&
+		((virtfn && bnxt_qplib_is_chip_gen_p7(ctx)) || (!virtfn)));
+}
+
 static inline bool _is_hw_retx_supported(u16 dev_cap_flags)
 {
 	return dev_cap_flags &
@@ -569,6 +588,11 @@ static inline u8 bnxt_qplib_dbr_pacing_en(struct bnxt_qplib_chip_ctx *cctx)
 	return cctx->modes.dbr_pacing;
 }
 
+static inline u8 bnxt_qplib_roce_mirror_supported(struct bnxt_qplib_chip_ctx *cctx)
+{
+	return cctx->modes.roce_mirror;
+}
+
 static inline bool _is_alloc_mr_unified(u16 dev_cap_flags)
 {
 	return dev_cap_flags & CREQ_QUERY_FUNC_RESP_SB_MR_REGISTER_ALLOC;
@@ -584,9 +608,25 @@ static inline bool _is_optimize_modify_qp_supported(u16 dev_cap_ext_flags2)
 	return dev_cap_ext_flags2 & CREQ_QUERY_FUNC_RESP_SB_OPTIMIZE_MODIFY_QP_SUPPORTED;
 }
 
+static inline bool _is_min_rnr_in_rtr_rts_mandatory(u16 dev_cap_ext_flags2)
+{
+	return !!(dev_cap_ext_flags2 & CREQ_QUERY_FUNC_RESP_SB_MIN_RNR_RTR_RTS_OPT_SUPPORTED);
+}
+
 static inline bool _is_cq_coalescing_supported(u16 dev_cap_ext_flags2)
 {
 	return dev_cap_ext_flags2 & CREQ_QUERY_FUNC_RESP_SB_CQ_COALESCING_SUPPORTED;
+}
+
+static inline bool _is_max_srq_ext_supported(u16 dev_cap_ext_flags_2)
+{
+	return !!(dev_cap_ext_flags_2 & CREQ_QUERY_FUNC_RESP_SB_MAX_SRQ_EXTENDED);
+}
+
+static inline bool _is_modify_qp_rate_limit_supported(u16 dev_cap_ext_flags2)
+{
+	return dev_cap_ext_flags2 &
+		CREQ_QUERY_FUNC_RESP_SB_MODIFY_QP_RATE_LIMIT_SUPPORTED;
 }
 
 #endif /* __BNXT_QPLIB_RES_H__ */

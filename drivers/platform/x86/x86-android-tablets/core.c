@@ -5,7 +5,7 @@
  * devices typically have a bunch of things hardcoded, rather than specified
  * in their DSDT.
  *
- * Copyright (C) 2021-2023 Hans de Goede <hdegoede@redhat.com>
+ * Copyright (C) 2021-2023 Hans de Goede <hansg@kernel.org>
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -49,7 +49,7 @@ int x86_android_tablet_get_gpiod(const char *chip, int pin, const char *con_id,
 	struct gpiod_lookup_table *lookup;
 	struct gpio_desc *gpiod;
 
-	lookup = kzalloc(struct_size(lookup, table, 2), GFP_KERNEL);
+	lookup = kzalloc_flex(*lookup, table, 2);
 	if (!lookup)
 		return -ENOMEM;
 
@@ -152,12 +152,12 @@ static struct i2c_client **i2c_clients;
 static struct spi_device **spi_devs;
 static struct platform_device **pdevs;
 static struct serdev_device **serdevs;
-static struct gpio_keys_button *buttons;
-static struct gpiod_lookup_table * const *gpiod_lookup_tables;
-static const struct software_node *bat_swnode;
+static const struct software_node **gpio_button_swnodes;
+static const struct software_node **swnode_group;
+static const struct software_node **gpiochip_node_group;
 static void (*exit_handler)(void);
 
-static struct i2c_adapter *
+static __init struct i2c_adapter *
 get_i2c_adap_by_handle(const struct x86_i2c_client_info *client_info)
 {
 	acpi_handle handle;
@@ -177,7 +177,7 @@ static __init int match_parent(struct device *dev, const void *data)
 	return dev->parent == data;
 }
 
-static struct i2c_adapter *
+static __init struct i2c_adapter *
 get_i2c_adap_by_pci_parent(const struct x86_i2c_client_info *client_info)
 {
 	struct i2c_adapter *adap = NULL;
@@ -212,7 +212,7 @@ static __init int x86_instantiate_i2c_client(const struct x86_dev_info *dev_info
 	if (board_info.irq < 0)
 		return board_info.irq;
 
-	if (dev_info->use_pci_devname)
+	if (dev_info->use_pci)
 		adap = get_i2c_adap_by_pci_parent(client_info);
 	else
 		adap = get_i2c_adap_by_handle(client_info);
@@ -265,21 +265,39 @@ static __init int x86_instantiate_spi_dev(const struct x86_dev_info *dev_info, i
 	spi_devs[idx] = spi_new_device(controller, &board_info);
 	put_device(&controller->dev);
 	if (!spi_devs[idx])
-		return dev_err_probe(&controller->dev, -ENOMEM,
-				     "creating SPI-device %d\n", idx);
+		return -ENOMEM;
 
 	return 0;
 }
 
-static __init int x86_instantiate_serdev(const struct x86_serdev_info *info, int idx)
+static __init struct device *
+get_serdev_controller_by_pci_parent(const struct x86_serdev_info *info)
 {
+	struct pci_dev *pdev;
+
+	pdev = pci_get_domain_bus_and_slot(0, 0, info->ctrl.pci.devfn);
+	if (!pdev) {
+		pr_err("error could not get PCI serdev at devfn 0x%02x\n", info->ctrl.pci.devfn);
+		return ERR_PTR(-ENODEV);
+	}
+
+	/* This puts our reference on pdev and returns a ref on the ctrl */
+	return get_serdev_controller_from_parent(&pdev->dev, 0, info->ctrl_devname);
+}
+
+static __init int x86_instantiate_serdev(const struct x86_dev_info *dev_info, int idx)
+{
+	const struct x86_serdev_info *info = &dev_info->serdev_info[idx];
 	struct acpi_device *serdev_adev;
 	struct serdev_device *serdev;
 	struct device *ctrl_dev;
 	int ret = -ENODEV;
 
-	ctrl_dev = get_serdev_controller(info->ctrl_hid, info->ctrl_uid, 0,
-					 info->ctrl_devname);
+	if (dev_info->use_pci)
+		ctrl_dev = get_serdev_controller_by_pci_parent(info);
+	else
+		ctrl_dev = get_serdev_controller(info->ctrl.acpi.hid, info->ctrl.acpi.uid,
+						 0, info->ctrl_devname);
 	if (IS_ERR(ctrl_dev))
 		return PTR_ERR(ctrl_dev);
 
@@ -314,6 +332,34 @@ put_ctrl_dev:
 	return ret;
 }
 
+const struct software_node baytrail_gpiochip_nodes[] = {
+	{ .name = "INT33FC:00" },
+	{ .name = "INT33FC:01" },
+	{ .name = "INT33FC:02" },
+};
+
+static const struct software_node *baytrail_gpiochip_node_group[] = {
+	&baytrail_gpiochip_nodes[0],
+	&baytrail_gpiochip_nodes[1],
+	&baytrail_gpiochip_nodes[2],
+	NULL
+};
+
+const struct software_node cherryview_gpiochip_nodes[] = {
+	{ .name = "INT33FF:00" },
+	{ .name = "INT33FF:01" },
+	{ .name = "INT33FF:02" },
+	{ .name = "INT33FF:03" },
+};
+
+static const struct software_node *cherryview_gpiochip_node_group[] = {
+	&cherryview_gpiochip_nodes[0],
+	&cherryview_gpiochip_nodes[1],
+	&cherryview_gpiochip_nodes[2],
+	&cherryview_gpiochip_nodes[3],
+	NULL
+};
+
 static void x86_android_tablet_remove(struct platform_device *pdev)
 {
 	int i;
@@ -329,7 +375,6 @@ static void x86_android_tablet_remove(struct platform_device *pdev)
 		platform_device_unregister(pdevs[i]);
 
 	kfree(pdevs);
-	kfree(buttons);
 
 	for (i = spi_dev_count - 1; i >= 0; i--)
 		spi_unregister_device(spi_devs[i]);
@@ -344,10 +389,9 @@ static void x86_android_tablet_remove(struct platform_device *pdev)
 	if (exit_handler)
 		exit_handler();
 
-	for (i = 0; gpiod_lookup_tables && gpiod_lookup_tables[i]; i++)
-		gpiod_remove_lookup_table(gpiod_lookup_tables[i]);
-
-	software_node_unregister(bat_swnode);
+	software_node_unregister_node_group(gpio_button_swnodes);
+	software_node_unregister_node_group(swnode_group);
+	software_node_unregister_node_group(gpiochip_node_group);
 }
 
 static __init int x86_android_tablet_probe(struct platform_device *pdev)
@@ -371,16 +415,28 @@ static __init int x86_android_tablet_probe(struct platform_device *pdev)
 	for (i = 0; dev_info->modules && dev_info->modules[i]; i++)
 		request_module(dev_info->modules[i]);
 
-	bat_swnode = dev_info->bat_swnode;
-	if (bat_swnode) {
-		ret = software_node_register(bat_swnode);
-		if (ret)
-			return ret;
+	switch (dev_info->gpiochip_type) {
+	case X86_GPIOCHIP_BAYTRAIL:
+		gpiochip_node_group = baytrail_gpiochip_node_group;
+		break;
+	case X86_GPIOCHIP_CHERRYVIEW:
+		gpiochip_node_group = cherryview_gpiochip_node_group;
+		break;
+	case X86_GPIOCHIP_UNSPECIFIED:
+		gpiochip_node_group = NULL;
+		break;
 	}
 
-	gpiod_lookup_tables = dev_info->gpiod_lookup_tables;
-	for (i = 0; gpiod_lookup_tables && gpiod_lookup_tables[i]; i++)
-		gpiod_add_lookup_table(gpiod_lookup_tables[i]);
+	ret = software_node_register_node_group(gpiochip_node_group);
+	if (ret)
+		return ret;
+
+	ret = software_node_register_node_group(dev_info->swnode_group);
+	if (ret) {
+		x86_android_tablet_remove(pdev);
+		return ret;
+	}
+	swnode_group = dev_info->swnode_group;
 
 	if (dev_info->init) {
 		ret = dev_info->init(&pdev->dev);
@@ -391,7 +447,7 @@ static __init int x86_android_tablet_probe(struct platform_device *pdev)
 		exit_handler = dev_info->exit;
 	}
 
-	i2c_clients = kcalloc(dev_info->i2c_client_count, sizeof(*i2c_clients), GFP_KERNEL);
+	i2c_clients = kzalloc_objs(*i2c_clients, dev_info->i2c_client_count);
 	if (!i2c_clients) {
 		x86_android_tablet_remove(pdev);
 		return -ENOMEM;
@@ -406,7 +462,7 @@ static __init int x86_android_tablet_probe(struct platform_device *pdev)
 		}
 	}
 
-	spi_devs = kcalloc(dev_info->spi_dev_count, sizeof(*spi_devs), GFP_KERNEL);
+	spi_devs = kzalloc_objs(*spi_devs, dev_info->spi_dev_count);
 	if (!spi_devs) {
 		x86_android_tablet_remove(pdev);
 		return -ENOMEM;
@@ -422,7 +478,7 @@ static __init int x86_android_tablet_probe(struct platform_device *pdev)
 	}
 
 	/* + 1 to make space for the (optional) gpio_keys_button platform device */
-	pdevs = kcalloc(dev_info->pdev_count + 1, sizeof(*pdevs), GFP_KERNEL);
+	pdevs = kzalloc_objs(*pdevs, dev_info->pdev_count + 1);
 	if (!pdevs) {
 		x86_android_tablet_remove(pdev);
 		return -ENOMEM;
@@ -438,7 +494,7 @@ static __init int x86_android_tablet_probe(struct platform_device *pdev)
 		}
 	}
 
-	serdevs = kcalloc(dev_info->serdev_count, sizeof(*serdevs), GFP_KERNEL);
+	serdevs = kzalloc_objs(*serdevs, dev_info->serdev_count);
 	if (!serdevs) {
 		x86_android_tablet_remove(pdev);
 		return -ENOMEM;
@@ -446,45 +502,29 @@ static __init int x86_android_tablet_probe(struct platform_device *pdev)
 
 	serdev_count = dev_info->serdev_count;
 	for (i = 0; i < serdev_count; i++) {
-		ret = x86_instantiate_serdev(&dev_info->serdev_info[i], i);
+		ret = x86_instantiate_serdev(dev_info, i);
 		if (ret < 0) {
 			x86_android_tablet_remove(pdev);
 			return ret;
 		}
 	}
 
-	if (dev_info->gpio_button_count) {
-		struct gpio_keys_platform_data pdata = { };
-		struct gpio_desc *gpiod;
+	if (dev_info->gpio_button_swnodes) {
+		struct platform_device_info button_info = {
+			.name = "gpio-keys",
+			.id = PLATFORM_DEVID_AUTO,
+		};
 
-		buttons = kcalloc(dev_info->gpio_button_count, sizeof(*buttons), GFP_KERNEL);
-		if (!buttons) {
+		ret = software_node_register_node_group(dev_info->gpio_button_swnodes);
+		if (ret < 0) {
 			x86_android_tablet_remove(pdev);
-			return -ENOMEM;
+			return ret;
 		}
 
-		for (i = 0; i < dev_info->gpio_button_count; i++) {
-			ret = x86_android_tablet_get_gpiod(dev_info->gpio_button[i].chip,
-							   dev_info->gpio_button[i].pin,
-							   dev_info->gpio_button[i].button.desc,
-							   false, GPIOD_IN, &gpiod);
-			if (ret < 0) {
-				x86_android_tablet_remove(pdev);
-				return ret;
-			}
+		gpio_button_swnodes = dev_info->gpio_button_swnodes;
 
-			buttons[i] = dev_info->gpio_button[i].button;
-			buttons[i].gpio = desc_to_gpio(gpiod);
-			/* Release GPIO descriptor so that gpio-keys can request it */
-			devm_gpiod_put(&x86_android_tablet_device->dev, gpiod);
-		}
-
-		pdata.buttons = buttons;
-		pdata.nbuttons = dev_info->gpio_button_count;
-
-		pdevs[pdev_count] = platform_device_register_data(&pdev->dev, "gpio-keys",
-								  PLATFORM_DEVID_AUTO,
-								  &pdata, sizeof(pdata));
+		button_info.fwnode = software_node_fwnode(dev_info->gpio_button_swnodes[0]);
+		pdevs[pdev_count] = platform_device_register_full(&button_info);
 		if (IS_ERR(pdevs[pdev_count])) {
 			ret = PTR_ERR(pdevs[pdev_count]);
 			x86_android_tablet_remove(pdev);
@@ -520,6 +560,6 @@ static void __exit x86_android_tablet_exit(void)
 }
 module_exit(x86_android_tablet_exit);
 
-MODULE_AUTHOR("Hans de Goede <hdegoede@redhat.com>");
+MODULE_AUTHOR("Hans de Goede <hansg@kernel.org>");
 MODULE_DESCRIPTION("X86 Android tablets DSDT fixups driver");
 MODULE_LICENSE("GPL");

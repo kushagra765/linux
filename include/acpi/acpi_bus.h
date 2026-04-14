@@ -43,9 +43,6 @@ acpi_status
 acpi_evaluate_ost(acpi_handle handle, u32 source_event, u32 status_code,
 		  struct acpi_buffer *status_buf);
 
-acpi_status
-acpi_get_physical_device_location(acpi_handle handle, struct acpi_pld_info **pld);
-
 bool acpi_has_method(acpi_handle handle, char *name);
 acpi_status acpi_execute_simple_method(acpi_handle handle, char *method,
 				       u64 arg);
@@ -60,6 +57,9 @@ bool acpi_check_dsm(acpi_handle handle, const guid_t *guid, u64 rev, u64 funcs);
 union acpi_object *acpi_evaluate_dsm(acpi_handle handle, const guid_t *guid,
 			u64 rev, u64 func, union acpi_object *argv4);
 #ifdef CONFIG_ACPI
+bool
+acpi_get_physical_device_location(acpi_handle handle, struct acpi_pld_info **pld);
+
 static inline union acpi_object *
 acpi_evaluate_dsm_typed(acpi_handle handle, const guid_t *guid, u64 rev,
 			u64 func, union acpi_object *argv4,
@@ -613,6 +613,8 @@ struct acpi_bus_event {
 	u32 data;
 };
 
+#define ACPI_AC_CLASS	"ac_adapter"
+
 extern struct kobject *acpi_kobj;
 extern int acpi_bus_generate_netlink_event(const char*, const char*, u8, int);
 void acpi_bus_private_data_handler(acpi_handle, void *);
@@ -625,7 +627,8 @@ int acpi_dev_install_notify_handler(struct acpi_device *adev,
 void acpi_dev_remove_notify_handler(struct acpi_device *adev,
 				    u32 handler_type,
 				    acpi_notify_handler handler);
-extern int acpi_notifier_call_chain(struct acpi_device *, u32, u32);
+extern int acpi_notifier_call_chain(const char *device_class,
+				    const char *bus_id, u32 type, u32 data);
 extern int register_acpi_notifier(struct notifier_block *);
 extern int unregister_acpi_notifier(struct notifier_block *);
 
@@ -760,8 +763,6 @@ int acpi_disable_wakeup_device_power(struct acpi_device *dev);
 #ifdef CONFIG_X86
 bool acpi_device_override_status(struct acpi_device *adev, unsigned long long *status);
 bool acpi_quirk_skip_acpi_ac_and_battery(void);
-int acpi_install_cmos_rtc_space_handler(acpi_handle handle);
-void acpi_remove_cmos_rtc_space_handler(acpi_handle handle);
 int acpi_quirk_skip_serdev_enumeration(struct device *controller_parent, bool *skip);
 #else
 static inline bool acpi_device_override_status(struct acpi_device *adev,
@@ -772,13 +773,6 @@ static inline bool acpi_device_override_status(struct acpi_device *adev,
 static inline bool acpi_quirk_skip_acpi_ac_and_battery(void)
 {
 	return false;
-}
-static inline int acpi_install_cmos_rtc_space_handler(acpi_handle handle)
-{
-	return 1;
-}
-static inline void acpi_remove_cmos_rtc_space_handler(acpi_handle handle)
-{
 }
 static inline int
 acpi_quirk_skip_serdev_enumeration(struct device *controller_parent, bool *skip)
@@ -1002,6 +996,23 @@ static inline int register_acpi_bus_type(void *bus) { return 0; }
 static inline int unregister_acpi_bus_type(void *bus) { return 0; }
 
 static inline int acpi_wait_for_acpi_ipmi(void) { return 0; }
+
+static inline const char *acpi_device_hid(struct acpi_device *device)
+{
+	return "";
+}
+
+static inline bool
+acpi_get_physical_device_location(acpi_handle handle, struct acpi_pld_info **pld)
+{
+	return false;
+}
+
+#define for_each_acpi_consumer_dev(supplier, consumer)			\
+	for (consumer = NULL; false && (supplier);)
+
+#define for_each_acpi_dev_match(adev, hid, uid, hrv)			\
+	for (adev = NULL; false && (hid) && (uid) && (hrv); )
 
 #endif				/* CONFIG_ACPI */
 

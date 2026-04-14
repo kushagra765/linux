@@ -52,6 +52,7 @@
 #include <rdma/ib.h>
 #include <rdma/uverbs_std_types.h>
 #include <rdma/rdma_netlink.h>
+#include <rdma/ib_ucaps.h>
 
 #include "uverbs.h"
 #include "core_priv.h"
@@ -381,7 +382,7 @@ void ib_uverbs_comp_handler(struct ib_cq *cq, void *cq_context)
 		return;
 	}
 
-	entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
+	entry = kmalloc_obj(*entry, GFP_ATOMIC);
 	if (!entry) {
 		spin_unlock_irqrestore(&ev_queue->lock, flags);
 		return;
@@ -416,7 +417,7 @@ void ib_uverbs_async_handler(struct ib_uverbs_async_event_file *async_file,
 		return;
 	}
 
-	entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
+	entry = kmalloc_obj(*entry, GFP_ATOMIC);
 	if (!entry) {
 		spin_unlock_irqrestore(&async_file->ev_queue.lock, flags);
 		return;
@@ -736,7 +737,7 @@ static void rdma_umap_open(struct vm_area_struct *vma)
 	if (!ufile->ucontext)
 		goto out_unlock;
 
-	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+	priv = kzalloc_obj(*priv);
 	if (!priv)
 		goto out_unlock;
 	rdma_umap_priv_init(priv, vma, opriv->entry);
@@ -965,7 +966,7 @@ static int ib_uverbs_open(struct inode *inode, struct file *filp)
 		}
 	}
 
-	file = kzalloc(sizeof(*file), GFP_KERNEL);
+	file = kzalloc_obj(*file);
 	if (!file) {
 		ret = -ENOMEM;
 		if (module_dependent)
@@ -1153,7 +1154,7 @@ static int ib_uverbs_add_one(struct ib_device *device)
 	    device->type == RDMA_DEVICE_TYPE_SMI)
 		return -EOPNOTSUPP;
 
-	uverbs_dev = kzalloc(sizeof(*uverbs_dev), GFP_KERNEL);
+	uverbs_dev = kzalloc_obj(*uverbs_dev);
 	if (!uverbs_dev)
 		return -ENOMEM;
 
@@ -1345,6 +1346,7 @@ static void __exit ib_uverbs_cleanup(void)
 				 IB_UVERBS_NUM_FIXED_MINOR);
 	unregister_chrdev_region(dynamic_uverbs_dev,
 				 IB_UVERBS_NUM_DYNAMIC_MINOR);
+	ib_cleanup_ucaps();
 	mmu_notifier_synchronize();
 }
 

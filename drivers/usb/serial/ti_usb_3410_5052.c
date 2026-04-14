@@ -519,7 +519,7 @@ static int ti_startup(struct usb_serial *serial)
 		dev->descriptor.bNumConfigurations,
 		dev->actconfig->desc.bConfigurationValue);
 
-	tdev = kzalloc(sizeof(struct ti_device), GFP_KERNEL);
+	tdev = kzalloc_obj(struct ti_device);
 	if (!tdev)
 		return -ENOMEM;
 
@@ -598,7 +598,7 @@ static int ti_port_probe(struct usb_serial_port *port)
 {
 	struct ti_port *tport;
 
-	tport = kzalloc(sizeof(*tport), GFP_KERNEL);
+	tport = kzalloc_obj(*tport);
 	if (!tport)
 		return -ENOMEM;
 
@@ -729,11 +729,6 @@ static int ti_open(struct tty_struct *tty, struct usb_serial_port *port)
 
 	/* start read urb */
 	urb = port->read_urb;
-	if (!urb) {
-		dev_err(&port->dev, "%s - no read urb\n", __func__);
-		status = -EINVAL;
-		goto unlink_int_urb;
-	}
 	tport->tp_read_urb_state = TI_READ_URB_RUNNING;
 	urb->context = tport;
 	status = usb_submit_urb(urb, GFP_KERNEL);
@@ -902,7 +897,7 @@ static void ti_set_termios(struct tty_struct *tty,
 	u16 wbaudrate;
 	u16 wflags = 0;
 
-	config = kmalloc(sizeof(*config), GFP_KERNEL);
+	config = kmalloc_obj(*config);
 	if (!config)
 		return;
 

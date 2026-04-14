@@ -3,7 +3,7 @@
  * Copyright (c) 2020-2024 Oracle.  All Rights Reserved.
  * Author: Darrick J. Wong <djwong@kernel.org>
  */
-#include "xfs.h"
+#include "xfs_platform.h"
 #include "xfs_fs.h"
 #include "xfs_shared.h"
 #include "xfs_format.h"
@@ -165,7 +165,8 @@ xrep_rtsummary(
 	 * Now exchange the contents.  Nothing in repair uses the temporary
 	 * buffer, so we can reuse it for the tempfile exchrange information.
 	 */
-	error = xrep_tempexch_trans_reserve(sc, XFS_DATA_FORK, &rts->tempexch);
+	error = xrep_tempexch_trans_reserve(sc, XFS_DATA_FORK, 0,
+			rts->rsumblocks, &rts->tempexch);
 	if (error)
 		return error;
 

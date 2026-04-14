@@ -19,7 +19,7 @@
 
 #endif /* CONFIG_ARC_HAS_PAE40 */
 
-#ifndef __ASSEMBLY__
+#ifndef __ASSEMBLER__
 
 #define clear_page(paddr)		memset((paddr), 0, PAGE_SIZE)
 #define copy_user_page(to, from, vaddr, pg)	copy_page(to, from)
@@ -32,6 +32,8 @@ struct page;
 
 void copy_user_highpage(struct page *to, struct page *from,
 			unsigned long u_vaddr, struct vm_area_struct *vma);
+
+#define clear_user_page clear_user_page
 void clear_user_page(void *to, unsigned long u_vaddr, struct page *page);
 
 typedef struct {
@@ -136,6 +138,6 @@ static inline unsigned long virt_to_pfn(const void *kaddr)
 #include <asm-generic/memory_model.h>   /* page_to_pfn, pfn_to_page */
 #include <asm-generic/getorder.h>
 
-#endif /* !__ASSEMBLY__ */
+#endif /* !__ASSEMBLER__ */
 
 #endif

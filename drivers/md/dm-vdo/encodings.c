@@ -172,9 +172,9 @@ static int __must_check validate_version(struct version_number expected_version,
  *         VDO_INCORRECT_COMPONENT if the component ids don't match,
  *         VDO_UNSUPPORTED_VERSION if the versions or sizes don't match.
  */
-int vdo_validate_header(const struct header *expected_header,
-			const struct header *actual_header, bool exact_size,
-			const char *name)
+static int vdo_validate_header(const struct header *expected_header,
+			       const struct header *actual_header,
+			       bool exact_size, const char *name)
 {
 	int result;
 
@@ -210,7 +210,8 @@ static void encode_version_number(u8 *buffer, size_t *offset,
 	*offset += sizeof(packed);
 }
 
-void vdo_encode_header(u8 *buffer, size_t *offset, const struct header *header)
+static void vdo_encode_header(u8 *buffer, size_t *offset,
+			      const struct header *header)
 {
 	struct packed_header packed = vdo_pack_header(header);
 
@@ -228,7 +229,7 @@ static void decode_version_number(u8 *buffer, size_t *offset,
 	*version = vdo_unpack_version_number(packed);
 }
 
-void vdo_decode_header(u8 *buffer, size_t *offset, struct header *header)
+static void vdo_decode_header(u8 *buffer, size_t *offset, struct header *header)
 {
 	struct packed_header packed;
 
@@ -432,7 +433,10 @@ static void encode_block_map_state_2_0(u8 *buffer, size_t *offset,
 /**
  * vdo_compute_new_forest_pages() - Compute the number of pages which must be allocated at each
  *                                  level in order to grow the forest to a new number of entries.
+ * @root_count: The number of block map roots.
+ * @old_sizes: The sizes of the old tree segments.
  * @entries: The new number of entries the block map must address.
+ * @new_sizes: The sizes of the new tree segments.
  *
  * Return: The total number of non-leaf pages required.
  */
@@ -462,6 +466,9 @@ block_count_t vdo_compute_new_forest_pages(root_count_t root_count,
 
 /**
  * encode_recovery_journal_state_7_0() - Encode the state of a recovery journal.
+ * @buffer: A buffer to store the encoding.
+ * @offset: The offset in the buffer at which to encode.
+ * @state: The recovery journal state to encode.
  *
  * Return: VDO_SUCCESS or an error code.
  */
@@ -484,6 +491,7 @@ static void encode_recovery_journal_state_7_0(u8 *buffer, size_t *offset,
 /**
  * decode_recovery_journal_state_7_0() - Decode the state of a recovery journal saved in a buffer.
  * @buffer: The buffer containing the saved state.
+ * @offset: The offset to start decoding from.
  * @state: A pointer to a recovery journal state to hold the result of a successful decode.
  *
  * Return: VDO_SUCCESS or an error code.
@@ -544,6 +552,9 @@ const char *vdo_get_journal_operation_name(enum journal_operation operation)
 
 /**
  * encode_slab_depot_state_2_0() - Encode the state of a slab depot into a buffer.
+ * @buffer: A buffer to store the encoding.
+ * @offset: The offset in the buffer at which to encode.
+ * @state: The slab depot state to encode.
  */
 static void encode_slab_depot_state_2_0(u8 *buffer, size_t *offset,
 					struct slab_depot_state_2_0 state)
@@ -570,6 +581,9 @@ static void encode_slab_depot_state_2_0(u8 *buffer, size_t *offset,
 
 /**
  * decode_slab_depot_state_2_0() - Decode slab depot component state version 2.0 from a buffer.
+ * @buffer: The buffer being decoded.
+ * @offset: The offset to start decoding from.
+ * @state: A pointer to a slab depot state to hold the decoded result.
  *
  * Return: VDO_SUCCESS or an error code.
  */
@@ -711,24 +725,11 @@ int vdo_configure_slab(block_count_t slab_size, block_count_t slab_journal_block
 	ref_blocks = vdo_get_saved_reference_count_size(slab_size - slab_journal_blocks);
 	meta_blocks = (ref_blocks + slab_journal_blocks);
 
-	/* Make sure test code hasn't configured slabs to be too small. */
+	/* Make sure configured slabs are not too small. */
 	if (meta_blocks >= slab_size)
 		return VDO_BAD_CONFIGURATION;
 
-	/*
-	 * If the slab size is very small, assume this must be a unit test and override the number
-	 * of data blocks to be a power of two (wasting blocks in the slab). Many tests need their
-	 * data_blocks fields to be the exact capacity of the configured volume, and that used to
-	 * fall out since they use a power of two for the number of data blocks, the slab size was
-	 * a power of two, and every block in a slab was a data block.
-	 *
-	 * TODO: Try to figure out some way of structuring testParameters and unit tests so this
-	 * hack isn't needed without having to edit several unit tests every time the metadata size
-	 * changes by one block.
-	 */
 	data_blocks = slab_size - meta_blocks;
-	if ((slab_size < 1024) && !is_power_of_2(data_blocks))
-		data_blocks = ((block_count_t) 1 << ilog2(data_blocks));
 
 	/*
 	 * Configure the slab journal thresholds. The flush threshold is 168 of 224 blocks in
@@ -1169,6 +1170,9 @@ static struct vdo_component unpack_vdo_component_41_0(struct packed_vdo_componen
 
 /**
  * decode_vdo_component() - Decode the component data for the vdo itself out of the super block.
+ * @buffer: The buffer being decoded.
+ * @offset: The offset to start decoding from.
+ * @component: The vdo component structure to decode into.
  *
  * Return: VDO_SUCCESS or an error.
  */
@@ -1218,11 +1222,6 @@ int vdo_validate_config(const struct vdo_config *config,
 	result = VDO_ASSERT(config->slab_size <= (1 << MAX_VDO_SLAB_BITS),
 			    "slab size must be less than or equal to 2^%d",
 			    MAX_VDO_SLAB_BITS);
-	if (result != VDO_SUCCESS)
-		return result;
-
-	result = VDO_ASSERT(config->slab_journal_blocks >= MINIMUM_VDO_SLAB_JOURNAL_BLOCKS,
-			    "slab journal size meets minimum size");
 	if (result != VDO_SUCCESS)
 		return result;
 
@@ -1308,7 +1307,7 @@ void vdo_destroy_component_states(struct vdo_component_states *states)
  *                       understand.
  * @buffer: The buffer being decoded.
  * @offset: The offset to start decoding from.
- * @geometry: The vdo geometry
+ * @geometry: The vdo geometry.
  * @states: An object to hold the successfully decoded state.
  *
  * Return: VDO_SUCCESS or an error.
@@ -1347,7 +1346,7 @@ static int __must_check decode_components(u8 *buffer, size_t *offset,
 /**
  * vdo_decode_component_states() - Decode the payload of a super block.
  * @buffer: The buffer containing the encoded super block contents.
- * @geometry: The vdo geometry
+ * @geometry: The vdo geometry.
  * @states: A pointer to hold the decoded states.
  *
  * Return: VDO_SUCCESS or an error.
@@ -1401,6 +1400,9 @@ int vdo_validate_component_states(struct vdo_component_states *states,
 
 /**
  * vdo_encode_component_states() - Encode the state of all vdo components in the super block.
+ * @buffer: A buffer to store the encoding.
+ * @offset: The offset into the buffer to start the encoding.
+ * @states: The component states to encode.
  */
 static void vdo_encode_component_states(u8 *buffer, size_t *offset,
 					const struct vdo_component_states *states)
@@ -1420,6 +1422,8 @@ static void vdo_encode_component_states(u8 *buffer, size_t *offset,
 
 /**
  * vdo_encode_super_block() - Encode a super block into its on-disk representation.
+ * @buffer: A buffer to store the encoding.
+ * @states: The component states to encode.
  */
 void vdo_encode_super_block(u8 *buffer, struct vdo_component_states *states)
 {
@@ -1444,6 +1448,7 @@ void vdo_encode_super_block(u8 *buffer, struct vdo_component_states *states)
 
 /**
  * vdo_decode_super_block() - Decode a super block from its on-disk representation.
+ * @buffer: The buffer to decode from.
  */
 int vdo_decode_super_block(u8 *buffer)
 {

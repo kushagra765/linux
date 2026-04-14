@@ -84,6 +84,7 @@ enum inv_devices {
 	INV_ICM20600,
 	INV_ICM20602,
 	INV_ICM20690,
+	INV_IAM20380,
 	INV_IAM20680,
 	INV_IAM20680HP,
 	INV_IAM20680HT,
@@ -389,6 +390,8 @@ struct inv_mpu6050_state {
 /* enable level triggering */
 #define INV_MPU6050_LATCH_INT_EN	0x20
 #define INV_MPU6050_BIT_BYPASS_EN	0x2
+/* allow acking interrupts by any register read */
+#define INV_MPU6050_INT_RD_CLEAR	0x10
 
 /* Allowed timestamp period jitter in percent */
 #define INV_MPU6050_TS_PERIOD_JITTER	4
@@ -425,6 +428,7 @@ struct inv_mpu6050_state {
 #define INV_ICM20600_WHOAMI_VALUE		0x11
 #define INV_ICM20602_WHOAMI_VALUE		0x12
 #define INV_ICM20690_WHOAMI_VALUE		0x20
+#define INV_IAM20380_WHOAMI_VALUE		0xB5
 #define INV_IAM20680_WHOAMI_VALUE		0xA9
 #define INV_IAM20680HP_WHOAMI_VALUE		0xF8
 #define INV_IAM20680HT_WHOAMI_VALUE		0xFA

@@ -8,7 +8,6 @@
 
 #define pr_fmt(fmt)	"OF: fdt: " fmt
 
-#include <linux/acpi.h>
 #include <linux/crash_dump.h>
 #include <linux/crc32.h>
 #include <linux/kernel.h>
@@ -26,6 +25,7 @@
 #include <linux/serial_core.h>
 #include <linux/sysfs.h>
 #include <linux/random.h>
+#include <linux/kexec_handover.h>
 
 #include <asm/setup.h>  /* for COMMAND_LINE_SIZE */
 #include <asm/page.h>
@@ -497,17 +497,22 @@ static void __init fdt_reserve_elfcorehdr(void)
 void __init early_init_fdt_scan_reserved_mem(void)
 {
 	int n;
+	int res;
 	u64 base, size;
 
 	if (!initial_boot_params)
 		return;
 
-	fdt_scan_reserved_mem();
 	fdt_reserve_elfcorehdr();
+	fdt_scan_reserved_mem();
 
 	/* Process header /memreserve/ fields */
 	for (n = 0; ; n++) {
-		fdt_get_mem_rsv(initial_boot_params, n, &base, &size);
+		res = fdt_get_mem_rsv(initial_boot_params, n, &base, &size);
+		if (res) {
+			pr_err("Invalid memory reservation block index %d\n", n);
+			break;
+		}
 		if (!size)
 			break;
 		memblock_reserve(base, size);
@@ -618,6 +623,47 @@ const void *__init of_get_flat_dt_prop(unsigned long node, const char *name,
 				       int *size)
 {
 	return fdt_getprop(initial_boot_params, node, name, size);
+}
+
+const __be32 *__init of_flat_dt_get_addr_size_prop(unsigned long node,
+						   const char *name,
+						   int *entries)
+{
+	const __be32 *prop;
+	int len, elen = (dt_root_addr_cells + dt_root_size_cells) * sizeof(__be32);
+
+	prop = of_get_flat_dt_prop(node, name, &len);
+	if (!prop || len % elen) {
+		*entries = 0;
+		return NULL;
+	}
+
+	*entries = len / elen;
+	return prop;
+}
+
+bool __init of_flat_dt_get_addr_size(unsigned long node, const char *name,
+				     u64 *addr, u64 *size)
+{
+	const __be32 *prop;
+	int entries;
+
+	prop = of_flat_dt_get_addr_size_prop(node, name, &entries);
+	if (!prop || entries != 1)
+		return false;
+
+	of_flat_dt_read_addr_size(prop, 0, addr, size);
+	return true;
+}
+
+void __init of_flat_dt_read_addr_size(const __be32 *prop, int entry_index,
+				      u64 *addr, u64 *size)
+{
+	int entry_cells = dt_root_addr_cells + dt_root_size_cells;
+	prop += entry_cells * entry_index;
+
+	*addr = dt_mem_next_cell(dt_root_addr_cells, &prop);
+	*size = dt_mem_next_cell(dt_root_size_cells, &prop);
 }
 
 /**
@@ -807,20 +853,14 @@ static void __init early_init_dt_check_for_initrd(unsigned long node)
  */
 static void __init early_init_dt_check_for_elfcorehdr(unsigned long node)
 {
-	const __be32 *prop;
-	int len;
-
 	if (!IS_ENABLED(CONFIG_CRASH_DUMP))
 		return;
 
 	pr_debug("Looking for elfcorehdr property... ");
 
-	prop = of_get_flat_dt_prop(node, "linux,elfcorehdr", &len);
-	if (!prop || (len < (dt_root_addr_cells + dt_root_size_cells)))
+	if (!of_flat_dt_get_addr_size(node, "linux,elfcorehdr",
+				      &elfcorehdr_addr, &elfcorehdr_size))
 		return;
-
-	elfcorehdr_addr = dt_mem_next_cell(dt_root_addr_cells, &prop);
-	elfcorehdr_size = dt_mem_next_cell(dt_root_size_cells, &prop);
 
 	pr_debug("elfcorehdr_start=0x%llx elfcorehdr_size=0x%llx\n",
 		 elfcorehdr_addr, elfcorehdr_size);
@@ -844,8 +884,9 @@ static unsigned long chosen_node_offset = -FDT_ERR_NOTFOUND;
 void __init early_init_dt_check_for_usable_mem_range(void)
 {
 	struct memblock_region rgn[MAX_USABLE_RANGES] = {0};
-	const __be32 *prop, *endp;
+	const __be32 *prop;
 	int len, i;
+	u64 base, size;
 	unsigned long node = chosen_node_offset;
 
 	if ((long)node < 0)
@@ -853,14 +894,17 @@ void __init early_init_dt_check_for_usable_mem_range(void)
 
 	pr_debug("Looking for usable-memory-range property... ");
 
-	prop = of_get_flat_dt_prop(node, "linux,usable-memory-range", &len);
-	if (!prop || (len % (dt_root_addr_cells + dt_root_size_cells)))
+	prop = of_flat_dt_get_addr_size_prop(node, "linux,usable-memory-range",
+					     &len);
+	if (!prop)
 		return;
 
-	endp = prop + (len / sizeof(__be32));
-	for (i = 0; i < MAX_USABLE_RANGES && prop < endp; i++) {
-		rgn[i].base = dt_mem_next_cell(dt_root_addr_cells, &prop);
-		rgn[i].size = dt_mem_next_cell(dt_root_size_cells, &prop);
+	len = min(len, MAX_USABLE_RANGES);
+
+	for (i = 0; i < len; i++) {
+		of_flat_dt_read_addr_size(prop, i, &base, &size);
+		rgn[i].base = base;
+		rgn[i].size = size;
 
 		pr_debug("cap_mem_regions[%d]: base=%pa, size=%pa\n",
 			 i, &rgn[i].base, &rgn[i].size);
@@ -869,6 +913,28 @@ void __init early_init_dt_check_for_usable_mem_range(void)
 	memblock_cap_memory_range(rgn[0].base, rgn[0].size);
 	for (i = 1; i < MAX_USABLE_RANGES && rgn[i].size; i++)
 		memblock_add(rgn[i].base, rgn[i].size);
+}
+
+/**
+ * early_init_dt_check_kho - Decode info required for kexec handover from DT
+ */
+static void __init early_init_dt_check_kho(void)
+{
+	unsigned long node = chosen_node_offset;
+	u64 fdt_start, fdt_size, scratch_start, scratch_size;
+
+	if (!IS_ENABLED(CONFIG_KEXEC_HANDOVER) || (long)node < 0)
+		return;
+
+	if (!of_flat_dt_get_addr_size(node, "linux,kho-fdt",
+				      &fdt_start, &fdt_size))
+		return;
+
+	if (!of_flat_dt_get_addr_size(node, "linux,kho-scratch",
+				      &scratch_start, &scratch_size))
+		return;
+
+	kho_populate(fdt_start, fdt_size, scratch_start, scratch_size);
 }
 
 #ifdef CONFIG_SERIAL_EARLYCON
@@ -967,8 +1033,8 @@ int __init early_init_dt_scan_memory(void)
 
 	fdt_for_each_subnode(node, fdt, 0) {
 		const char *type = of_get_flat_dt_prop(node, "device_type", NULL);
-		const __be32 *reg, *endp;
-		int l;
+		const __be32 *reg;
+		int i, l;
 		bool hotpluggable;
 
 		/* We are scanning "memory" nodes only */
@@ -978,23 +1044,21 @@ int __init early_init_dt_scan_memory(void)
 		if (!of_fdt_device_is_available(fdt, node))
 			continue;
 
-		reg = of_get_flat_dt_prop(node, "linux,usable-memory", &l);
+		reg = of_flat_dt_get_addr_size_prop(node, "linux,usable-memory", &l);
 		if (reg == NULL)
-			reg = of_get_flat_dt_prop(node, "reg", &l);
+			reg = of_flat_dt_get_addr_size_prop(node, "reg", &l);
 		if (reg == NULL)
 			continue;
 
-		endp = reg + (l / sizeof(__be32));
 		hotpluggable = of_get_flat_dt_prop(node, "hotpluggable", NULL);
 
-		pr_debug("memory scan node %s, reg size %d,\n",
+		pr_debug("memory scan node %s, reg {addr,size} entries %d,\n",
 			 fdt_get_name(fdt, node, NULL), l);
 
-		while ((endp - reg) >= (dt_root_addr_cells + dt_root_size_cells)) {
+		for (i = 0; i < l; i++) {
 			u64 base, size;
 
-			base = dt_mem_next_cell(dt_root_addr_cells, &reg);
-			size = dt_mem_next_cell(dt_root_size_cells, &reg);
+			of_flat_dt_read_addr_size(reg, i, &base, &size);
 
 			if (size == 0)
 				continue;
@@ -1126,13 +1190,7 @@ void __init __weak early_init_dt_add_memory_arch(u64 base, u64 size)
 
 static void * __init early_init_dt_alloc_memory_arch(u64 size, u64 align)
 {
-	void *ptr = memblock_alloc(size, align);
-
-	if (!ptr)
-		panic("%s: Failed to allocate %llu bytes align=0x%llx\n",
-		      __func__, size, align);
-
-	return ptr;
+	return memblock_alloc_or_panic(size, align);
 }
 
 bool __init early_init_dt_verify(void *dt_virt, phys_addr_t dt_phys)
@@ -1171,6 +1229,9 @@ void __init early_init_dt_scan_nodes(void)
 
 	/* Handle linux,usable-memory-range property */
 	early_init_dt_check_for_usable_mem_range();
+
+	/* Handle kexec handover */
+	early_init_dt_check_kho();
 }
 
 bool __init early_init_dt_scan(void *dt_virt, phys_addr_t dt_phys)
@@ -1215,14 +1276,7 @@ void __init unflatten_device_tree(void)
 	/* Save the statically-placed regions in the reserved_mem array */
 	fdt_scan_reserved_mem_reg_nodes();
 
-	/* Don't use the bootloader provided DTB if ACPI is enabled */
-	if (!acpi_disabled)
-		fdt = NULL;
-
-	/*
-	 * Populate an empty root node when ACPI is enabled or bootloader
-	 * doesn't provide one.
-	 */
+	/* Populate an empty root node when bootloader doesn't provide one */
 	if (!fdt) {
 		fdt = (void *) __dtb_empty_root_begin;
 		/* fdt_totalsize() will be used for copy size */
@@ -1264,18 +1318,9 @@ void __init unflatten_and_copy_device_tree(void)
 }
 
 #ifdef CONFIG_SYSFS
-static ssize_t of_fdt_raw_read(struct file *filp, struct kobject *kobj,
-			       struct bin_attribute *bin_attr,
-			       char *buf, loff_t off, size_t count)
-{
-	memcpy(buf, initial_boot_params + off, count);
-	return count;
-}
-
 static int __init of_fdt_raw_init(void)
 {
-	static struct bin_attribute of_fdt_raw_attr =
-		__BIN_ATTR(fdt, S_IRUSR, of_fdt_raw_read, NULL, 0);
+	static __ro_after_init BIN_ATTR_SIMPLE_ADMIN_RO(fdt);
 
 	if (!initial_boot_params)
 		return 0;
@@ -1285,8 +1330,9 @@ static int __init of_fdt_raw_init(void)
 		pr_warn("not creating '/sys/firmware/fdt': CRC check failed\n");
 		return 0;
 	}
-	of_fdt_raw_attr.size = fdt_totalsize(initial_boot_params);
-	return sysfs_create_bin_file(firmware_kobj, &of_fdt_raw_attr);
+	bin_attr_fdt.private = initial_boot_params;
+	bin_attr_fdt.size = fdt_totalsize(initial_boot_params);
+	return sysfs_create_bin_file(firmware_kobj, &bin_attr_fdt);
 }
 late_initcall(of_fdt_raw_init);
 #endif

@@ -20,6 +20,7 @@
 #include <linux/gpio.h>
 #include <linux/gpio/consumer.h>
 #include <linux/slab.h>
+#include <linux/string_choices.h>
 #include <linux/prefetch.h>
 #include <linux/byteorder/generic.h>
 #include <linux/platform_data/pxa2xx_udc.h>
@@ -572,7 +573,7 @@ pxa_ep_alloc_request(struct usb_ep *_ep, gfp_t gfp_flags)
 {
 	struct pxa27x_request *req;
 
-	req = kzalloc(sizeof *req, gfp_flags);
+	req = kzalloc_obj(*req, gfp_flags);
 	if (!req)
 		return NULL;
 
@@ -1083,7 +1084,7 @@ static int pxa_ep_queue(struct usb_ep *_ep, struct usb_request *_req,
 
 	is_first_req = list_empty(&ep->queue);
 	ep_dbg(ep, "queue req %p(first=%s), len %d buf %p\n",
-			_req, is_first_req ? "yes" : "no",
+			_req, str_yes_no(is_first_req),
 			_req->length, _req->buf);
 
 	if (!ep->enabled) {

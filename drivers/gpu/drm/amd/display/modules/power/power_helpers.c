@@ -975,6 +975,40 @@ bool psr_su_set_dsc_slice_height(struct dc *dc, struct dc_link *link,
 	return true;
 }
 
+void set_replay_frame_skip_number(struct dc_link *link,
+	enum replay_coasting_vtotal_type type,
+	uint32_t coasting_vtotal_refresh_rate_mhz,
+	uint32_t flicker_free_refresh_rate_mhz,
+	bool is_defer)
+{
+	uint32_t *frame_skip_number_array = NULL;
+	uint32_t frame_skip_number = 0;
+
+	if (link == NULL)
+		return;
+
+	if (false == link->replay_settings.config.frame_skip_supported)
+		return;
+
+	if (flicker_free_refresh_rate_mhz == 0 || coasting_vtotal_refresh_rate_mhz == 0)
+		return;
+
+	if (is_defer)
+		frame_skip_number_array = link->replay_settings.defer_frame_skip_number_table;
+	else
+		frame_skip_number_array = link->replay_settings.frame_skip_number_table;
+
+	if (frame_skip_number_array == NULL)
+		return;
+
+	frame_skip_number = coasting_vtotal_refresh_rate_mhz / flicker_free_refresh_rate_mhz;
+
+	if (frame_skip_number >= 1)
+		frame_skip_number_array[type] = frame_skip_number - 1;
+	else
+		frame_skip_number_array[type] = 0;
+}
+
 void set_replay_defer_update_coasting_vtotal(struct dc_link *link,
 	enum replay_coasting_vtotal_type type,
 	uint32_t vtotal)
@@ -987,6 +1021,8 @@ void update_replay_coasting_vtotal_from_defer(struct dc_link *link,
 {
 	link->replay_settings.coasting_vtotal_table[type] =
 		link->replay_settings.defer_update_coasting_vtotal_table[type];
+	link->replay_settings.frame_skip_number_table[type] =
+		link->replay_settings.defer_frame_skip_number_table[type];
 }
 
 void set_replay_coasting_vtotal(struct dc_link *link,
@@ -996,9 +1032,9 @@ void set_replay_coasting_vtotal(struct dc_link *link,
 	link->replay_settings.coasting_vtotal_table[type] = vtotal;
 }
 
-void set_replay_ips_full_screen_video_src_vtotal(struct dc_link *link, uint16_t vtotal)
+void set_replay_low_rr_full_screen_video_src_vtotal(struct dc_link *link, uint16_t vtotal)
 {
-	link->replay_settings.abm_with_ips_on_full_screen_video_pseudo_vtotal = vtotal;
+	link->replay_settings.low_rr_full_screen_video_pseudo_vtotal = vtotal;
 }
 
 void calculate_replay_link_off_frame_count(struct dc_link *link,
@@ -1006,6 +1042,9 @@ void calculate_replay_link_off_frame_count(struct dc_link *link,
 {
 	uint8_t max_link_off_frame_count = 0;
 	uint16_t max_deviation_line = 0,  pixel_deviation_per_line = 0;
+
+	if (!link || link->replay_settings.config.replay_version != DC_FREESYNC_REPLAY)
+		return;
 
 	max_deviation_line = link->dpcd_caps.pr_info.max_deviation_line;
 	pixel_deviation_per_line = link->dpcd_caps.pr_info.pixel_deviation_per_line;
@@ -1038,4 +1077,9 @@ bool fill_custom_backlight_caps(unsigned int config_no, struct dm_acpi_atif_back
 	caps->num_data_points = custom_backlight_profiles[config_no].num_data_points;
 	memcpy(caps->data_points, custom_backlight_profiles[config_no].data_points, data_points_size);
 	return true;
+}
+
+void reset_replay_dsync_error_count(struct dc_link *link)
+{
+	link->replay_settings.replay_desync_error_fail_count = 0;
 }

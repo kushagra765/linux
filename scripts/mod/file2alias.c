@@ -94,6 +94,7 @@ module_alias_printf(struct module *mod, bool append_wildcard,
 		}
 	}
 
+	new->builtin_modname = NULL;
 	list_add_tail(&new->node, &mod->aliases);
 }
 
@@ -132,7 +133,8 @@ struct devtable {
  * based at address m.
  */
 #define DEF_FIELD(m, devid, f) \
-	typeof(((struct devid *)0)->f) f = TO_NATIVE(*(typeof(f) *)((m) + OFF_##devid##_##f))
+	typeof(((struct devid *)0)->f) f = \
+		get_unaligned_native((typeof(f) *)((m) + OFF_##devid##_##f))
 
 /* Define a variable f that holds the address of field f of struct devid
  * based at address m.  Due to the way typeof works, for a field of type
@@ -600,7 +602,7 @@ static void do_pnp_card_entry(struct module *mod, void *symval)
 static void do_pcmcia_entry(struct module *mod, void *symval)
 {
 	char alias[256] = {};
-	unsigned int i;
+
 	DEF_FIELD(symval, pcmcia_device_id, match_flags);
 	DEF_FIELD(symval, pcmcia_device_id, manf_id);
 	DEF_FIELD(symval, pcmcia_device_id, card_id);
@@ -608,10 +610,6 @@ static void do_pcmcia_entry(struct module *mod, void *symval)
 	DEF_FIELD(symval, pcmcia_device_id, function);
 	DEF_FIELD(symval, pcmcia_device_id, device_no);
 	DEF_FIELD_ADDR(symval, pcmcia_device_id, prod_id_hash);
-
-	for (i=0; i<4; i++) {
-		(*prod_id_hash)[i] = TO_NATIVE((*prod_id_hash)[i]);
-	}
 
 	ADD(alias, "m", match_flags & PCMCIA_DEV_ID_MATCH_MANF_ID,
 	    manf_id);
@@ -623,10 +621,14 @@ static void do_pcmcia_entry(struct module *mod, void *symval)
 	    function);
 	ADD(alias, "pfn", match_flags & PCMCIA_DEV_ID_MATCH_DEVICE_NO,
 	    device_no);
-	ADD(alias, "pa", match_flags & PCMCIA_DEV_ID_MATCH_PROD_ID1, (*prod_id_hash)[0]);
-	ADD(alias, "pb", match_flags & PCMCIA_DEV_ID_MATCH_PROD_ID2, (*prod_id_hash)[1]);
-	ADD(alias, "pc", match_flags & PCMCIA_DEV_ID_MATCH_PROD_ID3, (*prod_id_hash)[2]);
-	ADD(alias, "pd", match_flags & PCMCIA_DEV_ID_MATCH_PROD_ID4, (*prod_id_hash)[3]);
+	ADD(alias, "pa", match_flags & PCMCIA_DEV_ID_MATCH_PROD_ID1,
+	    get_unaligned_native(*prod_id_hash + 0));
+	ADD(alias, "pb", match_flags & PCMCIA_DEV_ID_MATCH_PROD_ID2,
+	    get_unaligned_native(*prod_id_hash + 1));
+	ADD(alias, "pc", match_flags & PCMCIA_DEV_ID_MATCH_PROD_ID3,
+	    get_unaligned_native(*prod_id_hash + 2));
+	ADD(alias, "pd", match_flags & PCMCIA_DEV_ID_MATCH_PROD_ID4,
+	    get_unaligned_native(*prod_id_hash + 3));
 
 	module_alias_printf(mod, true, "pcmcia:%s", alias);
 }
@@ -654,10 +656,9 @@ static void do_input(char *alias,
 {
 	unsigned int i;
 
-	for (i = min / BITS_PER_LONG; i < max / BITS_PER_LONG + 1; i++)
-		arr[i] = TO_NATIVE(arr[i]);
-	for (i = min; i < max; i++)
-		if (arr[i / BITS_PER_LONG] & (1ULL << (i%BITS_PER_LONG)))
+	for (i = min; i <= max; i++)
+		if (get_unaligned_native(arr + i / BITS_PER_LONG) &
+		    (1ULL << (i % BITS_PER_LONG)))
 			sprintf(alias + strlen(alias), "%X,*", i);
 }
 
@@ -812,15 +813,13 @@ static void do_virtio_entry(struct module *mod, void *symval)
  * Each byte of the guid will be represented by two hex characters
  * in the name.
  */
-
 static void do_vmbus_entry(struct module *mod, void *symval)
 {
-	int i;
 	DEF_FIELD_ADDR(symval, hv_vmbus_device_id, guid);
-	char guid_name[(sizeof(*guid) + 1) * 2];
+	char guid_name[sizeof(*guid) * 2 + 1];
 
-	for (i = 0; i < (sizeof(*guid) * 2); i += 2)
-		sprintf(&guid_name[i], "%02x", TO_NATIVE((guid->b)[i/2]));
+	for (int i = 0; i < sizeof(*guid); i++)
+		sprintf(&guid_name[i * 2], "%02x", guid->b[i]);
 
 	module_alias_printf(mod, false, "vmbus:%s", guid_name);
 }
@@ -1111,6 +1110,14 @@ static void do_cpu_entry(struct module *mod, void *symval)
 	module_alias_printf(mod, false, "cpu:type:*:feature:*%04X*", feature);
 }
 
+/* Looks like: mcb:16zN */
+static void do_mcb_entry(struct module *mod, void *symval)
+{
+	DEF_FIELD(symval, mcb_device_id, device);
+
+	module_alias_printf(mod, false, "mcb:16z%03d", device);
+}
+
 /* Looks like: mei:S:uuid:N:* */
 static void do_mei_entry(struct module *mod, void *symval)
 {
@@ -1221,17 +1228,12 @@ static void do_tbsvc_entry(struct module *mod, void *symval)
 	module_alias_printf(mod, true, "tbsvc:%s", alias);
 }
 
-/* Looks like: typec:idNmN */
+/* Looks like: typec:idN */
 static void do_typec_entry(struct module *mod, void *symval)
 {
-	char alias[256] = {};
-
 	DEF_FIELD(symval, typec_device_id, svid);
-	DEF_FIELD(symval, typec_device_id, mode);
 
-	ADD(alias, "m", mode != TYPEC_ANY_MODE, mode);
-
-	module_alias_printf(mod, false, "typec:id%04X%s", svid, alias);
+	module_alias_printf(mod, false, "typec:id%04X", svid);
 }
 
 /* Looks like: tee:uuid */
@@ -1450,6 +1452,7 @@ static const struct devtable devtable[] = {
 	{"mipscdmm", SIZE_mips_cdmm_device_id, do_mips_cdmm_entry},
 	{"x86cpu", SIZE_x86_cpu_id, do_x86cpu_entry},
 	{"cpu", SIZE_cpu_feature, do_cpu_entry},
+	{"mcb", SIZE_mcb_device_id, do_mcb_entry},
 	{"mei", SIZE_mei_cl_device_id, do_mei_entry},
 	{"rapidio", SIZE_rio_device_id, do_rio_entry},
 	{"ulpi", SIZE_ulpi_device_id, do_ulpi_entry},
@@ -1483,8 +1486,8 @@ void handle_moddevtable(struct module *mod, struct elf_info *info,
 {
 	void *symval;
 	char *zeros = NULL;
-	const char *type, *name;
-	size_t typelen;
+	const char *type, *name, *modname;
+	size_t typelen, modnamelen;
 	static const char *prefix = "__mod_device_table__";
 
 	/* We're looking for a section relative symbol */
@@ -1495,10 +1498,20 @@ void handle_moddevtable(struct module *mod, struct elf_info *info,
 	if (ELF_ST_TYPE(sym->st_info) != STT_OBJECT)
 		return;
 
-	/* All our symbols are of form __mod_device_table__<type>__<name>. */
+	/* All our symbols are of form __mod_device_table__kmod_<modname>__<type>__<name>. */
 	if (!strstarts(symname, prefix))
 		return;
-	type = symname + strlen(prefix);
+
+	modname = strstr(symname, "__kmod_");
+	if (!modname)
+		return;
+	modname += strlen("__kmod_");
+
+	type = strstr(modname, "__");
+	if (!type)
+		return;
+	modnamelen = type - modname;
+	type += strlen("__");
 
 	name = strstr(type, "__");
 	if (!name)
@@ -1521,6 +1534,22 @@ void handle_moddevtable(struct module *mod, struct elf_info *info,
 			do_table(name, symval, sym->st_size, p->id_size,
 				 p->device_id, p->do_entry, mod);
 			break;
+		}
+	}
+
+	if (mod->is_vmlinux) {
+		struct module_alias *alias;
+
+		/*
+		 * If this is vmlinux, record the name of the builtin module.
+		 * Traverse the linked list in the reverse order, and set the
+		 * builtin_modname unless it has already been set in the
+		 * previous call.
+		 */
+		list_for_each_entry_reverse(alias, &mod->aliases, node) {
+			if (alias->builtin_modname)
+				break;
+			alias->builtin_modname = xstrndup(modname, modnamelen);
 		}
 	}
 

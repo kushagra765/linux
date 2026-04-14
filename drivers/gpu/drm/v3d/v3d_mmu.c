@@ -4,7 +4,7 @@
 /**
  * DOC: Broadcom V3D MMU
  *
- * The V3D 3.x hardware (compared to VC4) now includes an MMU.  It has
+ * The V3D 3.x hardware (compared to VC4) now includes an MMU. It has
  * a single level of page tables for the V3D's 4GB address space to
  * map to AXI bus addresses, thus it could need up to 4MB of
  * physically contiguous memory to store the PTEs.
@@ -15,14 +15,16 @@
  *
  * To protect clients from each other, we should use the GMP to
  * quickly mask out (at 128kb granularity) what pages are available to
- * each client.  This is not yet implemented.
+ * each client. This is not yet implemented.
  */
+
+#include <drm/drm_print.h>
 
 #include "v3d_drv.h"
 #include "v3d_regs.h"
 
-/* Note: All PTEs for the 1MB superpage must be filled with the
- * superpage bit set.
+/* Note: All PTEs for the 64KB bigpage or 1MB superpage must be filled
+ * with the bigpage/superpage bit set.
  */
 #define V3D_PTE_SUPERPAGE BIT(31)
 #define V3D_PTE_BIGPAGE BIT(30)
@@ -125,7 +127,7 @@ void v3d_mmu_insert_ptes(struct v3d_bo *bo)
 		     shmem_obj->base.size >> V3D_MMU_PAGE_SHIFT);
 
 	if (v3d_mmu_flush_all(v3d))
-		dev_err(v3d->drm.dev, "MMU flush timeout\n");
+		drm_err(&v3d->drm, "MMU flush timeout\n");
 }
 
 void v3d_mmu_remove_ptes(struct v3d_bo *bo)
@@ -138,5 +140,5 @@ void v3d_mmu_remove_ptes(struct v3d_bo *bo)
 		v3d->pt[page] = 0;
 
 	if (v3d_mmu_flush_all(v3d))
-		dev_err(v3d->drm.dev, "MMU flush timeout\n");
+		drm_err(&v3d->drm, "MMU flush timeout\n");
 }

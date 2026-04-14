@@ -46,6 +46,7 @@
 #include <linux/notifier.h>
 #include <linux/inetdevice.h>
 #include <linux/igmp.h>
+#include "igmp_internal.h"
 #include <linux/slab.h>
 #include <linux/hash.h>
 #ifdef CONFIG_SYSCTL
@@ -105,15 +106,6 @@ static const struct nla_policy ifa_ipv4_policy[IFA_MAX+1] = {
 	[IFA_RT_PRIORITY]	= { .type = NLA_U32 },
 	[IFA_TARGET_NETNSID]	= { .type = NLA_S32 },
 	[IFA_PROTO]		= { .type = NLA_U8 },
-};
-
-struct inet_fill_args {
-	u32 portid;
-	u32 seq;
-	int event;
-	unsigned int flags;
-	int netnsid;
-	int ifindex;
 };
 
 #define IN4_ADDR_HSIZE_SHIFT	8
@@ -217,7 +209,7 @@ static struct in_ifaddr *inet_alloc_ifa(struct in_device *in_dev)
 {
 	struct in_ifaddr *ifa;
 
-	ifa = kzalloc(sizeof(*ifa), GFP_KERNEL_ACCOUNT);
+	ifa = kzalloc_obj(*ifa, GFP_KERNEL_ACCOUNT);
 	if (!ifa)
 		return NULL;
 
@@ -278,7 +270,7 @@ static struct in_device *inetdev_init(struct net_device *dev)
 
 	ASSERT_RTNL();
 
-	in_dev = kzalloc(sizeof(*in_dev), GFP_KERNEL);
+	in_dev = kzalloc_obj(*in_dev);
 	if (!in_dev)
 		goto out;
 	memcpy(&in_dev->cnf, dev_net(dev)->ipv4.devconf_dflt,
@@ -289,7 +281,7 @@ static struct in_device *inetdev_init(struct net_device *dev)
 	if (!in_dev->arp_parms)
 		goto out_kfree;
 	if (IPV4_DEVCONF(in_dev->cnf, FORWARDING))
-		dev_disable_lro(dev);
+		netif_disable_lro(dev);
 	/* Reference in_dev->dev */
 	netdev_hold(dev, &in_dev->dev_tracker, GFP_KERNEL);
 	/* Account for reference dev->ip_ptr (below) */
@@ -348,14 +340,13 @@ static void inetdev_destroy(struct in_device *in_dev)
 
 static int __init inet_blackhole_dev_init(void)
 {
-	int err = 0;
+	struct in_device *in_dev;
 
 	rtnl_lock();
-	if (!inetdev_init(blackhole_netdev))
-		err = -ENOMEM;
+	in_dev = inetdev_init(blackhole_netdev);
 	rtnl_unlock();
 
-	return err;
+	return PTR_ERR_OR_ZERO(in_dev);
 }
 late_initcall(inet_blackhole_dev_init);
 
@@ -1371,10 +1362,11 @@ __be32 inet_select_addr(const struct net_device *dev, __be32 dst, int scope)
 	__be32 addr = 0;
 	unsigned char localnet_scope = RT_SCOPE_HOST;
 	struct in_device *in_dev;
-	struct net *net = dev_net(dev);
+	struct net *net;
 	int master_idx;
 
 	rcu_read_lock();
+	net = dev_net_rcu(dev);
 	in_dev = __in_dev_get_rcu(dev);
 	if (!in_dev)
 		goto no_in_dev;
@@ -1799,12 +1791,12 @@ static int inet_valid_dump_ifaddr_req(const struct nlmsghdr *nlh,
 	struct ifaddrmsg *ifm;
 	int err, i;
 
-	if (nlh->nlmsg_len < nlmsg_msg_size(sizeof(*ifm))) {
+	ifm = nlmsg_payload(nlh, sizeof(*ifm));
+	if (!ifm) {
 		NL_SET_ERR_MSG(extack, "ipv4: Invalid header for address dump request");
 		return -EINVAL;
 	}
 
-	ifm = nlmsg_data(nlh);
 	if (ifm->ifa_prefixlen || ifm->ifa_flags || ifm->ifa_scope) {
 		NL_SET_ERR_MSG(extack, "ipv4: Invalid values in header for address dump request");
 		return -EINVAL;
@@ -1846,9 +1838,38 @@ static int inet_valid_dump_ifaddr_req(const struct nlmsghdr *nlh,
 	return 0;
 }
 
-static int in_dev_dump_addr(struct in_device *in_dev, struct sk_buff *skb,
-			    struct netlink_callback *cb, int *s_ip_idx,
-			    struct inet_fill_args *fillargs)
+static int in_dev_dump_ifmcaddr(struct in_device *in_dev, struct sk_buff *skb,
+				struct netlink_callback *cb, int *s_ip_idx,
+				struct inet_fill_args *fillargs)
+{
+	struct ip_mc_list *im;
+	int ip_idx = 0;
+	int err;
+
+	for (im = rcu_dereference(in_dev->mc_list);
+	     im;
+	     im = rcu_dereference(im->next_rcu)) {
+		if (ip_idx < *s_ip_idx) {
+			ip_idx++;
+			continue;
+		}
+		err = inet_fill_ifmcaddr(skb, in_dev->dev, im, fillargs);
+		if (err < 0)
+			goto done;
+
+		nl_dump_check_consistent(cb, nlmsg_hdr(skb));
+		ip_idx++;
+	}
+	err = 0;
+	ip_idx = 0;
+done:
+	*s_ip_idx = ip_idx;
+	return err;
+}
+
+static int in_dev_dump_ifaddr(struct in_device *in_dev, struct sk_buff *skb,
+			      struct netlink_callback *cb, int *s_ip_idx,
+			      struct inet_fill_args *fillargs)
 {
 	struct in_ifaddr *ifa;
 	int ip_idx = 0;
@@ -1874,6 +1895,21 @@ done:
 	return err;
 }
 
+static int in_dev_dump_addr(struct in_device *in_dev, struct sk_buff *skb,
+			    struct netlink_callback *cb, int *s_ip_idx,
+			    struct inet_fill_args *fillargs)
+{
+	switch (fillargs->event) {
+	case RTM_NEWADDR:
+		return in_dev_dump_ifaddr(in_dev, skb, cb, s_ip_idx, fillargs);
+	case RTM_GETMULTICAST:
+		return in_dev_dump_ifmcaddr(in_dev, skb, cb, s_ip_idx,
+					    fillargs);
+	default:
+		return -EINVAL;
+	}
+}
+
 /* Combine dev_addr_genid and dev_base_seq to detect changes.
  */
 static u32 inet_base_seq(const struct net *net)
@@ -1889,13 +1925,14 @@ static u32 inet_base_seq(const struct net *net)
 	return res;
 }
 
-static int inet_dump_ifaddr(struct sk_buff *skb, struct netlink_callback *cb)
+static int inet_dump_addr(struct sk_buff *skb, struct netlink_callback *cb,
+			  int event)
 {
 	const struct nlmsghdr *nlh = cb->nlh;
 	struct inet_fill_args fillargs = {
 		.portid = NETLINK_CB(cb->skb).portid,
 		.seq = nlh->nlmsg_seq,
-		.event = RTM_NEWADDR,
+		.event = event,
 		.flags = NLM_F_MULTI,
 		.netnsid = -1,
 	};
@@ -1947,6 +1984,16 @@ done:
 		put_net(tgt_net);
 	rcu_read_unlock();
 	return err;
+}
+
+static int inet_dump_ifaddr(struct sk_buff *skb, struct netlink_callback *cb)
+{
+	return inet_dump_addr(skb, cb, RTM_NEWADDR);
+}
+
+static int inet_dump_ifmcaddr(struct sk_buff *skb, struct netlink_callback *cb)
+{
+	return inet_dump_addr(skb, cb, RTM_GETMULTICAST);
 }
 
 static void rtmsg_ifa(int event, struct in_ifaddr *ifa, struct nlmsghdr *nlh,
@@ -2707,9 +2754,8 @@ static __net_init int devinet_init_net(struct net *net)
 	int i;
 
 	err = -ENOMEM;
-	net->ipv4.inet_addr_lst = kmalloc_array(IN4_ADDR_HSIZE,
-						sizeof(struct hlist_head),
-						GFP_KERNEL);
+	net->ipv4.inet_addr_lst = kmalloc_objs(struct hlist_head,
+					       IN4_ADDR_HSIZE);
 	if (!net->ipv4.inet_addr_lst)
 		goto err_alloc_hash;
 
@@ -2845,6 +2891,8 @@ static const struct rtnl_msg_handler devinet_rtnl_msg_handlers[] __initconst = {
 	{.protocol = PF_INET, .msgtype = RTM_GETNETCONF,
 	 .doit = inet_netconf_get_devconf, .dumpit = inet_netconf_dump_devconf,
 	 .flags = RTNL_FLAG_DOIT_UNLOCKED | RTNL_FLAG_DUMP_UNLOCKED},
+	{.owner = THIS_MODULE, .protocol = PF_INET, .msgtype = RTM_GETMULTICAST,
+	 .dumpit = inet_dump_ifmcaddr, .flags = RTNL_FLAG_DUMP_UNLOCKED},
 };
 
 void __init devinet_init(void)

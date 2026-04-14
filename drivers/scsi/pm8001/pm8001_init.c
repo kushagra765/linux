@@ -105,7 +105,7 @@ static void pm8001_map_queues(struct Scsi_Host *shost)
 	struct blk_mq_queue_map *qmap = &shost->tag_set.map[HCTX_TYPE_DEFAULT];
 
 	if (pm8001_ha->number_of_intr > 1) {
-		blk_mq_pci_map_queues(qmap, pm8001_ha->pdev, 1);
+		blk_mq_map_hw_queues(qmap, &pm8001_ha->pdev->dev, 1);
 		return;
 	}
 
@@ -552,6 +552,7 @@ static struct pm8001_hba_info *pm8001_pci_alloc(struct pci_dev *pdev,
 	pm8001_ha->id = pm8001_id++;
 	pm8001_ha->logging_level = logging_level;
 	pm8001_ha->non_fatal_count = 0;
+	mutex_init(&pm8001_ha->iop_log_lock);
 	if (link_rate >= 1 && link_rate <= 15)
 		pm8001_ha->link_rate = (link_rate << 8);
 	else {
@@ -621,7 +622,7 @@ static int pm8001_prep_sas_ha_init(struct Scsi_Host *shost,
 
 	sha->sas_phy = arr_phy;
 	sha->sas_port = arr_port;
-	sha->lldd_ha = kzalloc(sizeof(struct pm8001_hba_info), GFP_KERNEL);
+	sha->lldd_ha = kzalloc_obj(struct pm8001_hba_info);
 	if (!sha->lldd_ha)
 		goto exit_free1;
 
@@ -736,7 +737,7 @@ static int pm8001_init_sas_add(struct pm8001_hba_info *pm8001_ha)
 		return -EIO;
 	}
 	time_remaining = wait_for_completion_timeout(&completion,
-				msecs_to_jiffies(60*1000)); // 1 min
+				secs_to_jiffies(60)); // 1 min
 	if (!time_remaining) {
 		kfree(payload.func_specific);
 		pm8001_dbg(pm8001_ha, FAIL, "get_nvmd_req timeout\n");
@@ -1147,7 +1148,7 @@ static int pm8001_pci_probe(struct pci_dev *pdev,
 		goto err_out_regions;
 	}
 	chip = &pm8001_chips[ent->driver_data];
-	sha = kzalloc(sizeof(struct sas_ha_struct), GFP_KERNEL);
+	sha = kzalloc_obj(struct sas_ha_struct);
 	if (!sha) {
 		rc = -ENOMEM;
 		goto err_out_free_host;
@@ -1263,7 +1264,7 @@ static int pm8001_init_ccb_tag(struct pm8001_hba_info *pm8001_ha)
 	/* Memory region for ccb_info*/
 	pm8001_ha->ccb_count = ccb_count;
 	pm8001_ha->ccb_info =
-		kcalloc(ccb_count, sizeof(struct pm8001_ccb_info), GFP_KERNEL);
+		kzalloc_objs(struct pm8001_ccb_info, ccb_count);
 	if (!pm8001_ha->ccb_info) {
 		pm8001_dbg(pm8001_ha, FAIL,
 			   "Unable to allocate memory for ccb\n");
@@ -1435,7 +1436,7 @@ err_out_disable:
 /* update of pci device, vendor id and driver data with
  * unique value for each of the controller
  */
-static struct pci_device_id pm8001_pci_table[] = {
+static const struct pci_device_id pm8001_pci_table[] = {
 	{ PCI_VDEVICE(PMC_Sierra, 0x8001), chip_8001 },
 	{ PCI_VDEVICE(PMC_Sierra, 0x8006), chip_8006 },
 	{ PCI_VDEVICE(ADAPTEC2, 0x8006), chip_8006 },
@@ -1533,7 +1534,7 @@ static int __init pm8001_init(void)
 	if (pm8001_use_tasklet && !pm8001_use_msix)
 		pm8001_use_tasklet = false;
 
-	pm8001_wq = alloc_workqueue("pm80xx", 0, 0);
+	pm8001_wq = alloc_workqueue("pm80xx", WQ_PERCPU, 0);
 	if (!pm8001_wq)
 		goto err;
 

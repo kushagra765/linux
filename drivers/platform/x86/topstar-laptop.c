@@ -292,12 +292,12 @@ static int topstar_acpi_add(struct acpi_device *device)
 
 	dmi_check_system(topstar_dmi_ids);
 
-	topstar = kzalloc(sizeof(struct topstar_laptop), GFP_KERNEL);
+	topstar = kzalloc_obj(struct topstar_laptop);
 	if (!topstar)
 		return -ENOMEM;
 
-	strcpy(acpi_device_name(device), "Topstar TPSACPI");
-	strcpy(acpi_device_class(device), TOPSTAR_LAPTOP_CLASS);
+	strscpy(acpi_device_name(device), "Topstar TPSACPI");
+	strscpy(acpi_device_class(device), TOPSTAR_LAPTOP_CLASS);
 	device->driver_data = topstar;
 	topstar->device = device;
 

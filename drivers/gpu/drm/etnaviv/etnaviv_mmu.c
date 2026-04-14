@@ -6,6 +6,8 @@
 #include <linux/dma-mapping.h>
 #include <linux/scatterlist.h>
 
+#include <drm/drm_print.h>
+
 #include "common.xml.h"
 #include "etnaviv_cmdbuf.h"
 #include "etnaviv_drv.h"
@@ -18,12 +20,6 @@ static void etnaviv_context_unmap(struct etnaviv_iommu_context *context,
 {
 	size_t unmapped_page, unmapped = 0;
 	size_t pgsize = SZ_4K;
-
-	if (!IS_ALIGNED(iova | size, pgsize)) {
-		pr_err("unaligned: iova 0x%lx size 0x%zx min_pagesz 0x%zx\n",
-		       iova, size, pgsize);
-		return;
-	}
 
 	while (unmapped < size) {
 		unmapped_page = context->global->ops->unmap(context, iova,
@@ -44,12 +40,6 @@ static int etnaviv_context_map(struct etnaviv_iommu_context *context,
 	size_t pgsize = SZ_4K;
 	size_t orig_size = size;
 	int ret = 0;
-
-	if (!IS_ALIGNED(iova | paddr | size, pgsize)) {
-		pr_err("unaligned: iova 0x%lx pa %pa size 0x%zx min_pagesz 0x%zx\n",
-		       iova, &paddr, size, pgsize);
-		return -EINVAL;
-	}
 
 	while (size) {
 		ret = context->global->ops->map(context, iova, paddr, pgsize,
@@ -82,11 +72,19 @@ static int etnaviv_iommu_map(struct etnaviv_iommu_context *context,
 		return -EINVAL;
 
 	for_each_sgtable_dma_sg(sgt, sg, i) {
-		phys_addr_t pa = sg_dma_address(sg) - sg->offset;
-		unsigned int da_len = sg_dma_len(sg) + sg->offset;
+		phys_addr_t pa = sg_dma_address(sg);
+		unsigned int da_len = sg_dma_len(sg);
 		unsigned int bytes = min_t(unsigned int, da_len, va_len);
 
-		VERB("map[%d]: %08x %pap(%x)", i, iova, &pa, bytes);
+		VERB("map[%d]: %08x %pap(%x)", i, da, &pa, bytes);
+
+		if (!IS_ALIGNED(iova | pa | bytes, SZ_4K)) {
+			dev_err(context->global->dev,
+				"unaligned: iova 0x%x pa %pa size 0x%x\n",
+				iova, &pa, bytes);
+			ret = -EINVAL;
+			goto fail;
+		}
 
 		ret = etnaviv_context_map(context, da, pa, bytes, prot);
 		if (ret)
@@ -496,7 +494,7 @@ int etnaviv_iommu_global_init(struct etnaviv_gpu *gpu)
 		return 0;
 	}
 
-	global = kzalloc(sizeof(*global), GFP_KERNEL);
+	global = kzalloc_obj(*global);
 	if (!global)
 		return -ENOMEM;
 

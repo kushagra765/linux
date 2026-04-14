@@ -3,7 +3,7 @@
  * Copyright (C) 2016 Oracle.  All Rights Reserved.
  * Author: Darrick J. Wong <darrick.wong@oracle.com>
  */
-#include "xfs.h"
+#include "xfs_platform.h"
 #include "xfs_fs.h"
 #include "xfs_shared.h"
 #include "xfs_format.h"
@@ -92,9 +92,8 @@ xfs_ag_resv_critical(
 	trace_xfs_ag_resv_critical(pag, type, avail);
 
 	/* Critically low if less than 10% or max btree height remains. */
-	return XFS_TEST_ERROR(avail < orig / 10 ||
-			      avail < mp->m_agbtree_maxlevels,
-			mp, XFS_ERRTAG_AG_RESV_CRITICAL);
+	return avail < orig / 10 || avail < mp->m_agbtree_maxlevels ||
+		XFS_TEST_ERROR(mp, XFS_ERRTAG_AG_RESV_CRITICAL);
 }
 
 /*
@@ -114,6 +113,7 @@ xfs_ag_resv_needed(
 	case XFS_AG_RESV_RMAPBT:
 		len -= xfs_perag_resv(pag, type)->ar_reserved;
 		break;
+	case XFS_AG_RESV_METAFILE:
 	case XFS_AG_RESV_NONE:
 		/* empty */
 		break;
@@ -202,7 +202,7 @@ __xfs_ag_resv_init(
 		return -EINVAL;
 	}
 
-	if (XFS_TEST_ERROR(false, mp, XFS_ERRTAG_AG_RESV_FAIL))
+	if (XFS_TEST_ERROR(mp, XFS_ERRTAG_AG_RESV_FAIL))
 		error = -ENOSPC;
 	else
 		error = xfs_dec_fdblocks(mp, hidden_space, true);
@@ -347,6 +347,7 @@ xfs_ag_resv_alloc_extent(
 
 	switch (type) {
 	case XFS_AG_RESV_AGFL:
+	case XFS_AG_RESV_METAFILE:
 		return;
 	case XFS_AG_RESV_METADATA:
 	case XFS_AG_RESV_RMAPBT:
@@ -389,6 +390,7 @@ xfs_ag_resv_free_extent(
 
 	switch (type) {
 	case XFS_AG_RESV_AGFL:
+	case XFS_AG_RESV_METAFILE:
 		return;
 	case XFS_AG_RESV_METADATA:
 	case XFS_AG_RESV_RMAPBT:

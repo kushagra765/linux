@@ -542,6 +542,8 @@ static u8 nci_hci_create_pipe(struct nci_dev *ndev, u8 dest_host,
 
 	pr_debug("pipe created=%d\n", pipe);
 
+	if (pipe >= NCI_HCI_MAX_PIPES)
+		pipe = NCI_HCI_INVALID_PIPE;
 	return pipe;
 }
 
@@ -775,7 +777,7 @@ struct nci_hci_dev *nci_hci_allocate(struct nci_dev *ndev)
 {
 	struct nci_hci_dev *hdev;
 
-	hdev = kzalloc(sizeof(*hdev), GFP_KERNEL);
+	hdev = kzalloc_obj(*hdev);
 	if (!hdev)
 		return NULL;
 

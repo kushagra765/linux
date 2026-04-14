@@ -2,20 +2,18 @@
 config CIFS
 	tristate "SMB3 and CIFS support (advanced network filesystem)"
 	depends on INET
-	select NETFS_SUPPORT
 	select NLS
 	select NLS_UCS2_UTILS
 	select CRYPTO
-	select CRYPTO_MD5
-	select CRYPTO_SHA256
-	select CRYPTO_SHA512
 	select CRYPTO_CMAC
-	select CRYPTO_HMAC
 	select CRYPTO_AEAD2
 	select CRYPTO_CCM
 	select CRYPTO_GCM
-	select CRYPTO_ECB
 	select CRYPTO_AES
+	select CRYPTO_LIB_ARC4
+	select CRYPTO_LIB_MD5
+	select CRYPTO_LIB_SHA256
+	select CRYPTO_LIB_SHA512
 	select KEYS
 	select DNS_RESOLVER
 	select ASN1
@@ -218,4 +216,15 @@ config CIFS_COMPRESSION
 	  Say Y here if you want SMB traffic to be compressed.
 	  If unsure, say N.
 
+config SMB1_KUNIT_TESTS
+	tristate "KUnit tests for SMB1"
+	depends on SMB_KUNIT_TESTS && CIFS_ALLOW_INSECURE_LEGACY
+	default SMB_KUNIT_TESTS
+	help
+	  This builds the SMB1-specific KUnit tests.
+
+	  These tests are only enabled when legacy insecure SMB1 support
+	  (CIFS_ALLOW_INSECURE_LEGACY) is enabled.
+
+	  If unsure, say N.
 endif

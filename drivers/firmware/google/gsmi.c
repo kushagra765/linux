@@ -153,7 +153,7 @@ static struct gsmi_buf *gsmi_buf_alloc(void)
 {
 	struct gsmi_buf *smibuf;
 
-	smibuf = kzalloc(sizeof(*smibuf), GFP_KERNEL);
+	smibuf = kzalloc_obj(*smibuf);
 	if (!smibuf) {
 		printk(KERN_ERR "gsmi: out of memory\n");
 		return NULL;
@@ -488,7 +488,7 @@ static const struct efivar_operations efivar_ops = {
 #endif /* CONFIG_EFI */
 
 static ssize_t eventlog_write(struct file *filp, struct kobject *kobj,
-			       struct bin_attribute *bin_attr,
+			       const struct bin_attribute *bin_attr,
 			       char *buf, loff_t pos, size_t count)
 {
 	struct gsmi_set_eventlog_param param = {
@@ -528,7 +528,7 @@ static ssize_t eventlog_write(struct file *filp, struct kobject *kobj,
 
 }
 
-static struct bin_attribute eventlog_bin_attr = {
+static const struct bin_attribute eventlog_bin_attr = {
 	.attr = {.name = "append_to_eventlog", .mode = 0200},
 	.write = eventlog_write,
 };

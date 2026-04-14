@@ -133,9 +133,7 @@ static const char *rsrc_name(enum mcs_rsrc_type rsrc_type)
 		return "SA";
 	default:
 		return "Unknown";
-	};
-
-	return "Unknown";
+	}
 }
 
 static int cn10k_mcs_alloc_rsrc(struct otx2_nic *pfvf, enum mcs_direction dir,
@@ -330,7 +328,7 @@ static int cn10k_mcs_write_rx_flowid(struct otx2_nic *pfvf,
 
 	req->data[0] = FIELD_PREP(MCS_TCAM0_MAC_DA_MASK, mac_da);
 	req->mask[0] = ~0ULL;
-	req->mask[0] = ~MCS_TCAM0_MAC_DA_MASK;
+	req->mask[0] &= ~MCS_TCAM0_MAC_DA_MASK;
 
 	req->data[1] = FIELD_PREP(MCS_TCAM1_ETYPE_MASK, ETH_P_MACSEC);
 	req->mask[1] = ~0ULL;
@@ -533,7 +531,8 @@ static int cn10k_mcs_write_tx_secy(struct otx2_nic *pfvf,
 	if (sw_tx_sc->encrypt)
 		sectag_tci |= (MCS_TCI_E | MCS_TCI_C);
 
-	policy = FIELD_PREP(MCS_TX_SECY_PLCY_MTU, secy->netdev->mtu);
+	policy = FIELD_PREP(MCS_TX_SECY_PLCY_MTU,
+			    pfvf->netdev->mtu + OTX2_ETH_HLEN);
 	/* Write SecTag excluding AN bits(1..0) */
 	policy |= FIELD_PREP(MCS_TX_SECY_PLCY_ST_TCI, sectag_tci >> 2);
 	policy |= FIELD_PREP(MCS_TX_SECY_PLCY_ST_OFFSET, tag_offset);
@@ -915,7 +914,7 @@ static struct cn10k_mcs_txsc *cn10k_mcs_create_txsc(struct otx2_nic *pfvf)
 	struct cn10k_mcs_txsc *txsc;
 	int ret;
 
-	txsc = kzalloc(sizeof(*txsc), GFP_KERNEL);
+	txsc = kzalloc_obj(*txsc);
 	if (!txsc)
 		return ERR_PTR(-ENOMEM);
 
@@ -988,7 +987,7 @@ static struct cn10k_mcs_rxsc *cn10k_mcs_create_rxsc(struct otx2_nic *pfvf)
 	struct cn10k_mcs_rxsc *rxsc;
 	int ret;
 
-	rxsc = kzalloc(sizeof(*rxsc), GFP_KERNEL);
+	rxsc = kzalloc_obj(*rxsc);
 	if (!rxsc)
 		return ERR_PTR(-ENOMEM);
 
@@ -1773,7 +1772,7 @@ int cn10k_mcs_init(struct otx2_nic *pfvf)
 	if (!test_bit(CN10K_HW_MACSEC, &pfvf->hw.cap_flag))
 		return 0;
 
-	cfg = kzalloc(sizeof(*cfg), GFP_KERNEL);
+	cfg = kzalloc_obj(*cfg);
 	if (!cfg)
 		return -ENOMEM;
 

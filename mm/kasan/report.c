@@ -203,7 +203,7 @@ static inline void fail_non_kasan_kunit_test(void) { }
 
 static DEFINE_RAW_SPINLOCK(report_lock);
 
-static void start_report(unsigned long *flags, bool sync)
+static void start_report(unsigned long *flags)
 {
 	fail_non_kasan_kunit_test();
 	/* Respect the /proc/sys/kernel/traceoff_on_warning interface. */
@@ -399,17 +399,10 @@ static void print_address_description(void *addr, u8 tag,
 	}
 
 	if (is_vmalloc_addr(addr)) {
-		struct vm_struct *va = find_vm_area(addr);
-
-		if (va) {
-			pr_err("The buggy address belongs to the virtual mapping at\n"
-			       " [%px, %px) created by:\n"
-			       " %pS\n",
-			       va->addr, va->addr + va->size, va->caller);
-			pr_err("\n");
-
-			page = vmalloc_to_page(addr);
-		}
+		pr_err("The buggy address belongs to a");
+		if (!vmalloc_dump_obj(addr))
+			pr_cont(" vmalloc virtual mapping\n");
+		page = vmalloc_to_page(addr);
 	}
 
 	if (page) {
@@ -550,7 +543,7 @@ void kasan_report_invalid_free(void *ptr, unsigned long ip, enum kasan_report_ty
 	if (unlikely(!report_enabled()))
 		return;
 
-	start_report(&flags, true);
+	start_report(&flags);
 
 	__memset(&info, 0, sizeof(info));
 	info.type = type;
@@ -588,7 +581,7 @@ bool kasan_report(const void *addr, size_t size, bool is_write,
 		goto out;
 	}
 
-	start_report(&irq_flags, true);
+	start_report(&irq_flags);
 
 	__memset(&info, 0, sizeof(info));
 	info.type = KASAN_REPORT_ACCESS;
@@ -622,7 +615,7 @@ void kasan_report_async(void)
 	if (unlikely(!report_enabled()))
 		return;
 
-	start_report(&flags, false);
+	start_report(&flags);
 	pr_err("BUG: KASAN: invalid-access\n");
 	pr_err("Asynchronous fault: no details available\n");
 	pr_err("\n");

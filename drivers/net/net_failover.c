@@ -734,7 +734,7 @@ struct failover *net_failover_create(struct net_device *standby_dev)
 	failover_dev->lltx = true;
 
 	/* Don't allow failover devices to change network namespaces. */
-	failover_dev->netns_local = true;
+	failover_dev->netns_immutable = true;
 
 	failover_dev->hw_features = FAILOVER_VLAN_FEATURES |
 				    NETIF_F_HW_VLAN_CTAG_TX |
@@ -818,19 +818,6 @@ void net_failover_destroy(struct failover *failover)
 	free_netdev(failover_dev);
 }
 EXPORT_SYMBOL_GPL(net_failover_destroy);
-
-static __init int
-net_failover_init(void)
-{
-	return 0;
-}
-module_init(net_failover_init);
-
-static __exit
-void net_failover_exit(void)
-{
-}
-module_exit(net_failover_exit);
 
 MODULE_DESCRIPTION("Failover driver for Paravirtual drivers");
 MODULE_LICENSE("GPL v2");

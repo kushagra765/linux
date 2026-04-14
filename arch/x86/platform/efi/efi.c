@@ -54,13 +54,11 @@
 #include <asm/uv/uv.h>
 
 static unsigned long efi_systab_phys __initdata;
-static unsigned long uga_phys = EFI_INVALID_TABLE_ADDR;
 static unsigned long efi_runtime, efi_nr_tables;
 
 unsigned long efi_fw_vendor, efi_config_table;
 
 static const efi_config_table_type_t arch_tables[] __initconst = {
-	{UGA_IO_PROTOCOL_GUID,		&uga_phys,		"UGA"		},
 #ifdef CONFIG_X86_UV
 	{UV_SYSTEM_TABLE_GUID,		&uv_systab_phys,	"UVsystab"	},
 #endif
@@ -72,7 +70,6 @@ static const unsigned long * const efi_tables[] = {
 	&efi.acpi20,
 	&efi.smbios,
 	&efi.smbios3,
-	&uga_phys,
 #ifdef CONFIG_X86_UV
 	&uv_systab_phys,
 #endif
@@ -336,8 +333,7 @@ static void __init efi_remove_e820_mmio(void)
 			if (size >= 256*1024) {
 				pr_info("Remove mem%02u: MMIO range=[0x%08llx-0x%08llx] (%lluMB) from e820 map\n",
 					i, start, end, size >> 20);
-				e820__range_remove(start, size,
-						   E820_TYPE_RESERVED, 1);
+				e820__range_remove(start, size, E820_TYPE_RESERVED);
 			} else {
 				pr_info("Not removing mem%02u: MMIO range=[0x%08llx-0x%08llx] (%lluKB) from e820 map\n",
 					i, start, end, size >> 10);
@@ -840,7 +836,7 @@ static void __init __efi_enter_virtual_mode(void)
 	}
 
 	efi_check_for_embedded_firmwares();
-	efi_free_boot_services();
+	efi_unmap_boot_services();
 
 	if (!efi_is_mixed())
 		efi_native_runtime_setup();
@@ -889,13 +885,6 @@ bool efi_is_table_address(unsigned long phys_addr)
 			return true;
 
 	return false;
-}
-
-char *efi_systab_show_arch(char *str)
-{
-	if (uga_phys != EFI_INVALID_TABLE_ADDR)
-		str += sprintf(str, "UGA=0x%lx\n", uga_phys);
-	return str;
 }
 
 #define EFI_FIELD(var) efi_ ## var

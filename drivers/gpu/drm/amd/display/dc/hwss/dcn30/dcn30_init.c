@@ -37,6 +37,7 @@ static const struct hw_sequencer_funcs dcn30_funcs = {
 	.apply_ctx_to_hw = dce110_apply_ctx_to_hw,
 	.apply_ctx_for_surface = NULL,
 	.program_front_end_for_ctx = dcn20_program_front_end_for_ctx,
+	.clear_surface_dcc_and_tiling = dcn10_reset_surface_dcc_and_tiling,
 	.wait_for_pending_cleared = dcn10_wait_for_pending_cleared,
 	.post_unlock_program_front_end = dcn20_post_unlock_program_front_end,
 	.update_plane_addr = dcn20_update_plane_addr,
@@ -86,7 +87,6 @@ static const struct hw_sequencer_funcs dcn30_funcs = {
 	.enable_writeback = dcn30_enable_writeback,
 	.disable_writeback = dcn30_disable_writeback,
 	.update_writeback = dcn30_update_writeback,
-	.mmhubbub_warmup = dcn30_mmhubbub_warmup,
 	.dmdata_status_done = dcn20_dmdata_status_done,
 	.program_dmdata_engine = dcn30_program_dmdata_engine,
 	.set_dmdata_attributes = dcn20_set_dmdata_attributes,
@@ -110,6 +110,7 @@ static const struct hw_sequencer_funcs dcn30_funcs = {
 	.update_visual_confirm_color = dcn10_update_visual_confirm_color,
 	.is_abm_supported = dcn21_is_abm_supported,
 	.wait_for_all_pending_updates = dcn30_wait_for_all_pending_updates,
+	.get_underflow_debug_data = dcn30_get_underflow_debug_data,
 };
 
 static const struct hwseq_private_funcs dcn30_private_funcs = {
@@ -142,7 +143,6 @@ static const struct hwseq_private_funcs dcn30_private_funcs = {
 	.set_hdr_multiplier = dcn10_set_hdr_multiplier,
 	.verify_allow_pstate_change_high = dcn10_verify_allow_pstate_change_high,
 	.wait_for_blank_complete = dcn20_wait_for_blank_complete,
-	.dccg_init = dcn20_dccg_init,
 	.set_blend_lut = dcn30_set_blend_lut,
 	.set_shaper_3dlut = dcn20_set_shaper_3dlut,
 };

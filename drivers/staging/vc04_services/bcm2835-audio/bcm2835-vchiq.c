@@ -4,10 +4,11 @@
 #include <linux/slab.h>
 #include <linux/module.h>
 #include <linux/completion.h>
+
+#include <linux/raspberrypi/vchiq_arm.h>
+
 #include "bcm2835.h"
 #include "vc_vchi_audioserv_defs.h"
-
-#include "../interface/vchiq_arm/vchiq_arm.h"
 
 struct bcm2835_audio_instance {
 	struct device *dev;
@@ -59,7 +60,7 @@ static int bcm2835_audio_send_msg_locked(struct bcm2835_audio_instance *instance
 
 	if (wait) {
 		if (!wait_for_completion_timeout(&instance->msg_avail_comp,
-						 msecs_to_jiffies(10 * 1000))) {
+						 secs_to_jiffies(10))) {
 			dev_err(instance->dev,
 				"vchi message timeout, msg=%d\n", m->type);
 			return -ETIMEDOUT;
@@ -218,7 +219,7 @@ int bcm2835_audio_open(struct bcm2835_alsa_stream *alsa_stream)
 	int err;
 
 	/* Allocate memory for this instance */
-	instance = kzalloc(sizeof(*instance), GFP_KERNEL);
+	instance = kzalloc_obj(*instance);
 	if (!instance)
 		return -ENOMEM;
 	mutex_init(&instance->vchi_mutex);

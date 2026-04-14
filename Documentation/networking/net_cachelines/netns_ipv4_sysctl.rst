@@ -79,12 +79,14 @@ u8                              sysctl_tcp_retries1
 u8                              sysctl_tcp_retries2
 u8                              sysctl_tcp_orphan_retries
 u8                              sysctl_tcp_tw_reuse                                                                  timewait_sock_ops
+unsigned_int                    sysctl_tcp_tw_reuse_delay                                                            timewait_sock_ops
 int                             sysctl_tcp_fin_timeout                                                               TCP_LAST_ACK/tcp_rcv_state_process
 unsigned_int                    sysctl_tcp_notsent_lowat                     read_mostly                             tcp_notsent_lowat/tcp_stream_memory_free
 u8                              sysctl_tcp_sack                                                                      tcp_syn_options
 u8                              sysctl_tcp_window_scaling                                                            tcp_syn_options,tcp_parse_options
 u8                              sysctl_tcp_timestamps
 u8                              sysctl_tcp_early_retrans                     read_mostly                             tcp_schedule_loss_probe(tcp_write_xmit)
+u32                             sysctl_tcp_rto_max_ms
 u8                              sysctl_tcp_recovery                                                                  tcp_fastretrans_alert
 u8                              sysctl_tcp_thin_linear_timeouts                                                      tcp_retrans_timer(on_thin_streams)
 u8                              sysctl_tcp_slow_start_after_idle                                                     unlikely(tcp_cwnd_validate-network-not-starved)
@@ -100,7 +102,8 @@ u8                              sysctl_tcp_app_win                              
 u8                              sysctl_tcp_frto                                                                      tcp_enter_loss
 u8                              sysctl_tcp_nometrics_save                                                            TCP_LAST_ACK/tcp_update_metrics
 u8                              sysctl_tcp_no_ssthresh_metrics_save                                                  TCP_LAST_ACK/tcp_(update/init)_metrics
-u8                              sysctl_tcp_moderate_rcvbuf                   read_mostly         read_mostly         tcp_tso_should_defer(tx);tcp_rcv_space_adjust(rx)
+u8                              sysctl_tcp_moderate_rcvbuf                                       read_mostly         tcp_rcvbuf_grow()
+u32                             sysctl_tcp_rcvbuf_low_rtt                                        read_mostly         tcp_rcvbuf_grow()
 u8                              sysctl_tcp_tso_win_divisor                   read_mostly                             tcp_tso_should_defer(tcp_write_xmit)
 u8                              sysctl_tcp_workaround_signed_windows                                                 tcp_select_window
 int                             sysctl_tcp_limit_output_bytes                read_mostly                             tcp_small_queue_check(tcp_write_xmit)

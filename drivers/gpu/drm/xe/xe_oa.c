@@ -10,13 +10,15 @@
 
 #include <drm/drm_drv.h>
 #include <drm/drm_managed.h>
+#include <drm/drm_syncobj.h>
 #include <uapi/drm/xe_drm.h>
+
+#include <generated/xe_wa_oob.h>
 
 #include "abi/guc_actions_slpc_abi.h"
 #include "instructions/xe_mi_commands.h"
 #include "regs/xe_engine_regs.h"
 #include "regs/xe_gt_regs.h"
-#include "regs/xe_lrc_layout.h"
 #include "regs/xe_oa_regs.h"
 #include "xe_assert.h"
 #include "xe_bb.h"
@@ -28,7 +30,6 @@
 #include "xe_gt_mcr.h"
 #include "xe_gt_printk.h"
 #include "xe_guc_pc.h"
-#include "xe_lrc.h"
 #include "xe_macros.h"
 #include "xe_mmio.h"
 #include "xe_oa.h"
@@ -37,10 +38,17 @@
 #include "xe_sched_job.h"
 #include "xe_sriov.h"
 #include "xe_sync.h"
+#include "xe_wa.h"
 
 #define DEFAULT_POLL_FREQUENCY_HZ 200
 #define DEFAULT_POLL_PERIOD_NS (NSEC_PER_SEC / DEFAULT_POLL_FREQUENCY_HZ)
 #define XE_OA_UNIT_INVALID U32_MAX
+
+enum xe_oam_unit_type {
+	XE_OAM_UNIT_SAG,
+	XE_OAM_UNIT_SCMI_0,
+	XE_OAM_UNIT_SCMI_1,
+};
 
 enum xe_oa_submit_deps {
 	XE_OA_SUBMIT_NO_DEPS,
@@ -74,15 +82,9 @@ struct xe_oa_config {
 	struct rcu_head rcu;
 };
 
-struct flex {
-	struct xe_reg reg;
-	u32 offset;
-	u32 value;
-};
-
 struct xe_oa_open_param {
 	struct xe_file *xef;
-	u32 oa_unit_id;
+	struct xe_oa_unit *oa_unit;
 	bool sample;
 	u32 metric_set;
 	enum xe_oa_format_name oa_format;
@@ -96,6 +98,8 @@ struct xe_oa_open_param {
 	struct drm_xe_sync __user *syncs_user;
 	int num_syncs;
 	struct xe_sync_entry *syncs;
+	size_t oa_buffer_size;
+	int wait_num_reports;
 };
 
 struct xe_oa_config_bo {
@@ -197,7 +201,7 @@ static void free_oa_config_bo(struct xe_oa_config_bo *oa_bo, struct dma_fence *l
 
 static const struct xe_oa_regs *__oa_regs(struct xe_oa_stream *stream)
 {
-	return &stream->hwe->oa_unit->regs;
+	return &stream->oa_unit->regs;
 }
 
 static u32 xe_oa_hw_tail_read(struct xe_oa_stream *stream)
@@ -240,11 +244,9 @@ static void oa_timestamp_clear(struct xe_oa_stream *stream, u32 *report)
 static bool xe_oa_buffer_check_unlocked(struct xe_oa_stream *stream)
 {
 	u32 gtt_offset = xe_bo_ggtt_addr(stream->oa_buffer.bo);
+	u32 tail, hw_tail, partial_report_size, available;
 	int report_size = stream->oa_buffer.format->size;
-	u32 tail, hw_tail;
 	unsigned long flags;
-	bool pollin;
-	u32 partial_report_size;
 
 	spin_lock_irqsave(&stream->oa_buffer.ptr_lock, flags);
 
@@ -288,12 +290,12 @@ static bool xe_oa_buffer_check_unlocked(struct xe_oa_stream *stream)
 
 	stream->oa_buffer.tail = tail;
 
-	pollin = xe_oa_circ_diff(stream, stream->oa_buffer.tail,
-				 stream->oa_buffer.head) >= report_size;
+	available = xe_oa_circ_diff(stream, stream->oa_buffer.tail, stream->oa_buffer.head);
+	stream->pollin = available >= stream->wait_num_reports * report_size;
 
 	spin_unlock_irqrestore(&stream->oa_buffer.ptr_lock, flags);
 
-	return pollin;
+	return stream->pollin;
 }
 
 static enum hrtimer_restart xe_oa_poll_check_timer_cb(struct hrtimer *hrtimer)
@@ -301,10 +303,8 @@ static enum hrtimer_restart xe_oa_poll_check_timer_cb(struct hrtimer *hrtimer)
 	struct xe_oa_stream *stream =
 		container_of(hrtimer, typeof(*stream), poll_check_timer);
 
-	if (xe_oa_buffer_check_unlocked(stream)) {
-		stream->pollin = true;
+	if (xe_oa_buffer_check_unlocked(stream))
 		wake_up(&stream->poll_wq);
-	}
 
 	hrtimer_forward_now(hrtimer, ns_to_ktime(stream->poll_period_ns));
 
@@ -403,10 +403,18 @@ static int xe_oa_append_reports(struct xe_oa_stream *stream, char __user *buf,
 
 static void xe_oa_init_oa_buffer(struct xe_oa_stream *stream)
 {
-	struct xe_mmio *mmio = &stream->gt->mmio;
 	u32 gtt_offset = xe_bo_ggtt_addr(stream->oa_buffer.bo);
-	u32 oa_buf = gtt_offset | OABUFFER_SIZE_16M | OAG_OABUFFER_MEMORY_SELECT;
+	int size_exponent = __ffs(xe_bo_size(stream->oa_buffer.bo));
+	u32 oa_buf = gtt_offset | OAG_OABUFFER_MEMORY_SELECT;
+	struct xe_mmio *mmio = &stream->gt->mmio;
 	unsigned long flags;
+
+	/*
+	 * If oa buffer size is more than 16MB (exponent greater than 24), the
+	 * oa buffer size field is multiplied by 8 in xe_oa_enable_metric_set.
+	 */
+	oa_buf |= REG_FIELD_PREP(OABUFFER_SIZE_MASK,
+		size_exponent > 24 ? size_exponent - 20 : size_exponent - 17);
 
 	spin_lock_irqsave(&stream->oa_buffer.ptr_lock, flags);
 
@@ -428,7 +436,7 @@ static void xe_oa_init_oa_buffer(struct xe_oa_stream *stream)
 	spin_unlock_irqrestore(&stream->oa_buffer.ptr_lock, flags);
 
 	/* Zero out the OA buffer since we rely on zero report id and timestamp fields */
-	memset(stream->oa_buffer.vaddr, 0, stream->oa_buffer.bo->size);
+	memset(stream->oa_buffer.vaddr, 0, xe_bo_size(stream->oa_buffer.bo));
 }
 
 static u32 __format_to_oactrl(const struct xe_oa_format *format, int counter_sel_mask)
@@ -451,6 +459,12 @@ static u32 __oa_ccs_select(struct xe_oa_stream *stream)
 	return val;
 }
 
+static u32 __oactrl_used_bits(struct xe_oa_stream *stream)
+{
+	return stream->oa_unit->type == DRM_XE_OA_UNIT_TYPE_OAG ?
+		OAG_OACONTROL_USED_BITS : OAM_OACONTROL_USED_BITS;
+}
+
 static void xe_oa_enable(struct xe_oa_stream *stream)
 {
 	const struct xe_oa_format *format = stream->oa_buffer.format;
@@ -468,17 +482,17 @@ static void xe_oa_enable(struct xe_oa_stream *stream)
 		__oa_ccs_select(stream) | OAG_OACONTROL_OA_COUNTER_ENABLE;
 
 	if (GRAPHICS_VER(stream->oa->xe) >= 20 &&
-	    stream->hwe->oa_unit->type == DRM_XE_OA_UNIT_TYPE_OAG)
+	    stream->oa_unit->type == DRM_XE_OA_UNIT_TYPE_OAG)
 		val |= OAG_OACONTROL_OA_PES_DISAG_EN;
 
-	xe_mmio_write32(&stream->gt->mmio, regs->oa_ctrl, val);
+	xe_mmio_rmw32(&stream->gt->mmio, regs->oa_ctrl, __oactrl_used_bits(stream), val);
 }
 
 static void xe_oa_disable(struct xe_oa_stream *stream)
 {
 	struct xe_mmio *mmio = &stream->gt->mmio;
 
-	xe_mmio_write32(mmio, __oa_regs(stream)->oa_ctrl, 0);
+	xe_mmio_rmw32(mmio, __oa_regs(stream)->oa_ctrl, __oactrl_used_bits(stream), 0);
 	if (xe_mmio_wait32(mmio, __oa_regs(stream)->oa_ctrl,
 			   OAG_OACONTROL_OA_COUNTER_ENABLE, 0, 50000, NULL, false))
 		drm_err(&stream->oa->xe->drm,
@@ -529,8 +543,7 @@ static ssize_t xe_oa_read(struct file *file, char __user *buf,
 	size_t offset = 0;
 	int ret;
 
-	/* Can't read from disabled streams */
-	if (!stream->enabled || !stream->sample)
+	if (!stream->sample)
 		return -EINVAL;
 
 	if (!(file->f_flags & O_NONBLOCK)) {
@@ -544,6 +557,7 @@ static ssize_t xe_oa_read(struct file *file, char __user *buf,
 			mutex_unlock(&stream->stream_lock);
 		} while (!offset && !ret);
 	} else {
+		xe_oa_buffer_check_unlocked(stream);
 		mutex_lock(&stream->stream_lock);
 		ret = __xe_oa_read(stream, buf, count, &offset);
 		mutex_unlock(&stream->stream_lock);
@@ -596,19 +610,38 @@ static __poll_t xe_oa_poll(struct file *file, poll_table *wait)
 	return ret;
 }
 
+static void xe_oa_lock_vma(struct xe_exec_queue *q)
+{
+	if (q->vm) {
+		down_read(&q->vm->lock);
+		xe_vm_lock(q->vm, false);
+	}
+}
+
+static void xe_oa_unlock_vma(struct xe_exec_queue *q)
+{
+	if (q->vm) {
+		xe_vm_unlock(q->vm);
+		up_read(&q->vm->lock);
+	}
+}
+
 static struct dma_fence *xe_oa_submit_bb(struct xe_oa_stream *stream, enum xe_oa_submit_deps deps,
 					 struct xe_bb *bb)
 {
+	struct xe_exec_queue *q = stream->exec_q ?: stream->k_exec_q;
 	struct xe_sched_job *job;
 	struct dma_fence *fence;
 	int err = 0;
 
-	/* Kernel configuration is issued on stream->k_exec_q, not stream->exec_q */
-	job = xe_bb_create_job(stream->k_exec_q, bb);
+	xe_oa_lock_vma(q);
+
+	job = xe_bb_create_job(q, bb);
 	if (IS_ERR(job)) {
 		err = PTR_ERR(job);
 		goto exit;
 	}
+	job->ggtt = true;
 
 	if (deps == XE_OA_SUBMIT_ADD_DEPS) {
 		for (int i = 0; i < stream->num_syncs && !err; i++)
@@ -623,10 +656,13 @@ static struct dma_fence *xe_oa_submit_bb(struct xe_oa_stream *stream, enum xe_oa
 	fence = dma_fence_get(&job->drm.s_fence->finished);
 	xe_sched_job_push(job);
 
+	xe_oa_unlock_vma(q);
+
 	return fence;
 err_put_job:
 	xe_sched_job_put(job);
 exit:
+	xe_oa_unlock_vma(q);
 	return ERR_PTR(err);
 }
 
@@ -675,63 +711,19 @@ static void xe_oa_free_configs(struct xe_oa_stream *stream)
 	dma_fence_put(stream->last_fence);
 }
 
-static void xe_oa_store_flex(struct xe_oa_stream *stream, struct xe_lrc *lrc,
-			     struct xe_bb *bb, const struct flex *flex, u32 count)
-{
-	u32 offset = xe_bo_ggtt_addr(lrc->bo);
-
-	do {
-		bb->cs[bb->len++] = MI_STORE_DATA_IMM | MI_SDI_GGTT | MI_SDI_NUM_DW(1);
-		bb->cs[bb->len++] = offset + flex->offset * sizeof(u32);
-		bb->cs[bb->len++] = 0;
-		bb->cs[bb->len++] = flex->value;
-
-	} while (flex++, --count);
-}
-
-static int xe_oa_modify_ctx_image(struct xe_oa_stream *stream, struct xe_lrc *lrc,
-				  const struct flex *flex, u32 count)
+static int xe_oa_load_with_lri(struct xe_oa_stream *stream, struct xe_oa_reg *reg_lri, u32 count)
 {
 	struct dma_fence *fence;
 	struct xe_bb *bb;
 	int err;
 
-	bb = xe_bb_new(stream->gt, 4 * count, false);
+	bb = xe_bb_new(stream->gt, 2 * count + 1, false);
 	if (IS_ERR(bb)) {
 		err = PTR_ERR(bb);
 		goto exit;
 	}
 
-	xe_oa_store_flex(stream, lrc, bb, flex, count);
-
-	fence = xe_oa_submit_bb(stream, XE_OA_SUBMIT_NO_DEPS, bb);
-	if (IS_ERR(fence)) {
-		err = PTR_ERR(fence);
-		goto free_bb;
-	}
-	xe_bb_free(bb, fence);
-	dma_fence_put(fence);
-
-	return 0;
-free_bb:
-	xe_bb_free(bb, NULL);
-exit:
-	return err;
-}
-
-static int xe_oa_load_with_lri(struct xe_oa_stream *stream, struct xe_oa_reg *reg_lri)
-{
-	struct dma_fence *fence;
-	struct xe_bb *bb;
-	int err;
-
-	bb = xe_bb_new(stream->gt, 3, false);
-	if (IS_ERR(bb)) {
-		err = PTR_ERR(bb);
-		goto exit;
-	}
-
-	write_cs_mi_lri(bb, reg_lri, 1);
+	write_cs_mi_lri(bb, reg_lri, count);
 
 	fence = xe_oa_submit_bb(stream, XE_OA_SUBMIT_NO_DEPS, bb);
 	if (IS_ERR(fence)) {
@@ -751,71 +743,55 @@ exit:
 static int xe_oa_configure_oar_context(struct xe_oa_stream *stream, bool enable)
 {
 	const struct xe_oa_format *format = stream->oa_buffer.format;
-	struct xe_lrc *lrc = stream->exec_q->lrc[0];
-	u32 regs_offset = xe_lrc_regs_offset(lrc) / sizeof(u32);
 	u32 oacontrol = __format_to_oactrl(format, OAR_OACONTROL_COUNTER_SEL_MASK) |
 		(enable ? OAR_OACONTROL_COUNTER_ENABLE : 0);
 
-	struct flex regs_context[] = {
+	struct xe_oa_reg reg_lri[] = {
 		{
 			OACTXCONTROL(stream->hwe->mmio_base),
-			stream->oa->ctx_oactxctrl_offset[stream->hwe->class] + 1,
 			enable ? OA_COUNTER_RESUME : 0,
 		},
 		{
+			OAR_OACONTROL,
+			oacontrol,
+		},
+		{
 			RING_CONTEXT_CONTROL(stream->hwe->mmio_base),
-			regs_offset + CTX_CONTEXT_CONTROL,
-			_MASKED_BIT_ENABLE(CTX_CTRL_OAC_CONTEXT_ENABLE),
+			_MASKED_FIELD(CTX_CTRL_OAC_CONTEXT_ENABLE,
+				      enable ? CTX_CTRL_OAC_CONTEXT_ENABLE : 0)
 		},
 	};
-	struct xe_oa_reg reg_lri = { OAR_OACONTROL, oacontrol };
-	int err;
 
-	/* Modify stream hwe context image with regs_context */
-	err = xe_oa_modify_ctx_image(stream, stream->exec_q->lrc[0],
-				     regs_context, ARRAY_SIZE(regs_context));
-	if (err)
-		return err;
-
-	/* Apply reg_lri using LRI */
-	return xe_oa_load_with_lri(stream, &reg_lri);
+	return xe_oa_load_with_lri(stream, reg_lri, ARRAY_SIZE(reg_lri));
 }
 
 static int xe_oa_configure_oac_context(struct xe_oa_stream *stream, bool enable)
 {
 	const struct xe_oa_format *format = stream->oa_buffer.format;
-	struct xe_lrc *lrc = stream->exec_q->lrc[0];
-	u32 regs_offset = xe_lrc_regs_offset(lrc) / sizeof(u32);
 	u32 oacontrol = __format_to_oactrl(format, OAR_OACONTROL_COUNTER_SEL_MASK) |
 		(enable ? OAR_OACONTROL_COUNTER_ENABLE : 0);
-	struct flex regs_context[] = {
+	struct xe_oa_reg reg_lri[] = {
 		{
 			OACTXCONTROL(stream->hwe->mmio_base),
-			stream->oa->ctx_oactxctrl_offset[stream->hwe->class] + 1,
 			enable ? OA_COUNTER_RESUME : 0,
 		},
 		{
+			OAC_OACONTROL,
+			oacontrol
+		},
+		{
 			RING_CONTEXT_CONTROL(stream->hwe->mmio_base),
-			regs_offset + CTX_CONTEXT_CONTROL,
-			_MASKED_BIT_ENABLE(CTX_CTRL_OAC_CONTEXT_ENABLE) |
+			_MASKED_FIELD(CTX_CTRL_OAC_CONTEXT_ENABLE,
+				      enable ? CTX_CTRL_OAC_CONTEXT_ENABLE : 0) |
 			_MASKED_FIELD(CTX_CTRL_RUN_ALONE, enable ? CTX_CTRL_RUN_ALONE : 0),
 		},
 	};
-	struct xe_oa_reg reg_lri = { OAC_OACONTROL, oacontrol };
-	int err;
 
 	/* Set ccs select to enable programming of OAC_OACONTROL */
 	xe_mmio_write32(&stream->gt->mmio, __oa_regs(stream)->oa_ctrl,
 			__oa_ccs_select(stream));
 
-	/* Modify stream hwe context image with regs_context */
-	err = xe_oa_modify_ctx_image(stream, stream->exec_q->lrc[0],
-				     regs_context, ARRAY_SIZE(regs_context));
-	if (err)
-		return err;
-
-	/* Apply reg_lri using LRI */
-	return xe_oa_load_with_lri(stream, &reg_lri);
+	return xe_oa_load_with_lri(stream, reg_lri, ARRAY_SIZE(reg_lri));
 }
 
 static int xe_oa_configure_oa_context(struct xe_oa_stream *stream, bool enable)
@@ -845,11 +821,8 @@ static void xe_oa_disable_metric_set(struct xe_oa_stream *stream)
 	struct xe_mmio *mmio = &stream->gt->mmio;
 	u32 sqcnt1;
 
-	/*
-	 * Wa_1508761755:xehpsdv, dg2
-	 * Enable thread stall DOP gating and EU DOP gating.
-	 */
-	if (stream->oa->xe->info.platform == XE_DG2) {
+	/* Enable thread stall DOP gating and EU DOP gating. */
+	if (XE_GT_WA(stream->gt, 1508761755)) {
 		xe_gt_mcr_multicast_write(stream->gt, ROW_CHICKEN,
 					  _MASKED_BIT_DISABLE(STALL_DOP_GATING_DISABLE));
 		xe_gt_mcr_multicast_write(stream->gt, ROW_CHICKEN2,
@@ -864,18 +837,24 @@ static void xe_oa_disable_metric_set(struct xe_oa_stream *stream)
 		xe_oa_configure_oa_context(stream, false);
 
 	/* Make sure we disable noa to save power. */
-	xe_mmio_rmw32(mmio, RPM_CONFIG1, GT_NOA_ENABLE, 0);
+	if (GT_VER(stream->gt) < 35)
+		xe_mmio_rmw32(mmio, RPM_CONFIG1, GT_NOA_ENABLE, 0);
 
 	sqcnt1 = SQCNT1_PMON_ENABLE |
 		 (HAS_OA_BPC_REPORTING(stream->oa->xe) ? SQCNT1_OABPC : 0);
 
 	/* Reset PMON Enable to save power. */
 	xe_mmio_rmw32(mmio, XELPMP_SQCNT1, sqcnt1, 0);
+
+	if ((stream->oa_unit->type == DRM_XE_OA_UNIT_TYPE_OAM ||
+	     stream->oa_unit->type == DRM_XE_OA_UNIT_TYPE_OAM_SAG) &&
+	    GRAPHICS_VER(stream->oa->xe) >= 30)
+		xe_mmio_rmw32(mmio, OAM_COMPRESSION_T3_CONTROL, OAM_LAT_MEASURE_ENABLE, 0);
 }
 
 static void xe_oa_stream_destroy(struct xe_oa_stream *stream)
 {
-	struct xe_oa_unit *u = stream->hwe->oa_unit;
+	struct xe_oa_unit *u = stream->oa_unit;
 	struct xe_gt *gt = stream->hwe->gt;
 
 	if (WARN_ON(stream != u->exclusive_stream))
@@ -890,7 +869,7 @@ static void xe_oa_stream_destroy(struct xe_oa_stream *stream)
 
 	xe_oa_free_oa_buffer(stream);
 
-	xe_force_wake_put(gt_to_fw(gt), XE_FORCEWAKE_ALL);
+	xe_force_wake_put(gt_to_fw(gt), stream->fw_ref);
 	xe_pm_runtime_put(stream->oa->xe);
 
 	/* Wa_1509372804:pvc: Unset the override of GUCRC mode to enable rc6 */
@@ -901,16 +880,13 @@ static void xe_oa_stream_destroy(struct xe_oa_stream *stream)
 	xe_file_put(stream->xef);
 }
 
-static int xe_oa_alloc_oa_buffer(struct xe_oa_stream *stream)
+static int xe_oa_alloc_oa_buffer(struct xe_oa_stream *stream, size_t size)
 {
 	struct xe_bo *bo;
 
-	BUILD_BUG_ON_NOT_POWER_OF_2(XE_OA_BUFFER_SIZE);
-	BUILD_BUG_ON(XE_OA_BUFFER_SIZE < SZ_128K || XE_OA_BUFFER_SIZE > SZ_16M);
-
-	bo = xe_bo_create_pin_map(stream->oa->xe, stream->gt->tile, NULL,
-				  XE_OA_BUFFER_SIZE, ttm_bo_type_kernel,
-				  XE_BO_FLAG_SYSTEM | XE_BO_FLAG_GGTT);
+	bo = xe_bo_create_pin_map_novm(stream->oa->xe, stream->gt->tile,
+				       size, ttm_bo_type_kernel,
+				       XE_BO_FLAG_SYSTEM | XE_BO_FLAG_GGTT, false);
 	if (IS_ERR(bo))
 		return PTR_ERR(bo);
 
@@ -928,7 +904,7 @@ __xe_oa_alloc_config_buffer(struct xe_oa_stream *stream, struct xe_oa_config *oa
 	size_t config_length;
 	struct xe_bb *bb;
 
-	oa_bo = kzalloc(sizeof(*oa_bo), GFP_KERNEL);
+	oa_bo = kzalloc_obj(*oa_bo);
 	if (!oa_bo)
 		return ERR_PTR(-ENOMEM);
 
@@ -1020,7 +996,7 @@ static int xe_oa_emit_oa_config(struct xe_oa_stream *stream, struct xe_oa_config
 	int i, err, num_signal = 0;
 	struct dma_fence *fence;
 
-	ofence = kzalloc(sizeof(*ofence), GFP_KERNEL);
+	ofence = kzalloc_obj(*ofence);
 	if (!ofence) {
 		err = -ENOMEM;
 		goto exit;
@@ -1087,6 +1063,13 @@ static u32 oag_report_ctx_switches(const struct xe_oa_stream *stream)
 			     0 : OAG_OA_DEBUG_DISABLE_CTX_SWITCH_REPORTS);
 }
 
+static u32 oag_buf_size_select(const struct xe_oa_stream *stream)
+{
+	return _MASKED_FIELD(OAG_OA_DEBUG_BUF_SIZE_SELECT,
+			     xe_bo_size(stream->oa_buffer.bo) > SZ_16M ?
+			     OAG_OA_DEBUG_BUF_SIZE_SELECT : 0);
+}
+
 static int xe_oa_enable_metric_set(struct xe_oa_stream *stream)
 {
 	struct xe_mmio *mmio = &stream->gt->mmio;
@@ -1094,11 +1077,10 @@ static int xe_oa_enable_metric_set(struct xe_oa_stream *stream)
 	int ret;
 
 	/*
-	 * Wa_1508761755:xehpsdv, dg2
 	 * EU NOA signals behave incorrectly if EU clock gating is enabled.
 	 * Disable thread stall DOP gating and EU DOP gating.
 	 */
-	if (stream->oa->xe->info.platform == XE_DG2) {
+	if (XE_GT_WA(stream->gt, 1508761755)) {
 		xe_gt_mcr_multicast_write(stream->gt, ROW_CHICKEN,
 					  _MASKED_BIT_ENABLE(STALL_DOP_GATING_DISABLE));
 		xe_gt_mcr_multicast_write(stream->gt, ROW_CHICKEN2,
@@ -1119,13 +1101,15 @@ static int xe_oa_enable_metric_set(struct xe_oa_stream *stream)
 	xe_mmio_write32(mmio, __oa_regs(stream)->oa_debug,
 			_MASKED_BIT_ENABLE(oa_debug) |
 			oag_report_ctx_switches(stream) |
+			oag_buf_size_select(stream) |
 			oag_configure_mmio_trigger(stream, true));
 
-	xe_mmio_write32(mmio, __oa_regs(stream)->oa_ctx_ctrl, stream->periodic ?
-			(OAG_OAGLBCTXCTRL_COUNTER_RESUME |
+	xe_mmio_write32(mmio, __oa_regs(stream)->oa_ctx_ctrl,
+			OAG_OAGLBCTXCTRL_COUNTER_RESUME |
+			(stream->periodic ?
 			 OAG_OAGLBCTXCTRL_TIMER_ENABLE |
 			 REG_FIELD_PREP(OAG_OAGLBCTXCTRL_TIMER_PERIOD_MASK,
-					stream->period_exponent)) : 0);
+					 stream->period_exponent) : 0));
 
 	/*
 	 * Initialize Super Queue Internal Cnt Register
@@ -1134,8 +1118,12 @@ static int xe_oa_enable_metric_set(struct xe_oa_stream *stream)
 	 */
 	sqcnt1 = SQCNT1_PMON_ENABLE |
 		 (HAS_OA_BPC_REPORTING(stream->oa->xe) ? SQCNT1_OABPC : 0);
-
 	xe_mmio_rmw32(mmio, XELPMP_SQCNT1, 0, sqcnt1);
+
+	if ((stream->oa_unit->type == DRM_XE_OA_UNIT_TYPE_OAM ||
+	     stream->oa_unit->type == DRM_XE_OA_UNIT_TYPE_OAM_SAG) &&
+	    GRAPHICS_VER(stream->oa->xe) >= 30)
+		xe_mmio_rmw32(mmio, OAM_COMPRESSION_T3_CONTROL, 0, OAM_LAT_MEASURE_ENABLE);
 
 	/* Configure OAR/OAC */
 	if (stream->exec_q) {
@@ -1168,14 +1156,31 @@ static int decode_oa_format(struct xe_oa *oa, u64 fmt, enum xe_oa_format_name *n
 	return -EINVAL;
 }
 
+static struct xe_oa_unit *xe_oa_lookup_oa_unit(struct xe_oa *oa, u32 oa_unit_id)
+{
+	struct xe_gt *gt;
+	int gt_id, i;
+
+	for_each_gt(gt, oa->xe, gt_id) {
+		for (i = 0; i < gt->oa.num_oa_units; i++) {
+			struct xe_oa_unit *u = &gt->oa.oa_unit[i];
+
+			if (u->oa_unit_id == oa_unit_id)
+				return u;
+		}
+	}
+
+	return NULL;
+}
+
 static int xe_oa_set_prop_oa_unit_id(struct xe_oa *oa, u64 value,
 				     struct xe_oa_open_param *param)
 {
-	if (value >= oa->oa_unit_ids) {
+	param->oa_unit = xe_oa_lookup_oa_unit(oa, value);
+	if (!param->oa_unit) {
 		drm_dbg(&oa->xe->drm, "OA unit ID out of range %lld\n", value);
 		return -EINVAL;
 	}
-	param->oa_unit_id = value;
 	return 0;
 }
 
@@ -1249,6 +1254,9 @@ static int xe_oa_set_no_preempt(struct xe_oa *oa, u64 value,
 static int xe_oa_set_prop_num_syncs(struct xe_oa *oa, u64 value,
 				    struct xe_oa_open_param *param)
 {
+	if (XE_IOCTL_DBG(oa->xe, value > DRM_XE_MAX_SYNCS))
+		return -EINVAL;
+
 	param->num_syncs = value;
 	return 0;
 }
@@ -1257,6 +1265,28 @@ static int xe_oa_set_prop_syncs_user(struct xe_oa *oa, u64 value,
 				     struct xe_oa_open_param *param)
 {
 	param->syncs_user = u64_to_user_ptr(value);
+	return 0;
+}
+
+static int xe_oa_set_prop_oa_buffer_size(struct xe_oa *oa, u64 value,
+					 struct xe_oa_open_param *param)
+{
+	if (!is_power_of_2(value) || value < SZ_128K || value > SZ_128M) {
+		drm_dbg(&oa->xe->drm, "OA buffer size invalid %llu\n", value);
+		return -EINVAL;
+	}
+	param->oa_buffer_size = value;
+	return 0;
+}
+
+static int xe_oa_set_prop_wait_num_reports(struct xe_oa *oa, u64 value,
+					   struct xe_oa_open_param *param)
+{
+	if (!value) {
+		drm_dbg(&oa->xe->drm, "wait_num_reports %llu\n", value);
+		return -EINVAL;
+	}
+	param->wait_num_reports = value;
 	return 0;
 }
 
@@ -1280,6 +1310,8 @@ static const xe_oa_set_property_fn xe_oa_set_property_funcs_open[] = {
 	[DRM_XE_OA_PROPERTY_NO_PREEMPT] = xe_oa_set_no_preempt,
 	[DRM_XE_OA_PROPERTY_NUM_SYNCS] = xe_oa_set_prop_num_syncs,
 	[DRM_XE_OA_PROPERTY_SYNCS] = xe_oa_set_prop_syncs_user,
+	[DRM_XE_OA_PROPERTY_OA_BUFFER_SIZE] = xe_oa_set_prop_oa_buffer_size,
+	[DRM_XE_OA_PROPERTY_WAIT_NUM_REPORTS] = xe_oa_set_prop_wait_num_reports,
 };
 
 static const xe_oa_set_property_fn xe_oa_set_property_funcs_config[] = {
@@ -1294,6 +1326,8 @@ static const xe_oa_set_property_fn xe_oa_set_property_funcs_config[] = {
 	[DRM_XE_OA_PROPERTY_NO_PREEMPT] = xe_oa_set_prop_ret_inval,
 	[DRM_XE_OA_PROPERTY_NUM_SYNCS] = xe_oa_set_prop_num_syncs,
 	[DRM_XE_OA_PROPERTY_SYNCS] = xe_oa_set_prop_syncs_user,
+	[DRM_XE_OA_PROPERTY_OA_BUFFER_SIZE] = xe_oa_set_prop_ret_inval,
+	[DRM_XE_OA_PROPERTY_WAIT_NUM_REPORTS] = xe_oa_set_prop_ret_inval,
 };
 
 static int xe_oa_user_ext_set_property(struct xe_oa *oa, enum xe_oa_user_extn_from from,
@@ -1304,7 +1338,7 @@ static int xe_oa_user_ext_set_property(struct xe_oa *oa, enum xe_oa_user_extn_fr
 	int err;
 	u32 idx;
 
-	err = __copy_from_user(&ext, address, sizeof(ext));
+	err = copy_from_user(&ext, address, sizeof(ext));
 	if (XE_IOCTL_DBG(oa->xe, err))
 		return -EFAULT;
 
@@ -1312,7 +1346,7 @@ static int xe_oa_user_ext_set_property(struct xe_oa *oa, enum xe_oa_user_extn_fr
 		     ARRAY_SIZE(xe_oa_set_property_funcs_config));
 
 	if (XE_IOCTL_DBG(oa->xe, ext.property >= ARRAY_SIZE(xe_oa_set_property_funcs_open)) ||
-	    XE_IOCTL_DBG(oa->xe, ext.pad))
+	    XE_IOCTL_DBG(oa->xe, !ext.property) || XE_IOCTL_DBG(oa->xe, ext.pad))
 		return -EINVAL;
 
 	idx = array_index_nospec(ext.property, ARRAY_SIZE(xe_oa_set_property_funcs_open));
@@ -1341,7 +1375,7 @@ static int xe_oa_user_extensions(struct xe_oa *oa, enum xe_oa_user_extn_from fro
 	if (XE_IOCTL_DBG(oa->xe, ext_number >= MAX_USER_EXTENSIONS))
 		return -E2BIG;
 
-	err = __copy_from_user(&ext, address, sizeof(ext));
+	err = copy_from_user(&ext, address, sizeof(ext));
 	if (XE_IOCTL_DBG(oa->xe, err))
 		return -EFAULT;
 
@@ -1360,7 +1394,9 @@ static int xe_oa_user_extensions(struct xe_oa *oa, enum xe_oa_user_extn_from fro
 	return 0;
 }
 
-static int xe_oa_parse_syncs(struct xe_oa *oa, struct xe_oa_open_param *param)
+static int xe_oa_parse_syncs(struct xe_oa *oa,
+			     struct xe_oa_stream *stream,
+			     struct xe_oa_open_param *param)
 {
 	int ret, num_syncs, num_ufence = 0;
 
@@ -1371,7 +1407,7 @@ static int xe_oa_parse_syncs(struct xe_oa *oa, struct xe_oa_open_param *param)
 	}
 
 	if (param->num_syncs) {
-		param->syncs = kcalloc(param->num_syncs, sizeof(*param->syncs), GFP_KERNEL);
+		param->syncs = kzalloc_objs(*param->syncs, param->num_syncs);
 		if (!param->syncs) {
 			ret = -ENOMEM;
 			goto exit;
@@ -1380,7 +1416,9 @@ static int xe_oa_parse_syncs(struct xe_oa *oa, struct xe_oa_open_param *param)
 
 	for (num_syncs = 0; num_syncs < param->num_syncs; num_syncs++) {
 		ret = xe_sync_entry_parse(oa->xe, param->xef, &param->syncs[num_syncs],
-					  &param->syncs_user[num_syncs], 0);
+					  &param->syncs_user[num_syncs],
+					  stream->ufence_syncobj,
+					  ++stream->ufence_timeline_value, 0);
 		if (ret)
 			goto err_syncs;
 
@@ -1421,6 +1459,10 @@ static void xe_oa_stream_disable(struct xe_oa_stream *stream)
 
 	if (stream->sample)
 		hrtimer_cancel(&stream->poll_check_timer);
+
+	/* Update stream->oa_buffer.tail to allow any final reports to be read */
+	if (xe_oa_buffer_check_unlocked(stream))
+		wake_up(&stream->poll_wq);
 }
 
 static int xe_oa_enable_preempt_timeslice(struct xe_oa_stream *stream)
@@ -1510,7 +1552,7 @@ static long xe_oa_config_locked(struct xe_oa_stream *stream, u64 arg)
 		return -ENODEV;
 
 	param.xef = stream->xef;
-	err = xe_oa_parse_syncs(stream->oa, &param);
+	err = xe_oa_parse_syncs(stream->oa, stream, &param);
 	if (err)
 		goto err_config_put;
 
@@ -1553,7 +1595,7 @@ static long xe_oa_status_locked(struct xe_oa_stream *stream, unsigned long arg)
 
 static long xe_oa_info_locked(struct xe_oa_stream *stream, unsigned long arg)
 {
-	struct drm_xe_oa_stream_info info = { .oa_buf_size = XE_OA_BUFFER_SIZE, };
+	struct drm_xe_oa_stream_info info = { .oa_buf_size = xe_bo_size(stream->oa_buffer.bo), };
 	void __user *uaddr = (void __user *)arg;
 
 	if (copy_to_user(uaddr, &info, sizeof(info)))
@@ -1606,6 +1648,7 @@ static void xe_oa_destroy_locked(struct xe_oa_stream *stream)
 	if (stream->exec_q)
 		xe_exec_queue_put(stream->exec_q);
 
+	drm_syncobj_put(stream->ufence_syncobj);
 	kfree(stream);
 }
 
@@ -1639,7 +1682,7 @@ static int xe_oa_mmap(struct file *file, struct vm_area_struct *vma)
 	}
 
 	/* Can mmap the entire OA buffer or nothing (no partial OA buffer mmaps) */
-	if (vma->vm_end - vma->vm_start != XE_OA_BUFFER_SIZE) {
+	if (vma->vm_end - vma->vm_start != xe_bo_size(stream->oa_buffer.bo)) {
 		drm_dbg(&stream->oa->xe->drm, "Wrong mmap size, must be OA buffer size\n");
 		return -EINVAL;
 	}
@@ -1677,99 +1720,24 @@ static const struct file_operations xe_oa_fops = {
 	.mmap		= xe_oa_mmap,
 };
 
-static bool engine_supports_mi_query(struct xe_hw_engine *hwe)
-{
-	return hwe->class == XE_ENGINE_CLASS_RENDER ||
-		hwe->class == XE_ENGINE_CLASS_COMPUTE;
-}
-
-static bool xe_oa_find_reg_in_lri(u32 *state, u32 reg, u32 *offset, u32 end)
-{
-	u32 idx = *offset;
-	u32 len = min(MI_LRI_LEN(state[idx]) + idx, end);
-	bool found = false;
-
-	idx++;
-	for (; idx < len; idx += 2) {
-		if (state[idx] == reg) {
-			found = true;
-			break;
-		}
-	}
-
-	*offset = idx;
-	return found;
-}
-
-#define IS_MI_LRI_CMD(x) (REG_FIELD_GET(MI_OPCODE, (x)) == \
-			  REG_FIELD_GET(MI_OPCODE, MI_LOAD_REGISTER_IMM))
-
-static u32 xe_oa_context_image_offset(struct xe_oa_stream *stream, u32 reg)
-{
-	struct xe_lrc *lrc = stream->exec_q->lrc[0];
-	u32 len = (xe_gt_lrc_size(stream->gt, stream->hwe->class) +
-		   lrc->ring.size) / sizeof(u32);
-	u32 offset = xe_lrc_regs_offset(lrc) / sizeof(u32);
-	u32 *state = (u32 *)lrc->bo->vmap.vaddr;
-
-	if (drm_WARN_ON(&stream->oa->xe->drm, !state))
-		return U32_MAX;
-
-	for (; offset < len; ) {
-		if (IS_MI_LRI_CMD(state[offset])) {
-			/*
-			 * We expect reg-value pairs in MI_LRI command, so
-			 * MI_LRI_LEN() should be even
-			 */
-			drm_WARN_ON(&stream->oa->xe->drm,
-				    MI_LRI_LEN(state[offset]) & 0x1);
-
-			if (xe_oa_find_reg_in_lri(state, reg, &offset, len))
-				break;
-		} else {
-			offset++;
-		}
-	}
-
-	return offset < len ? offset : U32_MAX;
-}
-
-static int xe_oa_set_ctx_ctrl_offset(struct xe_oa_stream *stream)
-{
-	struct xe_reg reg = OACTXCONTROL(stream->hwe->mmio_base);
-	u32 offset = stream->oa->ctx_oactxctrl_offset[stream->hwe->class];
-
-	/* Do this only once. Failure is stored as offset of U32_MAX */
-	if (offset)
-		goto exit;
-
-	offset = xe_oa_context_image_offset(stream, reg.addr);
-	stream->oa->ctx_oactxctrl_offset[stream->hwe->class] = offset;
-
-	drm_dbg(&stream->oa->xe->drm, "%s oa ctx control at 0x%08x dword offset\n",
-		stream->hwe->name, offset);
-exit:
-	return offset && offset != U32_MAX ? 0 : -ENODEV;
-}
-
 static int xe_oa_stream_init(struct xe_oa_stream *stream,
 			     struct xe_oa_open_param *param)
 {
-	struct xe_oa_unit *u = param->hwe->oa_unit;
 	struct xe_gt *gt = param->hwe->gt;
-	unsigned int fw_ref;
 	int ret;
 
 	stream->exec_q = param->exec_q;
 	stream->poll_period_ns = DEFAULT_POLL_PERIOD_NS;
+	stream->oa_unit = param->oa_unit;
 	stream->hwe = param->hwe;
 	stream->gt = stream->hwe->gt;
 	stream->oa_buffer.format = &stream->oa->oa_formats[param->oa_format];
 
 	stream->sample = param->sample;
-	stream->periodic = param->period_exponent > 0;
+	stream->periodic = param->period_exponent >= 0;
 	stream->period_exponent = param->period_exponent;
 	stream->no_preempt = param->no_preempt;
+	stream->wait_num_reports = param->wait_num_reports;
 
 	stream->xef = xe_file_get(param->xef);
 	stream->num_syncs = param->num_syncs;
@@ -1781,22 +1749,12 @@ static int xe_oa_stream_init(struct xe_oa_stream *stream,
 	 * buffer whose size, circ_size, is a multiple of the report size
 	 */
 	if (GRAPHICS_VER(stream->oa->xe) >= 20 &&
-	    stream->hwe->oa_unit->type == DRM_XE_OA_UNIT_TYPE_OAG && stream->sample)
+	    stream->oa_unit->type == DRM_XE_OA_UNIT_TYPE_OAG && stream->sample)
 		stream->oa_buffer.circ_size =
-			XE_OA_BUFFER_SIZE - XE_OA_BUFFER_SIZE % stream->oa_buffer.format->size;
+			param->oa_buffer_size -
+			param->oa_buffer_size % stream->oa_buffer.format->size;
 	else
-		stream->oa_buffer.circ_size = XE_OA_BUFFER_SIZE;
-
-	if (stream->exec_q && engine_supports_mi_query(stream->hwe)) {
-		/* If we don't find the context offset, just return error */
-		ret = xe_oa_set_ctx_ctrl_offset(stream);
-		if (ret) {
-			drm_err(&stream->oa->xe->drm,
-				"xe_oa_set_ctx_ctrl_offset failed for %s\n",
-				stream->hwe->name);
-			goto exit;
-		}
-	}
+		stream->oa_buffer.circ_size = param->oa_buffer_size;
 
 	stream->oa_config = xe_oa_get_oa_config(stream->oa, param->metric_set);
 	if (!stream->oa_config) {
@@ -1806,12 +1764,10 @@ static int xe_oa_stream_init(struct xe_oa_stream *stream,
 	}
 
 	/*
-	 * Wa_1509372804:pvc
-	 *
 	 * GuC reset of engines causes OA to lose configuration
 	 * state. Prevent this by overriding GUCRC mode.
 	 */
-	if (stream->oa->xe->info.platform == XE_PVC) {
+	if (XE_GT_WA(stream->gt, 1509372804)) {
 		ret = xe_guc_pc_override_gucrc_mode(&gt->uc.guc.pc,
 						    SLPC_GUCRC_MODE_GUCRC_NO_RC6);
 		if (ret)
@@ -1822,13 +1778,13 @@ static int xe_oa_stream_init(struct xe_oa_stream *stream,
 
 	/* Take runtime pm ref and forcewake to disable RC6 */
 	xe_pm_runtime_get(stream->oa->xe);
-	fw_ref = xe_force_wake_get(gt_to_fw(gt), XE_FORCEWAKE_ALL);
-	if (!xe_force_wake_ref_has_domain(fw_ref, XE_FORCEWAKE_ALL)) {
+	stream->fw_ref = xe_force_wake_get(gt_to_fw(gt), XE_FORCEWAKE_ALL);
+	if (!xe_force_wake_ref_has_domain(stream->fw_ref, XE_FORCEWAKE_ALL)) {
 		ret = -ETIMEDOUT;
 		goto err_fw_put;
 	}
 
-	ret = xe_oa_alloc_oa_buffer(stream);
+	ret = xe_oa_alloc_oa_buffer(stream, param->oa_buffer_size);
 	if (ret)
 		goto err_fw_put;
 
@@ -1851,10 +1807,10 @@ static int xe_oa_stream_init(struct xe_oa_stream *stream,
 	drm_dbg(&stream->oa->xe->drm, "opening stream oa config uuid=%s\n",
 		stream->oa_config->uuid);
 
-	WRITE_ONCE(u->exclusive_stream, stream);
+	WRITE_ONCE(stream->oa_unit->exclusive_stream, stream);
 
-	hrtimer_init(&stream->poll_check_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	stream->poll_check_timer.function = xe_oa_poll_check_timer_cb;
+	hrtimer_setup(&stream->poll_check_timer, xe_oa_poll_check_timer_cb, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_REL);
 	init_waitqueue_head(&stream->poll_wq);
 
 	spin_lock_init(&stream->oa_buffer.ptr_lock);
@@ -1868,7 +1824,7 @@ err_put_k_exec_q:
 err_free_oa_buf:
 	xe_oa_free_oa_buffer(stream);
 err_fw_put:
-	xe_force_wake_put(gt_to_fw(gt), fw_ref);
+	xe_force_wake_put(gt_to_fw(gt), stream->fw_ref);
 	xe_pm_runtime_put(stream->oa->xe);
 	if (stream->override_gucrc)
 		xe_gt_WARN_ON(gt, xe_guc_pc_unset_gucrc_mode(&gt->uc.guc.pc));
@@ -1883,26 +1839,41 @@ static int xe_oa_stream_open_ioctl_locked(struct xe_oa *oa,
 					  struct xe_oa_open_param *param)
 {
 	struct xe_oa_stream *stream;
+	struct drm_syncobj *ufence_syncobj;
 	int stream_fd;
 	int ret;
 
 	/* We currently only allow exclusive access */
-	if (param->hwe->oa_unit->exclusive_stream) {
+	if (param->oa_unit->exclusive_stream) {
 		drm_dbg(&oa->xe->drm, "OA unit already in use\n");
 		ret = -EBUSY;
 		goto exit;
 	}
 
-	stream = kzalloc(sizeof(*stream), GFP_KERNEL);
+	ret = drm_syncobj_create(&ufence_syncobj, DRM_SYNCOBJ_CREATE_SIGNALED,
+				 NULL);
+	if (ret)
+		goto exit;
+
+	stream = kzalloc_obj(*stream);
 	if (!stream) {
 		ret = -ENOMEM;
-		goto exit;
+		goto err_syncobj;
 	}
-
+	stream->ufence_syncobj = ufence_syncobj;
 	stream->oa = oa;
-	ret = xe_oa_stream_init(stream, param);
+
+	ret = xe_oa_parse_syncs(oa, stream, param);
 	if (ret)
 		goto err_free;
+
+	ret = xe_oa_stream_init(stream, param);
+	if (ret) {
+		while (param->num_syncs--)
+			xe_sync_entry_cleanup(&param->syncs[param->num_syncs]);
+		kfree(param->syncs);
+		goto err_free;
+	}
 
 	if (!param->disabled) {
 		ret = xe_oa_enable_locked(stream);
@@ -1927,6 +1898,8 @@ err_destroy:
 	xe_oa_stream_destroy(stream);
 err_free:
 	kfree(stream);
+err_syncobj:
+	drm_syncobj_put(ufence_syncobj);
 exit:
 	return ret;
 }
@@ -1943,23 +1916,14 @@ u32 xe_oa_timestamp_frequency(struct xe_gt *gt)
 {
 	u32 reg, shift;
 
-	/*
-	 * Wa_18013179988:dg2
-	 * Wa_14015568240:pvc
-	 * Wa_14015846243:mtl
-	 */
-	switch (gt_to_xe(gt)->info.platform) {
-	case XE_DG2:
-	case XE_PVC:
-	case XE_METEORLAKE:
+	if (XE_GT_WA(gt, 18013179988) || XE_GT_WA(gt, 14015568240)) {
 		xe_pm_runtime_get(gt_to_xe(gt));
 		reg = xe_mmio_read32(&gt->mmio, RPM_CONFIG0);
 		xe_pm_runtime_put(gt_to_xe(gt));
 
 		shift = REG_FIELD_GET(RPM_CONFIG0_CTC_SHIFT_PARAMETER_MASK, reg);
 		return gt->info.reference_clock << (3 - shift);
-
-	default:
+	} else {
 		return gt->info.reference_clock;
 	}
 }
@@ -1972,13 +1936,15 @@ static u64 oa_exponent_to_ns(struct xe_gt *gt, int exponent)
 	return div_u64(nom + den - 1, den);
 }
 
-static bool engine_supports_oa_format(const struct xe_hw_engine *hwe, int type)
+static bool oa_unit_supports_oa_format(struct xe_oa_open_param *param, int type)
 {
-	switch (hwe->oa_unit->type) {
+	switch (param->oa_unit->type) {
 	case DRM_XE_OA_UNIT_TYPE_OAG:
 		return type == DRM_XE_OA_FMT_TYPE_OAG || type == DRM_XE_OA_FMT_TYPE_OAR ||
 			type == DRM_XE_OA_FMT_TYPE_OAC || type == DRM_XE_OA_FMT_TYPE_PEC;
 	case DRM_XE_OA_UNIT_TYPE_OAM:
+	case DRM_XE_OA_UNIT_TYPE_OAM_SAG:
+	case DRM_XE_OA_UNIT_TYPE_MERT:
 		return type == DRM_XE_OA_FMT_TYPE_OAM || type == DRM_XE_OA_FMT_TYPE_OAM_MPEC;
 	default:
 		return false;
@@ -1997,37 +1963,44 @@ u16 xe_oa_unit_id(struct xe_hw_engine *hwe)
 		hwe->oa_unit->oa_unit_id : U16_MAX;
 }
 
+/* A hwe must be assigned to stream/oa_unit for batch submissions */
 static int xe_oa_assign_hwe(struct xe_oa *oa, struct xe_oa_open_param *param)
 {
-	struct xe_gt *gt;
-	int i, ret = 0;
+	struct xe_hw_engine *hwe;
+	enum xe_hw_engine_id id;
+	int ret = 0;
 
+	/* When we have an exec_q, get hwe from the exec_q */
 	if (param->exec_q) {
-		/* When we have an exec_q, get hwe from the exec_q */
 		param->hwe = xe_gt_hw_engine(param->exec_q->gt, param->exec_q->class,
 					     param->engine_instance, true);
-	} else {
-		struct xe_hw_engine *hwe;
-		enum xe_hw_engine_id id;
+		if (!param->hwe || param->hwe->oa_unit != param->oa_unit)
+			goto err;
+		goto out;
+	}
 
-		/* Else just get the first hwe attached to the oa unit */
-		for_each_gt(gt, oa->xe, i) {
-			for_each_hw_engine(hwe, gt, id) {
-				if (xe_oa_unit_id(hwe) == param->oa_unit_id) {
-					param->hwe = hwe;
-					goto out;
-				}
-			}
+	/* Else just get the first hwe attached to the oa unit */
+	for_each_hw_engine(hwe, param->oa_unit->gt, id) {
+		if (hwe->oa_unit == param->oa_unit) {
+			param->hwe = hwe;
+			goto out;
 		}
 	}
-out:
-	if (!param->hwe || xe_oa_unit_id(param->hwe) != param->oa_unit_id) {
-		drm_dbg(&oa->xe->drm, "Unable to find hwe (%d, %d) for OA unit ID %d\n",
-			param->exec_q ? param->exec_q->class : -1,
-			param->engine_instance, param->oa_unit_id);
-		ret = -EINVAL;
-	}
 
+	/* If we still didn't find a hwe, just get one with a valid oa_unit from the same gt */
+	for_each_hw_engine(hwe, param->oa_unit->gt, id) {
+		if (!hwe->oa_unit)
+			continue;
+
+		param->hwe = hwe;
+		goto out;
+	}
+err:
+	drm_dbg(&oa->xe->drm, "Unable to find hwe (%d, %d) for OA unit ID %d\n",
+		param->exec_q ? param->exec_q->class : -1,
+		param->engine_instance, param->oa_unit->oa_unit_id);
+	ret = -EINVAL;
+out:
 	return ret;
 }
 
@@ -2057,17 +2030,26 @@ int xe_oa_stream_open_ioctl(struct drm_device *dev, u64 data, struct drm_file *f
 	}
 
 	param.xef = xef;
+	param.period_exponent = -1;
 	ret = xe_oa_user_extensions(oa, XE_OA_USER_EXTN_FROM_OPEN, data, 0, &param);
 	if (ret)
 		return ret;
 
+	/* If not provided, OA unit defaults to OA unit 0 as per uapi */
+	if (!param.oa_unit)
+		param.oa_unit = &xe_root_mmio_gt(oa->xe)->oa.oa_unit[0];
+
 	if (param.exec_queue_id > 0) {
+		/* An exec_queue is only needed for OAR/OAC functionality on OAG */
+		if (XE_IOCTL_DBG(oa->xe, param.oa_unit->type != DRM_XE_OA_UNIT_TYPE_OAG))
+			return -EINVAL;
+
 		param.exec_q = xe_exec_queue_lookup(xef, param.exec_queue_id);
 		if (XE_IOCTL_DBG(oa->xe, !param.exec_q))
 			return -ENOENT;
 
-		if (param.exec_q->width > 1)
-			drm_dbg(&oa->xe->drm, "exec_q->width > 1, programming only exec_q->lrc[0]\n");
+		if (XE_IOCTL_DBG(oa->xe, param.exec_q->width > 1))
+			return -EOPNOTSUPP;
 	}
 
 	/*
@@ -2104,14 +2086,14 @@ int xe_oa_stream_open_ioctl(struct drm_device *dev, u64 data, struct drm_file *f
 
 	f = &oa->oa_formats[param.oa_format];
 	if (!param.oa_format || !f->size ||
-	    !engine_supports_oa_format(param.hwe, f->type)) {
+	    !oa_unit_supports_oa_format(&param, f->type)) {
 		drm_dbg(&oa->xe->drm, "Invalid OA format %d type %d size %d for class %d\n",
 			param.oa_format, f->type, f->size, param.hwe->class);
 		ret = -EINVAL;
 		goto err_exec_q;
 	}
 
-	if (param.period_exponent > 0) {
+	if (param.period_exponent >= 0) {
 		u64 oa_period, oa_freq_hz;
 
 		/* Requesting samples from OAG buffer is a privileged operation */
@@ -2125,22 +2107,25 @@ int xe_oa_stream_open_ioctl(struct drm_device *dev, u64 data, struct drm_file *f
 		drm_dbg(&oa->xe->drm, "Using periodic sampling freq %lld Hz\n", oa_freq_hz);
 	}
 
-	ret = xe_oa_parse_syncs(oa, &param);
-	if (ret)
+	if (!param.oa_buffer_size)
+		param.oa_buffer_size = DEFAULT_XE_OA_BUFFER_SIZE;
+
+	if (!param.wait_num_reports)
+		param.wait_num_reports = 1;
+	if (param.wait_num_reports > param.oa_buffer_size / f->size) {
+		drm_dbg(&oa->xe->drm, "wait_num_reports %d\n", param.wait_num_reports);
+		ret = -EINVAL;
 		goto err_exec_q;
+	}
 
 	mutex_lock(&param.hwe->gt->oa.gt_lock);
 	ret = xe_oa_stream_open_ioctl_locked(oa, &param);
 	mutex_unlock(&param.hwe->gt->oa.gt_lock);
 	if (ret < 0)
-		goto err_sync_cleanup;
+		goto err_exec_q;
 
 	return ret;
 
-err_sync_cleanup:
-	while (param.num_syncs--)
-		xe_sync_entry_cleanup(&param.syncs[param.num_syncs]);
-	kfree(param.syncs);
 err_exec_q:
 	if (param.exec_q)
 		xe_exec_queue_put(param.exec_q);
@@ -2241,10 +2226,14 @@ static const struct xe_mmio_range gen12_oa_mux_regs[] = {
 static const struct xe_mmio_range xe2_oa_mux_regs[] = {
 	{ .start = 0x5194, .end = 0x5194 },	/* SYS_MEM_LAT_MEASURE_MERTF_GRP_3D */
 	{ .start = 0x8704, .end = 0x8704 },	/* LMEM_LAT_MEASURE_MCFG_GRP */
+	{ .start = 0xB01C, .end = 0xB01C },	/* LNCF_MISC_CONFIG_REGISTER0 */
 	{ .start = 0xB1BC, .end = 0xB1BC },	/* L3_BANK_LAT_MEASURE_LBCF_GFX */
+	{ .start = 0xD0E0, .end = 0xD0F4 },	/* VISACTL */
 	{ .start = 0xE18C, .end = 0xE18C },	/* SAMPLER_MODE */
 	{ .start = 0xE590, .end = 0xE590 },	/* TDL_LSC_LAT_MEASURE_TDL_GFX */
 	{ .start = 0x13000, .end = 0x137FC },	/* PES_0_PESL0 - PES_63_UPPER_PESL3 */
+	{ .start = 0x145194, .end = 0x145194 },	/* SYS_MEM_LAT_MEASURE */
+	{ .start = 0x145340, .end = 0x14537C },	/* MERTSS_PES_0 - MERTSS_PES_7 */
 	{},
 };
 
@@ -2273,7 +2262,7 @@ xe_oa_alloc_regs(struct xe_oa *oa, bool (*is_valid)(struct xe_oa *oa, u32 addr),
 	int err;
 	u32 i;
 
-	oa_regs = kmalloc_array(n_regs, sizeof(*oa_regs), GFP_KERNEL);
+	oa_regs = kmalloc_objs(*oa_regs, n_regs);
 	if (!oa_regs)
 		return ERR_PTR(-ENOMEM);
 
@@ -2306,6 +2295,7 @@ addr_err:
 	kfree(oa_regs);
 	return ERR_PTR(err);
 }
+ALLOW_ERROR_INJECTION(xe_oa_alloc_regs, ERRNO);
 
 static ssize_t show_dynamic_id(struct kobject *kobj,
 			       struct kobj_attribute *attr,
@@ -2365,7 +2355,7 @@ int xe_oa_add_config_ioctl(struct drm_device *dev, u64 data, struct drm_file *fi
 		return -EACCES;
 	}
 
-	err = __copy_from_user(&param, u64_to_user_ptr(data), sizeof(param));
+	err = copy_from_user(&param, u64_to_user_ptr(data), sizeof(param));
 	if (XE_IOCTL_DBG(oa->xe, err))
 		return -EFAULT;
 
@@ -2374,7 +2364,7 @@ int xe_oa_add_config_ioctl(struct drm_device *dev, u64 data, struct drm_file *fi
 	    XE_IOCTL_DBG(oa->xe, !arg->n_regs))
 		return -EINVAL;
 
-	oa_config = kzalloc(sizeof(*oa_config), GFP_KERNEL);
+	oa_config = kzalloc_obj(*oa_config);
 	if (!oa_config)
 		return -ENOMEM;
 
@@ -2427,11 +2417,13 @@ int xe_oa_add_config_ioctl(struct drm_device *dev, u64 data, struct drm_file *fi
 		goto sysfs_err;
 	}
 
+	id = oa_config->id;
+
+	drm_dbg(&oa->xe->drm, "Added config %s id=%i\n", oa_config->uuid, id);
+
 	mutex_unlock(&oa->metrics_lock);
 
-	drm_dbg(&oa->xe->drm, "Added config %s id=%i\n", oa_config->uuid, oa_config->id);
-
-	return oa_config->id;
+	return id;
 
 sysfs_err:
 	mutex_unlock(&oa->metrics_lock);
@@ -2498,30 +2490,9 @@ err_unlock:
 	return ret;
 }
 
-/**
- * xe_oa_register - Xe OA registration
- * @xe: @xe_device
- *
- * Exposes the metrics sysfs directory upon completion of module initialization
- */
-void xe_oa_register(struct xe_device *xe)
+static void xe_oa_unregister(void *arg)
 {
-	struct xe_oa *oa = &xe->oa;
-
-	if (!oa->xe)
-		return;
-
-	oa->metrics_kobj = kobject_create_and_add("metrics",
-						  &xe->drm.primary->kdev->kobj);
-}
-
-/**
- * xe_oa_unregister - Xe OA de-registration
- * @xe: @xe_device
- */
-void xe_oa_unregister(struct xe_device *xe)
-{
-	struct xe_oa *oa = &xe->oa;
+	struct xe_oa *oa = arg;
 
 	if (!oa->metrics_kobj)
 		return;
@@ -2530,22 +2501,66 @@ void xe_oa_unregister(struct xe_device *xe)
 	oa->metrics_kobj = NULL;
 }
 
+/**
+ * xe_oa_register - Xe OA registration
+ * @xe: @xe_device
+ *
+ * Exposes the metrics sysfs directory upon completion of module initialization
+ */
+int xe_oa_register(struct xe_device *xe)
+{
+	struct xe_oa *oa = &xe->oa;
+
+	if (!oa->xe)
+		return 0;
+
+	oa->metrics_kobj = kobject_create_and_add("metrics",
+						  &xe->drm.primary->kdev->kobj);
+	if (!oa->metrics_kobj)
+		return -ENOMEM;
+
+	return devm_add_action_or_reset(xe->drm.dev, xe_oa_unregister, oa);
+}
+
 static u32 num_oa_units_per_gt(struct xe_gt *gt)
 {
-	return 1;
+	if (xe_gt_is_main_type(gt) || GRAPHICS_VER(gt_to_xe(gt)) < 20)
+		/*
+		 * Mert OA unit belongs to the SoC, not a gt, so should be accessed using
+		 * xe_root_tile_mmio(). However, for all known platforms this is the same as
+		 * accessing via xe_root_mmio_gt()->mmio.
+		 */
+		return xe_device_has_mert(gt_to_xe(gt)) ? 2 : 1;
+	else if (!IS_DGFX(gt_to_xe(gt)))
+		return XE_OAM_UNIT_SCMI_0 + 1; /* SAG + SCMI_0 */
+	else
+		return XE_OAM_UNIT_SCMI_1 + 1; /* SAG + SCMI_0 + SCMI_1 */
 }
 
 static u32 __hwe_oam_unit(struct xe_hw_engine *hwe)
 {
-	if (GRAPHICS_VERx100(gt_to_xe(hwe->gt)) >= 1270) {
-		/*
-		 * There's 1 SAMEDIA gt and 1 OAM per SAMEDIA gt. All media slices
-		 * within the gt use the same OAM. All MTL/LNL SKUs list 1 SA MEDIA
-		 */
-		xe_gt_WARN_ON(hwe->gt, hwe->gt->info.type != XE_GT_TYPE_MEDIA);
+	if (GRAPHICS_VERx100(gt_to_xe(hwe->gt)) < 1270)
+		return XE_OA_UNIT_INVALID;
 
+	xe_gt_WARN_ON(hwe->gt, xe_gt_is_main_type(hwe->gt));
+
+	if (GRAPHICS_VER(gt_to_xe(hwe->gt)) < 20)
 		return 0;
-	}
+	/*
+	 * XE_OAM_UNIT_SAG has only GSCCS attached to it, but only on some platforms. Also
+	 * GSCCS cannot be used to submit batches to program the OAM unit. Therefore we don't
+	 * assign an OA unit to GSCCS. This means that XE_OAM_UNIT_SAG is exposed as an OA
+	 * unit without attached engines. Fused off engines can also result in oa_unit's with
+	 * num_engines == 0. OA streams can be opened on all OA units.
+	 */
+	else if (hwe->engine_id == XE_HW_ENGINE_GSCCS0)
+		return XE_OA_UNIT_INVALID;
+	else if (!IS_DGFX(gt_to_xe(hwe->gt)))
+		return XE_OAM_UNIT_SCMI_0;
+	else if (hwe->class == XE_ENGINE_CLASS_VIDEO_DECODE)
+		return (hwe->instance / 2 & 0x1) + 1;
+	else if (hwe->class == XE_ENGINE_CLASS_VIDEO_ENHANCE)
+		return (hwe->instance & 0x1) + 1;
 
 	return XE_OA_UNIT_INVALID;
 }
@@ -2559,6 +2574,7 @@ static u32 __hwe_oa_unit(struct xe_hw_engine *hwe)
 
 	case XE_ENGINE_CLASS_VIDEO_DECODE:
 	case XE_ENGINE_CLASS_VIDEO_ENHANCE:
+	case XE_ENGINE_CLASS_OTHER:
 		return __hwe_oam_unit(hwe);
 
 	default:
@@ -2569,48 +2585,83 @@ static u32 __hwe_oa_unit(struct xe_hw_engine *hwe)
 static struct xe_oa_regs __oam_regs(u32 base)
 {
 	return (struct xe_oa_regs) {
-		base,
-		OAM_HEAD_POINTER(base),
-		OAM_TAIL_POINTER(base),
-		OAM_BUFFER(base),
-		OAM_CONTEXT_CONTROL(base),
-		OAM_CONTROL(base),
-		OAM_DEBUG(base),
-		OAM_STATUS(base),
-		OAM_CONTROL_COUNTER_SEL_MASK,
+		.base		= base,
+		.oa_head_ptr	= OAM_HEAD_POINTER(base),
+		.oa_tail_ptr	= OAM_TAIL_POINTER(base),
+		.oa_buffer	= OAM_BUFFER(base),
+		.oa_ctx_ctrl	= OAM_CONTEXT_CONTROL(base),
+		.oa_ctrl	= OAM_CONTROL(base),
+		.oa_debug	= OAM_DEBUG(base),
+		.oa_status	= OAM_STATUS(base),
+		.oa_mmio_trg	= OAM_MMIO_TRG(base),
+		.oa_ctrl_counter_select_mask = OAM_CONTROL_COUNTER_SEL_MASK,
 	};
 }
 
 static struct xe_oa_regs __oag_regs(void)
 {
 	return (struct xe_oa_regs) {
-		0,
-		OAG_OAHEADPTR,
-		OAG_OATAILPTR,
-		OAG_OABUFFER,
-		OAG_OAGLBCTXCTRL,
-		OAG_OACONTROL,
-		OAG_OA_DEBUG,
-		OAG_OASTATUS,
-		OAG_OACONTROL_OA_COUNTER_SEL_MASK,
+		.base		= 0,
+		.oa_head_ptr	= OAG_OAHEADPTR,
+		.oa_tail_ptr	= OAG_OATAILPTR,
+		.oa_buffer	= OAG_OABUFFER,
+		.oa_ctx_ctrl	= OAG_OAGLBCTXCTRL,
+		.oa_ctrl	= OAG_OACONTROL,
+		.oa_debug	= OAG_OA_DEBUG,
+		.oa_status	= OAG_OASTATUS,
+		.oa_mmio_trg	= OAG_MMIOTRIGGER,
+		.oa_ctrl_counter_select_mask = OAG_OACONTROL_OA_COUNTER_SEL_MASK,
+	};
+}
+
+static struct xe_oa_regs __oamert_regs(void)
+{
+	return (struct xe_oa_regs) {
+		.base		= 0,
+		.oa_head_ptr	= OAMERT_HEAD_POINTER,
+		.oa_tail_ptr	= OAMERT_TAIL_POINTER,
+		.oa_buffer	= OAMERT_BUFFER,
+		.oa_ctx_ctrl	= OAMERT_CONTEXT_CONTROL,
+		.oa_ctrl	= OAMERT_CONTROL,
+		.oa_debug	= OAMERT_DEBUG,
+		.oa_status	= OAMERT_STATUS,
+		.oa_mmio_trg	= OAMERT_MMIO_TRG,
+		.oa_ctrl_counter_select_mask = OAM_CONTROL_COUNTER_SEL_MASK,
 	};
 }
 
 static void __xe_oa_init_oa_units(struct xe_gt *gt)
 {
-	const u32 mtl_oa_base[] = { 0x13000 };
+	const u32 oam_base_addr[] = {
+		[XE_OAM_UNIT_SAG]    = XE_OAM_SAG_BASE,
+		[XE_OAM_UNIT_SCMI_0] = XE_OAM_SCMI_0_BASE,
+		[XE_OAM_UNIT_SCMI_1] = XE_OAM_SCMI_1_BASE,
+	};
 	int i, num_units = gt->oa.num_oa_units;
 
 	for (i = 0; i < num_units; i++) {
 		struct xe_oa_unit *u = &gt->oa.oa_unit[i];
 
-		if (gt->info.type != XE_GT_TYPE_MEDIA) {
-			u->regs = __oag_regs();
-			u->type = DRM_XE_OA_UNIT_TYPE_OAG;
-		} else if (GRAPHICS_VERx100(gt_to_xe(gt)) >= 1270) {
-			u->regs = __oam_regs(mtl_oa_base[i]);
-			u->type = DRM_XE_OA_UNIT_TYPE_OAM;
+		if (xe_gt_is_main_type(gt)) {
+			if (!i) {
+				u->regs = __oag_regs();
+				u->type = DRM_XE_OA_UNIT_TYPE_OAG;
+			} else {
+				xe_gt_assert(gt, xe_device_has_mert(gt_to_xe(gt)));
+				xe_gt_assert(gt, gt == xe_root_mmio_gt(gt_to_xe(gt)));
+				u->regs = __oamert_regs();
+				u->type = DRM_XE_OA_UNIT_TYPE_MERT;
+			}
+		} else {
+			xe_gt_assert(gt, GRAPHICS_VERx100(gt_to_xe(gt)) >= 1270);
+			u->regs = __oam_regs(oam_base_addr[i]);
+			u->type = i == XE_OAM_UNIT_SAG && GRAPHICS_VER(gt_to_xe(gt)) >= 20 ?
+				DRM_XE_OA_UNIT_TYPE_OAM_SAG : DRM_XE_OA_UNIT_TYPE_OAM;
 		}
+
+		u->gt = gt;
+
+		xe_mmio_write32(&gt->mmio, u->regs.oa_ctrl, 0);
 
 		/* Ensure MMIO trigger remains disabled till there is a stream */
 		xe_mmio_write32(&gt->mmio, u->regs.oa_debug,
@@ -2642,10 +2693,6 @@ static int xe_oa_init_gt(struct xe_gt *gt)
 		}
 	}
 
-	/*
-	 * Fused off engines can result in oa_unit's with num_engines == 0. These units
-	 * will appear in OA unit query, but no OA streams can be opened on them.
-	 */
 	gt->oa.num_oa_units = num_oa_units;
 	gt->oa.oa_unit = u;
 
@@ -2656,16 +2703,53 @@ static int xe_oa_init_gt(struct xe_gt *gt)
 	return 0;
 }
 
+static void xe_oa_print_gt_oa_units(struct xe_gt *gt)
+{
+	enum xe_hw_engine_id hwe_id;
+	struct xe_hw_engine *hwe;
+	struct xe_oa_unit *u;
+	char buf[256];
+	int i, n;
+
+	for (i = 0; i < gt->oa.num_oa_units; i++) {
+		u = &gt->oa.oa_unit[i];
+		buf[0] = '\0';
+		n = 0;
+
+		for_each_hw_engine(hwe, gt, hwe_id)
+			if (xe_oa_unit_id(hwe) == u->oa_unit_id)
+				n += scnprintf(buf + n, sizeof(buf) - n, "%s ", hwe->name);
+
+		xe_gt_dbg(gt, "oa_unit %d, type %d, Engines: %s\n", u->oa_unit_id, u->type, buf);
+	}
+}
+
+static void xe_oa_print_oa_units(struct xe_oa *oa)
+{
+	struct xe_gt *gt;
+	int gt_id;
+
+	for_each_gt(gt, oa->xe, gt_id)
+		xe_oa_print_gt_oa_units(gt);
+}
+
 static int xe_oa_init_oa_units(struct xe_oa *oa)
 {
 	struct xe_gt *gt;
 	int i, ret;
+
+	/* Needed for OAM implementation here */
+	BUILD_BUG_ON(XE_OAM_UNIT_SAG != 0);
+	BUILD_BUG_ON(XE_OAM_UNIT_SCMI_0 != 1);
+	BUILD_BUG_ON(XE_OAM_UNIT_SCMI_1 != 2);
 
 	for_each_gt(gt, oa->xe, i) {
 		ret = xe_oa_init_gt(gt);
 		if (ret)
 			return ret;
 	}
+
+	xe_oa_print_oa_units(oa);
 
 	return 0;
 }
@@ -2714,6 +2798,27 @@ static void xe_oa_init_supported_formats(struct xe_oa *oa)
 	}
 }
 
+static int destroy_config(int id, void *p, void *data)
+{
+	xe_oa_config_put(p);
+
+	return 0;
+}
+
+static void xe_oa_fini(void *arg)
+{
+	struct xe_device *xe = arg;
+	struct xe_oa *oa = &xe->oa;
+
+	if (!oa->xe)
+		return;
+
+	idr_for_each(&oa->metrics_idr, destroy_config, oa);
+	idr_destroy(&oa->metrics_idr);
+
+	oa->xe = NULL;
+}
+
 /**
  * xe_oa_init - OA initialization during device probe
  * @xe: @xe_device
@@ -2745,31 +2850,10 @@ int xe_oa_init(struct xe_device *xe)
 	}
 
 	xe_oa_init_supported_formats(oa);
-	return 0;
+
+	return devm_add_action_or_reset(xe->drm.dev, xe_oa_fini, xe);
+
 exit:
 	oa->xe = NULL;
 	return ret;
-}
-
-static int destroy_config(int id, void *p, void *data)
-{
-	xe_oa_config_put(p);
-	return 0;
-}
-
-/**
- * xe_oa_fini - OA de-initialization during device remove
- * @xe: @xe_device
- */
-void xe_oa_fini(struct xe_device *xe)
-{
-	struct xe_oa *oa = &xe->oa;
-
-	if (!oa->xe)
-		return;
-
-	idr_for_each(&oa->metrics_idr, destroy_config, oa);
-	idr_destroy(&oa->metrics_idr);
-
-	oa->xe = NULL;
 }

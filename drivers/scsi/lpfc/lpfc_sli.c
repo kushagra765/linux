@@ -1,7 +1,7 @@
 /*******************************************************************
  * This file is part of the Emulex Linux Device Driver for         *
  * Fibre Channel Host Bus Adapters.                                *
- * Copyright (C) 2017-2024 Broadcom. All Rights Reserved. The term *
+ * Copyright (C) 2017-2025 Broadcom. All Rights Reserved. The term *
  * “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.     *
  * Copyright (C) 2004-2016 Emulex.  All rights reserved.           *
  * EMULEX and SLI are trademarks of Emulex.                        *
@@ -27,6 +27,8 @@
 #include <linux/delay.h>
 #include <linux/slab.h>
 #include <linux/lockdep.h>
+#include <linux/dmi.h>
+#include <linux/of.h>
 
 #include <scsi/scsi.h>
 #include <scsi/scsi_cmnd.h>
@@ -1025,7 +1027,7 @@ lpfc_handle_rrq_active(struct lpfc_hba *phba)
 	LIST_HEAD(send_rrq);
 
 	clear_bit(HBA_RRQ_ACTIVE, &phba->hba_flag);
-	next_time = jiffies + msecs_to_jiffies(1000 * (phba->fc_ratov + 1));
+	next_time = jiffies + secs_to_jiffies(phba->fc_ratov + 1);
 	spin_lock_irqsave(&phba->rrq_list_lock, iflags);
 	list_for_each_entry_safe(rrq, nextrrq,
 				 &phba->active_rrq_list, list) {
@@ -1208,8 +1210,7 @@ lpfc_set_rrq_active(struct lpfc_hba *phba, struct lpfc_nodelist *ndlp,
 	else
 		rrq->send_rrq = 0;
 	rrq->xritag = xritag;
-	rrq->rrq_stop_time = jiffies +
-				msecs_to_jiffies(1000 * (phba->fc_ratov + 1));
+	rrq->rrq_stop_time = jiffies + secs_to_jiffies(phba->fc_ratov + 1);
 	rrq->nlp_DID = ndlp->nlp_DID;
 	rrq->vport = ndlp->vport;
 	rrq->rxid = rxid;
@@ -1736,8 +1737,7 @@ lpfc_sli_ringtxcmpl_put(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 		BUG_ON(!piocb->vport);
 		if (!test_bit(FC_UNLOADING, &piocb->vport->load_flag))
 			mod_timer(&piocb->vport->els_tmofunc,
-				  jiffies +
-				  msecs_to_jiffies(1000 * (phba->fc_ratov << 1)));
+				  jiffies + secs_to_jiffies(phba->fc_ratov << 1));
 	}
 
 	return 0;
@@ -2135,8 +2135,7 @@ lpfc_sli_next_iotag(struct lpfc_hba *phba, struct lpfc_iocbq *iocbq)
 					   - LPFC_IOCBQ_LOOKUP_INCREMENT)) {
 		new_len = psli->iocbq_lookup_len + LPFC_IOCBQ_LOOKUP_INCREMENT;
 		spin_unlock_irq(&phba->hbalock);
-		new_arr = kcalloc(new_len, sizeof(struct lpfc_iocbq *),
-				  GFP_KERNEL);
+		new_arr = kzalloc_objs(struct lpfc_iocbq *, new_len);
 		if (new_arr) {
 			spin_lock_irq(&phba->hbalock);
 			old_arr = psli->iocbq_lookup;
@@ -2923,6 +2922,8 @@ lpfc_sli_def_mbox_cmpl(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
 				clear_bit(NLP_UNREG_INP, &ndlp->nlp_flag);
 				ndlp->nlp_defer_did = NLP_EVT_NOTHING_PENDING;
 				lpfc_issue_els_plogi(vport, ndlp->nlp_DID, 0);
+			} else {
+				clear_bit(NLP_UNREG_INP, &ndlp->nlp_flag);
 			}
 
 			/* The unreg_login mailbox is complete and had a
@@ -3238,7 +3239,7 @@ lpfc_nvme_unsol_ls_handler(struct lpfc_hba *phba, struct lpfc_iocbq *piocb)
 			(FC_FC_FIRST_SEQ | FC_FC_END_SEQ | FC_FC_SEQ_INIT))) {
 		failwhy = "Bad NVME LS F_CTL";
 	} else {
-		axchg = kzalloc(sizeof(*axchg), GFP_ATOMIC);
+		axchg = kzalloc_obj(*axchg, GFP_ATOMIC);
 		if (!axchg)
 			failwhy = "No CTX memory";
 	}
@@ -3925,12 +3926,19 @@ void lpfc_poll_eratt(struct timer_list *t)
 	uint32_t eratt = 0;
 	uint64_t sli_intr, cnt;
 
-	phba = from_timer(phba, t, eratt_poll);
-	if (!test_bit(HBA_SETUP, &phba->hba_flag))
-		return;
+	phba = timer_container_of(phba, t, eratt_poll);
 
 	if (test_bit(FC_UNLOADING, &phba->pport->load_flag))
 		return;
+
+	if (phba->sli_rev == LPFC_SLI_REV4 &&
+	    !test_bit(HBA_SETUP, &phba->hba_flag)) {
+		lpfc_printf_log(phba, KERN_INFO, LOG_SLI,
+				"0663 HBA still initializing 0x%lx, restart "
+				"timer\n",
+				phba->hba_flag);
+		goto restart_timer;
+	}
 
 	/* Here we will also keep track of interrupts per sec of the hba */
 	sli_intr = phba->sli.slistat.sli_intr;
@@ -3950,14 +3958,16 @@ void lpfc_poll_eratt(struct timer_list *t)
 	/* Check chip HA register for error event */
 	eratt = lpfc_sli_check_eratt(phba);
 
-	if (eratt)
+	if (eratt) {
 		/* Tell the worker thread there is work to do */
 		lpfc_worker_wake_up(phba);
-	else
-		/* Restart the timer for next eratt poll */
-		mod_timer(&phba->eratt_poll,
-			  jiffies +
-			  msecs_to_jiffies(1000 * phba->eratt_poll_interval));
+		return;
+	}
+
+restart_timer:
+	/* Restart the timer for next eratt poll */
+	mod_timer(&phba->eratt_poll,
+		  jiffies + secs_to_jiffies(phba->eratt_poll_interval));
 	return;
 }
 
@@ -5042,7 +5052,7 @@ lpfc_sli_brdkill(struct lpfc_hba *phba)
 			return 1;
 	}
 
-	del_timer_sync(&psli->mbox_tmo);
+	timer_delete_sync(&psli->mbox_tmo);
 	if (ha_copy & HA_ERATT) {
 		writel(HA_ERATT, phba->HAregaddr);
 		phba->pport->stopped = 1;
@@ -5158,7 +5168,6 @@ lpfc_sli4_brdreset(struct lpfc_hba *phba)
 	phba->link_events = 0;
 	phba->pport->fc_myDID = 0;
 	phba->pport->fc_prevDID = 0;
-	clear_bit(HBA_SETUP, &phba->hba_flag);
 
 	spin_lock_irq(&phba->hbalock);
 	psli->sli_flag &= ~(LPFC_PROCESS_LA);
@@ -5275,6 +5284,7 @@ lpfc_sli_brdrestart_s4(struct lpfc_hba *phba)
 			"0296 Restart HBA Data: x%x x%x\n",
 			phba->pport->port_state, psli->sli_flag);
 
+	clear_bit(HBA_SETUP, &phba->hba_flag);
 	lpfc_sli4_queue_unset(phba);
 
 	rc = lpfc_sli4_brdreset(phba);
@@ -5883,7 +5893,7 @@ lpfc_sli4_read_rev(struct lpfc_hba *phba, LPFC_MBOXQ_t *mboxq,
 	struct lpfc_dmabuf *dmabuf;
 	struct lpfc_mqe *mqe;
 
-	dmabuf = kzalloc(sizeof(struct lpfc_dmabuf), GFP_KERNEL);
+	dmabuf = kzalloc_obj(struct lpfc_dmabuf);
 	if (!dmabuf)
 		return -ENOMEM;
 
@@ -6004,9 +6014,9 @@ lpfc_sli4_get_ctl_attr(struct lpfc_hba *phba)
 	phba->sli4_hba.flash_id = bf_get(lpfc_cntl_attr_flash_id, cntl_attr);
 	phba->sli4_hba.asic_rev = bf_get(lpfc_cntl_attr_asic_rev, cntl_attr);
 
-	memset(phba->BIOSVersion, 0, sizeof(phba->BIOSVersion));
-	strlcat(phba->BIOSVersion, (char *)cntl_attr->bios_ver_str,
+	memcpy(phba->BIOSVersion, cntl_attr->bios_ver_str,
 		sizeof(phba->BIOSVersion));
+	phba->BIOSVersion[sizeof(phba->BIOSVersion) - 1] = '\0';
 
 	lpfc_printf_log(phba, KERN_INFO, LOG_SLI,
 			"3086 lnk_type:%d, lnk_numb:%d, bios_ver:%s, "
@@ -6933,8 +6943,7 @@ lpfc_sli4_ras_dma_alloc(struct lpfc_hba *phba,
 
 	ras_fwlog->fw_buffcount = fwlog_buff_count;
 	for (i = 0; i < ras_fwlog->fw_buffcount; i++) {
-		dmabuf = kzalloc(sizeof(struct lpfc_dmabuf),
-				 GFP_KERNEL);
+		dmabuf = kzalloc_obj(struct lpfc_dmabuf);
 		if (!dmabuf) {
 			rc = -ENOMEM;
 			lpfc_printf_log(phba, KERN_WARNING, LOG_INIT,
@@ -8037,8 +8046,7 @@ static void lpfc_sli4_dip(struct lpfc_hba *phba)
 int lpfc_rx_monitor_create_ring(struct lpfc_rx_info_monitor *rx_monitor,
 				u32 entries)
 {
-	rx_monitor->ring = kmalloc_array(entries, sizeof(struct rx_info_entry),
-					 GFP_KERNEL);
+	rx_monitor->ring = kmalloc_objs(struct rx_info_entry, entries);
 	if (!rx_monitor->ring)
 		return -ENOMEM;
 
@@ -8285,7 +8293,7 @@ lpfc_cmf_setup(struct lpfc_hba *phba)
 
 		/* Allocate Congestion Information Buffer */
 		if (!phba->cgn_i) {
-			mp = kmalloc(sizeof(*mp), GFP_KERNEL);
+			mp = kmalloc_obj(*mp);
 			if (mp)
 				mp->virt = dma_alloc_coherent
 						(&phba->pcidev->dev,
@@ -8367,8 +8375,7 @@ no_cmf:
 
 	/* Allocate RX Monitor Buffer */
 	if (!phba->rx_monitor) {
-		phba->rx_monitor = kzalloc(sizeof(*phba->rx_monitor),
-					   GFP_KERNEL);
+		phba->rx_monitor = kzalloc_obj(*phba->rx_monitor);
 
 		if (!phba->rx_monitor) {
 			lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
@@ -8435,6 +8442,70 @@ lpfc_set_host_tm(struct lpfc_hba *phba)
 	rc = lpfc_sli_issue_mbox(phba, mboxq, MBX_POLL);
 	mempool_free(mboxq, phba->mbox_mem_pool);
 	return rc;
+}
+
+/**
+ * lpfc_get_platform_uuid - Attempts to extract a platform uuid
+ * @phba: pointer to lpfc hba data structure.
+ *
+ * This routine attempts to first read SMBIOS DMI data for the System
+ * Information structure offset 08h called System UUID.  Else, no platform
+ * UUID will be advertised.
+ **/
+static void
+lpfc_get_platform_uuid(struct lpfc_hba *phba)
+{
+	int rc;
+	const char *uuid;
+	char pni[17] = {0}; /* 16 characters + '\0' */
+	bool is_ff = true, is_00 = true;
+	u8 i;
+
+	/* First attempt SMBIOS DMI */
+	uuid = dmi_get_system_info(DMI_PRODUCT_UUID);
+	if (uuid) {
+		lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
+				"2088 SMBIOS UUID %s\n",
+				uuid);
+	} else {
+		lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
+				"2099 Could not extract UUID\n");
+	}
+
+	if (uuid && uuid_is_valid(uuid)) {
+		/* Generate PNI from UUID format.
+		 *
+		 * 1.) Extract lower 64 bits from UUID format.
+		 * 2.) Set 3h for NAA Locally Assigned Name Identifier format.
+		 *
+		 * e.g. xxxxxxxx-xxxx-xxxx-yyyy-yyyyyyyyyyyy
+		 *
+		 * extract the yyyy-yyyyyyyyyyyy portion
+		 * final PNI   3yyyyyyyyyyyyyyy
+		 */
+		scnprintf(pni, sizeof(pni), "3%c%c%c%s",
+			  uuid[20], uuid[21], uuid[22], &uuid[24]);
+
+		/* Sanitize the converted PNI */
+		for (i = 1; i < 16 && (is_ff || is_00); i++) {
+			if (pni[i] != '0')
+				is_00 = false;
+			if (pni[i] != 'f' && pni[i] != 'F')
+				is_ff = false;
+		}
+
+		/* Convert from char* to unsigned long */
+		rc = kstrtoul(pni, 16, &phba->pni);
+		if (!rc && !is_ff && !is_00) {
+			lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
+					"2100 PNI 0x%016lx\n", phba->pni);
+		} else {
+			lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
+					"2101 PNI %s generation status %d\n",
+					pni, rc);
+			phba->pni = 0;
+		}
+	}
 }
 
 /**
@@ -8519,6 +8590,10 @@ lpfc_sli4_hba_setup(struct lpfc_hba *phba)
 	} else {
 		clear_bit(HBA_FCOE_MODE, &phba->hba_flag);
 	}
+
+	/* Obtain platform UUID, only for SLI4 FC adapters */
+	if (!test_bit(HBA_FCOE_MODE, &phba->hba_flag))
+		lpfc_get_platform_uuid(phba);
 
 	if (bf_get(lpfc_mbx_rd_rev_cee_ver, &mqe->un.read_rev) ==
 		LPFC_DCBX_CEE_MODE)
@@ -8811,7 +8886,7 @@ lpfc_sli4_hba_setup(struct lpfc_hba *phba)
 	if (unlikely(rc)) {
 		lpfc_printf_log(phba, KERN_ERR, LOG_TRACE_EVENT,
 				"0381 Error %d during queue setup.\n", rc);
-		goto out_stop_timers;
+		goto out_destroy_queue;
 	}
 	/* Initialize the driver internal SLI layer lists. */
 	lpfc_sli4_setup(phba);
@@ -9008,11 +9083,11 @@ lpfc_sli4_hba_setup(struct lpfc_hba *phba)
 
 	/* Start the ELS watchdog timer */
 	mod_timer(&vport->els_tmofunc,
-		  jiffies + msecs_to_jiffies(1000 * (phba->fc_ratov * 2)));
+			jiffies + secs_to_jiffies(phba->fc_ratov * 2));
 
 	/* Start heart beat timer */
 	mod_timer(&phba->hb_tmofunc,
-		  jiffies + msecs_to_jiffies(1000 * LPFC_HB_MBOX_INTERVAL));
+		  jiffies + secs_to_jiffies(LPFC_HB_MBOX_INTERVAL));
 	clear_bit(HBA_HBEAT_INP, &phba->hba_flag);
 	clear_bit(HBA_HBEAT_TMO, &phba->hba_flag);
 	phba->last_completion_time = jiffies;
@@ -9027,7 +9102,7 @@ lpfc_sli4_hba_setup(struct lpfc_hba *phba)
 
 	/* Start error attention (ERATT) polling timer */
 	mod_timer(&phba->eratt_poll,
-		  jiffies + msecs_to_jiffies(1000 * phba->eratt_poll_interval));
+		  jiffies + secs_to_jiffies(phba->eratt_poll_interval));
 
 	/*
 	 * The port is ready, set the host's link state to LINK_DOWN
@@ -9094,7 +9169,6 @@ out_free_iocblist:
 	lpfc_free_iocb_list(phba);
 out_destroy_queue:
 	lpfc_sli4_queue_destroy(phba);
-out_stop_timers:
 	lpfc_stop_hba_timers(phba);
 out_free_mbox:
 	mempool_free(mboxq, phba->mbox_mem_pool);
@@ -9116,7 +9190,7 @@ out_free_mbox:
 void
 lpfc_mbox_timeout(struct timer_list *t)
 {
-	struct lpfc_hba  *phba = from_timer(phba, t, sli.mbox_tmo);
+	struct lpfc_hba  *phba = timer_container_of(phba, t, sli.mbox_tmo);
 	unsigned long iflag;
 	uint32_t tmo_posted;
 
@@ -9504,8 +9578,7 @@ lpfc_sli_issue_mbox_s3(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmbox,
 			goto out_not_finished;
 		}
 		/* timeout active mbox command */
-		timeout = msecs_to_jiffies(lpfc_mbox_tmo_val(phba, pmbox) *
-					   1000);
+		timeout = secs_to_jiffies(lpfc_mbox_tmo_val(phba, pmbox));
 		mod_timer(&psli->mbox_tmo, jiffies + timeout);
 	}
 
@@ -9629,8 +9702,7 @@ lpfc_sli_issue_mbox_s3(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmbox,
 						       drvr_flag);
 			goto out_not_finished;
 		}
-		timeout = msecs_to_jiffies(lpfc_mbox_tmo_val(phba, pmbox) *
-							1000) + jiffies;
+		timeout = secs_to_jiffies(lpfc_mbox_tmo_val(phba, pmbox)) + jiffies;
 		i = 0;
 		/* Wait for command to complete */
 		while (((word0 & OWN_CHIP) == OWN_CHIP) ||
@@ -9756,9 +9828,8 @@ lpfc_sli4_async_mbox_block(struct lpfc_hba *phba)
 	 * command to be gracefully completed by firmware.
 	 */
 	if (phba->sli.mbox_active)
-		timeout = msecs_to_jiffies(lpfc_mbox_tmo_val(phba,
-						phba->sli.mbox_active) *
-						1000) + jiffies;
+		timeout = secs_to_jiffies(lpfc_mbox_tmo_val(phba,
+						phba->sli.mbox_active)) + jiffies;
 	spin_unlock_irq(&phba->hbalock);
 
 	/* Make sure the mailbox is really active */
@@ -9881,8 +9952,7 @@ lpfc_sli4_wait_bmbx_ready(struct lpfc_hba *phba, LPFC_MBOXQ_t *mboxq)
 		}
 	}
 
-	timeout = msecs_to_jiffies(lpfc_mbox_tmo_val(phba, mboxq)
-				   * 1000) + jiffies;
+	timeout = secs_to_jiffies(lpfc_mbox_tmo_val(phba, mboxq)) + jiffies;
 
 	do {
 		bmbx_reg.word0 = readl(phba->sli4_hba.BMBXregaddr);
@@ -10230,7 +10300,7 @@ lpfc_sli4_post_async_mbox(struct lpfc_hba *phba)
 
 	/* Start timer for the mbox_tmo and log some mailbox post messages */
 	mod_timer(&psli->mbox_tmo, (jiffies +
-		  msecs_to_jiffies(1000 * lpfc_mbox_tmo_val(phba, mboxq))));
+		  secs_to_jiffies(lpfc_mbox_tmo_val(phba, mboxq))));
 
 	lpfc_printf_log(phba, KERN_INFO, LOG_MBOX | LOG_SLI,
 			"(%d):0355 Mailbox cmd x%x (x%x/x%x) issue Data: "
@@ -12081,7 +12151,7 @@ lpfc_sli_hba_down(struct lpfc_hba *phba)
 	local_bh_enable();
 
 	/* Return any active mbox cmds */
-	del_timer_sync(&psli->mbox_tmo);
+	timer_delete_sync(&psli->mbox_tmo);
 
 	spin_lock_irqsave(&phba->pport->work_port_lock, flags);
 	phba->pport->work_port_events &= ~WORKER_MBOX_TMO;
@@ -12434,19 +12504,11 @@ lpfc_sli_issue_abort_iotag(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 	}
 
 	/*
-	 * If we're unloading, don't abort iocb on the ELS ring, but change
-	 * the callback so that nothing happens when it finishes.
+	 * Always abort the outstanding WQE and set the IA bit correctly
+	 * for the context.  This is necessary for correctly removing
+	 * outstanding ndlp reference counts when the CQE completes with
+	 * the XB bit set.
 	 */
-	if (test_bit(FC_UNLOADING, &vport->load_flag) &&
-	    pring->ringno == LPFC_ELS_RING) {
-		if (cmdiocb->cmd_flag & LPFC_IO_FABRIC)
-			cmdiocb->fabric_cmd_cmpl = lpfc_ignore_els_cmpl;
-		else
-			cmdiocb->cmd_cmpl = lpfc_ignore_els_cmpl;
-		return retval;
-	}
-
-	/* issue ABTS for this IOCB based on iotag */
 	abtsiocbp = __lpfc_sli_get_iocbq(phba);
 	if (abtsiocbp == NULL)
 		return IOCB_NORESOURCE;
@@ -13159,7 +13221,7 @@ lpfc_sli_issue_iocb_wait(struct lpfc_hba *phba,
 	retval = lpfc_sli_issue_iocb(phba, ring_number, piocb,
 				     SLI_IOCB_RET_IOCB);
 	if (retval == IOCB_SUCCESS) {
-		timeout_req = msecs_to_jiffies(timeout * 1000);
+		timeout_req = secs_to_jiffies(timeout);
 		timeleft = wait_event_timeout(done_q,
 				lpfc_chk_iocb_flg(phba, piocb, LPFC_IO_WAKE),
 				timeout_req);
@@ -13275,8 +13337,7 @@ lpfc_sli_issue_mbox_wait(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmboxq,
 	/* now issue the command */
 	retval = lpfc_sli_issue_mbox(phba, pmboxq, MBX_NOWAIT);
 	if (retval == MBX_BUSY || retval == MBX_SUCCESS) {
-		wait_for_completion_timeout(&mbox_done,
-					    msecs_to_jiffies(timeout * 1000));
+		wait_for_completion_timeout(&mbox_done, secs_to_jiffies(timeout));
 
 		spin_lock_irqsave(&phba->hbalock, flag);
 		pmboxq->ctx_u.mbox_wait = NULL;
@@ -13323,7 +13384,7 @@ lpfc_sli_mbox_sys_shutdown(struct lpfc_hba *phba, int mbx_action)
 		lpfc_sli_mbox_sys_flush(phba);
 		return;
 	}
-	timeout = msecs_to_jiffies(LPFC_MBOX_TMO * 1000) + jiffies;
+	timeout = secs_to_jiffies(LPFC_MBOX_TMO) + jiffies;
 
 	/* Disable softirqs, including timers from obtaining phba->hbalock */
 	local_bh_disable();
@@ -13336,9 +13397,8 @@ lpfc_sli_mbox_sys_shutdown(struct lpfc_hba *phba, int mbx_action)
 		 * command to be gracefully completed by firmware.
 		 */
 		if (phba->sli.mbox_active)
-			timeout = msecs_to_jiffies(lpfc_mbox_tmo_val(phba,
-						phba->sli.mbox_active) *
-						1000) + jiffies;
+			timeout = secs_to_jiffies(lpfc_mbox_tmo_val(phba,
+						phba->sli.mbox_active)) + jiffies;
 		spin_unlock_irq(&phba->hbalock);
 
 		/* Enable softirqs again, done with phba->hbalock */
@@ -13809,7 +13869,7 @@ lpfc_sli_sp_intr_handler(int irq, void *dev_id)
 				phba->sli.mbox_active = NULL;
 				spin_unlock_irqrestore(&phba->hbalock, iflag);
 				phba->last_completion_time = jiffies;
-				del_timer(&phba->sli.mbox_tmo);
+				timer_delete(&phba->sli.mbox_tmo);
 				if (pmb->mbox_cmpl) {
 					lpfc_sli_pcimem_bcopy(mbox, pmbox,
 							MAILBOX_CMD_SIZE);
@@ -14309,7 +14369,7 @@ lpfc_sli4_sp_handle_mbox_event(struct lpfc_hba *phba, struct lpfc_mcqe *mcqe)
 
 	/* Reset heartbeat timer */
 	phba->last_completion_time = jiffies;
-	del_timer(&phba->sli.mbox_tmo);
+	timer_delete(&phba->sli.mbox_tmo);
 
 	/* Move mbox data to caller's mailbox region, do endian swapping */
 	if (pmb->mbox_cmpl && mbox)
@@ -15658,7 +15718,7 @@ lpfc_sli4_intr_handler(int irq, void *dev_id)
 
 void lpfc_sli4_poll_hbtimer(struct timer_list *t)
 {
-	struct lpfc_hba *phba = from_timer(phba, t, cpuhp_poll_timer);
+	struct lpfc_hba *phba = timer_container_of(phba, t, cpuhp_poll_timer);
 	struct lpfc_queue *eq;
 
 	rcu_read_lock();
@@ -15696,7 +15756,7 @@ static inline void lpfc_sli4_remove_from_poll_list(struct lpfc_queue *eq)
 	synchronize_rcu();
 
 	if (list_empty(&phba->poll_list))
-		del_timer_sync(&phba->cpuhp_poll_timer);
+		timer_delete_sync(&phba->cpuhp_poll_timer);
 }
 
 void lpfc_sli4_cleanup_poll_list(struct lpfc_hba *phba)
@@ -15915,6 +15975,32 @@ lpfc_dual_chute_pci_bar_map(struct lpfc_hba *phba, uint16_t pci_barset)
 		break;
 	}
 	return NULL;
+}
+
+static __maybe_unused void __iomem *
+lpfc_dpp_wc_map(struct lpfc_hba *phba, uint8_t dpp_barset)
+{
+
+	/* DPP region is supposed to cover 64-bit BAR2 */
+	if (dpp_barset != WQ_PCI_BAR_4_AND_5) {
+		lpfc_log_msg(phba, KERN_WARNING, LOG_INIT,
+			     "3273 dpp_barset x%x != WQ_PCI_BAR_4_AND_5\n",
+			     dpp_barset);
+		return NULL;
+	}
+
+	if (!phba->sli4_hba.dpp_regs_memmap_wc_p) {
+		void __iomem *dpp_map;
+
+		dpp_map = ioremap_wc(phba->pci_bar2_map,
+				     pci_resource_len(phba->pcidev,
+						      PCI_64BIT_BAR4));
+
+		if (dpp_map)
+			phba->sli4_hba.dpp_regs_memmap_wc_p = dpp_map;
+	}
+
+	return phba->sli4_hba.dpp_regs_memmap_wc_p;
 }
 
 /**
@@ -16474,10 +16560,10 @@ lpfc_cq_create_set(struct lpfc_hba *phba, struct lpfc_queue **cqp,
 			case 4096:
 				if (phba->sli4_hba.pc_sli4_params.cqv ==
 				    LPFC_Q_CREATE_VERSION_2) {
-					bf_set(lpfc_mbx_cq_create_set_cqe_cnt,
+					bf_set(lpfc_mbx_cq_create_set_cqe_cnt_lo,
 					       &cq_set->u.request,
-						cq->entry_count);
-					bf_set(lpfc_mbx_cq_create_set_cqe_cnt,
+					       cq->entry_count);
+					bf_set(lpfc_mbx_cq_create_set_cqecnt,
 					       &cq_set->u.request,
 					       LPFC_CQ_CNT_WORD7);
 					break;
@@ -16493,15 +16579,15 @@ lpfc_cq_create_set(struct lpfc_hba *phba, struct lpfc_queue **cqp,
 				}
 				fallthrough;	/* otherwise default to smallest */
 			case 256:
-				bf_set(lpfc_mbx_cq_create_set_cqe_cnt,
+				bf_set(lpfc_mbx_cq_create_set_cqecnt,
 				       &cq_set->u.request, LPFC_CQ_CNT_256);
 				break;
 			case 512:
-				bf_set(lpfc_mbx_cq_create_set_cqe_cnt,
+				bf_set(lpfc_mbx_cq_create_set_cqecnt,
 				       &cq_set->u.request, LPFC_CQ_CNT_512);
 				break;
 			case 1024:
-				bf_set(lpfc_mbx_cq_create_set_cqe_cnt,
+				bf_set(lpfc_mbx_cq_create_set_cqecnt,
 				       &cq_set->u.request, LPFC_CQ_CNT_1024);
 				break;
 			}
@@ -16880,9 +16966,6 @@ lpfc_wq_create(struct lpfc_hba *phba, struct lpfc_queue *wq,
 	uint8_t dpp_barset;
 	uint32_t dpp_offset;
 	uint8_t wq_create_version;
-#ifdef CONFIG_X86
-	unsigned long pg_addr;
-#endif
 
 	/* sanity check on queue memory */
 	if (!wq || !cq)
@@ -17068,14 +17151,15 @@ lpfc_wq_create(struct lpfc_hba *phba, struct lpfc_queue *wq,
 
 #ifdef CONFIG_X86
 			/* Enable combined writes for DPP aperture */
-			pg_addr = (unsigned long)(wq->dpp_regaddr) & PAGE_MASK;
-			rc = set_memory_wc(pg_addr, 1);
-			if (rc) {
+			bar_memmap_p = lpfc_dpp_wc_map(phba, dpp_barset);
+			if (!bar_memmap_p) {
 				lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
 					"3272 Cannot setup Combined "
 					"Write on WQ[%d] - disable DPP\n",
 					wq->queue_id);
 				phba->cfg_enable_dpp = 0;
+			} else {
+				wq->dpp_regaddr = bar_memmap_p + dpp_offset;
 			}
 #else
 			phba->cfg_enable_dpp = 0;
@@ -17083,7 +17167,7 @@ lpfc_wq_create(struct lpfc_hba *phba, struct lpfc_queue *wq,
 		} else
 			wq->db_regaddr = phba->sli4_hba.WQDBregaddr;
 	}
-	wq->pring = kzalloc(sizeof(struct lpfc_sli_ring), GFP_KERNEL);
+	wq->pring = kzalloc_obj(struct lpfc_sli_ring);
 	if (wq->pring == NULL) {
 		status = -ENOMEM;
 		goto out;
@@ -19402,7 +19486,7 @@ lpfc_sli4_handle_mds_loopback(struct lpfc_vport *vport,
 	}
 
 	/* Allocate buffer for command payload */
-	pcmd = kmalloc(sizeof(struct lpfc_dmabuf), GFP_KERNEL);
+	pcmd = kmalloc_obj(struct lpfc_dmabuf);
 	if (pcmd)
 		pcmd->virt = dma_pool_alloc(phba->lpfc_drb_pool, GFP_KERNEL,
 					    &pcmd->phys);
@@ -19864,13 +19948,15 @@ lpfc_sli4_remove_rpis(struct lpfc_hba *phba)
 }
 
 /**
- * lpfc_sli4_resume_rpi - Remove the rpi bitmask region
+ * lpfc_sli4_resume_rpi - Resume traffic relative to an RPI
  * @ndlp: pointer to lpfc nodelist data structure.
  * @cmpl: completion call-back.
  * @iocbq: data to load as mbox ctx_u information
  *
- * This routine is invoked to remove the memory region that
- * provided rpi via a bitmask.
+ * Return codes
+ *	0 - successful
+ *	-ENOMEM - No available memory
+ *	-EIO - The mailbox failed to complete successfully.
  **/
 int
 lpfc_sli4_resume_rpi(struct lpfc_nodelist *ndlp,
@@ -19900,7 +19986,6 @@ lpfc_sli4_resume_rpi(struct lpfc_nodelist *ndlp,
 		return -EIO;
 	}
 
-	/* Post all rpi memory regions to the port. */
 	lpfc_resume_rpi(mboxq, ndlp);
 	if (cmpl) {
 		mboxq->mbox_cmpl = cmpl;
@@ -20367,62 +20452,36 @@ lpfc_check_next_fcf_pri_level(struct lpfc_hba *phba)
 uint16_t
 lpfc_sli4_fcf_rr_next_index_get(struct lpfc_hba *phba)
 {
-	uint16_t next_fcf_index;
+	uint16_t next;
 
-initial_priority:
-	/* Search start from next bit of currently registered FCF index */
-	next_fcf_index = phba->fcf.current_rec.fcf_indx;
+	do {
+		for_each_set_bit_wrap(next, phba->fcf.fcf_rr_bmask,
+				LPFC_SLI4_FCF_TBL_INDX_MAX, phba->fcf.current_rec.fcf_indx) {
+			if (next == phba->fcf.current_rec.fcf_indx)
+				continue;
 
-next_priority:
-	/* Determine the next fcf index to check */
-	next_fcf_index = (next_fcf_index + 1) % LPFC_SLI4_FCF_TBL_INDX_MAX;
-	next_fcf_index = find_next_bit(phba->fcf.fcf_rr_bmask,
-				       LPFC_SLI4_FCF_TBL_INDX_MAX,
-				       next_fcf_index);
+			if (!(phba->fcf.fcf_pri[next].fcf_rec.flag & LPFC_FCF_FLOGI_FAILED)) {
+				lpfc_printf_log(phba, KERN_INFO, LOG_FIP,
+					"2845 Get next roundrobin failover FCF (x%x)\n", next);
+				return next;
+			}
 
-	/* Wrap around condition on phba->fcf.fcf_rr_bmask */
-	if (next_fcf_index >= LPFC_SLI4_FCF_TBL_INDX_MAX) {
-		/*
-		 * If we have wrapped then we need to clear the bits that
-		 * have been tested so that we can detect when we should
-		 * change the priority level.
-		 */
-		next_fcf_index = find_first_bit(phba->fcf.fcf_rr_bmask,
-					       LPFC_SLI4_FCF_TBL_INDX_MAX);
-	}
+			if (list_is_singular(&phba->fcf.fcf_pri_list))
+				return LPFC_FCOE_FCF_NEXT_NONE;
+		}
 
-
-	/* Check roundrobin failover list empty condition */
-	if (next_fcf_index >= LPFC_SLI4_FCF_TBL_INDX_MAX ||
-		next_fcf_index == phba->fcf.current_rec.fcf_indx) {
 		/*
 		 * If next fcf index is not found check if there are lower
 		 * Priority level fcf's in the fcf_priority list.
 		 * Set up the rr_bmask with all of the avaiable fcf bits
 		 * at that level and continue the selection process.
 		 */
-		if (lpfc_check_next_fcf_pri_level(phba))
-			goto initial_priority;
-		lpfc_printf_log(phba, KERN_WARNING, LOG_FIP,
-				"2844 No roundrobin failover FCF available\n");
+	} while (lpfc_check_next_fcf_pri_level(phba));
 
-		return LPFC_FCOE_FCF_NEXT_NONE;
-	}
+	lpfc_printf_log(phba, KERN_WARNING, LOG_FIP,
+			"2844 No roundrobin failover FCF available\n");
 
-	if (next_fcf_index < LPFC_SLI4_FCF_TBL_INDX_MAX &&
-		phba->fcf.fcf_pri[next_fcf_index].fcf_rec.flag &
-		LPFC_FCF_FLOGI_FAILED) {
-		if (list_is_singular(&phba->fcf.fcf_pri_list))
-			return LPFC_FCOE_FCF_NEXT_NONE;
-
-		goto next_priority;
-	}
-
-	lpfc_printf_log(phba, KERN_INFO, LOG_FIP,
-			"2845 Get next roundrobin failover FCF (x%x)\n",
-			next_fcf_index);
-
-	return next_fcf_index;
+	return LPFC_FCOE_FCF_NEXT_NONE;
 }
 
 /**
@@ -21370,7 +21429,7 @@ lpfc_sli4_issue_wqe(struct lpfc_hba *phba, struct lpfc_sli4_hdw_queue *qp,
 	struct lpfc_sglq *sglq;
 	struct lpfc_sli_ring *pring;
 	unsigned long iflags;
-	uint32_t ret = 0;
+	int ret = 0;
 
 	/* NVME_LS and NVME_LS ABTS requests. */
 	if (pwqe->cmd_flag & LPFC_IO_NVME_LS) {
@@ -22258,7 +22317,7 @@ lpfc_read_object(struct lpfc_hba *phba, char *rdobject, uint32_t *datap,
 		read_object->u.request.rd_object_name[j] =
 			cpu_to_le32(rd_object_name[j]);
 
-	pcmd = kmalloc(sizeof(*pcmd), GFP_KERNEL);
+	pcmd = kmalloc_obj(*pcmd);
 	if (pcmd)
 		pcmd->virt = lpfc_mbuf_alloc(phba, MEM_PRI, &pcmd->phys);
 	if (!pcmd || !pcmd->virt) {

@@ -23,11 +23,6 @@
 
 #define BITMASK(bits)		(BIT(bits) - 1)
 
-#define ALE_VERSION_MAJOR(rev, mask) (((rev) >> 8) & (mask))
-#define ALE_VERSION_MINOR(rev)	(rev & 0xff)
-#define ALE_VERSION_1R3		0x0103
-#define ALE_VERSION_1R4		0x0104
-
 /* ALE Registers */
 #define ALE_IDVER		0x00
 #define ALE_STATUS		0x04
@@ -127,15 +122,15 @@ struct cpsw_ale_dev_id {
 
 static inline int cpsw_ale_get_field(u32 *ale_entry, u32 start, u32 bits)
 {
-	int idx, idx2;
+	int idx, idx2, index;
 	u32 hi_val = 0;
 
 	idx    = start / 32;
 	idx2 = (start + bits - 1) / 32;
 	/* Check if bits to be fetched exceed a word */
 	if (idx != idx2) {
-		idx2 = 2 - idx2; /* flip */
-		hi_val = ale_entry[idx2] << ((idx2 * 32) - start);
+		index = 2 - idx2; /* flip */
+		hi_val = ale_entry[index] << ((idx2 * 32) - start);
 	}
 	start -= idx * 32;
 	idx    = 2 - idx; /* flip */
@@ -145,16 +140,16 @@ static inline int cpsw_ale_get_field(u32 *ale_entry, u32 start, u32 bits)
 static inline void cpsw_ale_set_field(u32 *ale_entry, u32 start, u32 bits,
 				      u32 value)
 {
-	int idx, idx2;
+	int idx, idx2, index;
 
 	value &= BITMASK(bits);
 	idx = start / 32;
 	idx2 = (start + bits - 1) / 32;
 	/* Check if bits to be set exceed a word */
 	if (idx != idx2) {
-		idx2 = 2 - idx2; /* flip */
-		ale_entry[idx2] &= ~(BITMASK(bits + start - (idx2 * 32)));
-		ale_entry[idx2] |= (value >> ((idx2 * 32) - start));
+		index = 2 - idx2; /* flip */
+		ale_entry[index] &= ~(BITMASK(bits + start - (idx2 * 32)));
+		ale_entry[index] |= (value >> ((idx2 * 32) - start));
 	}
 	start -= idx * 32;
 	idx = 2 - idx; /* flip */
@@ -455,14 +450,13 @@ static void cpsw_ale_flush_mcast(struct cpsw_ale *ale, u32 *ale_entry,
 				      ale->port_mask_bits);
 	if ((mask & port_mask) == 0)
 		return; /* ports dont intersect, not interested */
-	mask &= ~port_mask;
+	mask &= (~port_mask | ALE_PORT_HOST);
 
-	/* free if only remaining port is host port */
-	if (mask)
+	if (mask == 0x0 || mask == ALE_PORT_HOST)
+		cpsw_ale_set_entry_type(ale_entry, ALE_TYPE_FREE);
+	else
 		cpsw_ale_set_port_mask(ale_entry, mask,
 				       ale->port_mask_bits);
-	else
-		cpsw_ale_set_entry_type(ale_entry, ALE_TYPE_FREE);
 }
 
 int cpsw_ale_flush_multicast(struct cpsw_ale *ale, int port_mask, int vid)
@@ -1231,7 +1225,7 @@ int cpsw_ale_rx_ratelimit_bc(struct cpsw_ale *ale, int port, unsigned int rateli
 
 static void cpsw_ale_timer(struct timer_list *t)
 {
-	struct cpsw_ale *ale = from_timer(ale, t, timer);
+	struct cpsw_ale *ale = timer_container_of(ale, t, timer);
 
 	cpsw_ale_control_set(ale, 0, ALE_AGEOUT, 1);
 
@@ -1287,7 +1281,7 @@ static void cpsw_ale_aging_stop(struct cpsw_ale *ale)
 		return;
 	}
 
-	del_timer_sync(&ale->timer);
+	timer_delete_sync(&ale->timer);
 }
 
 void cpsw_ale_start(struct cpsw_ale *ale)

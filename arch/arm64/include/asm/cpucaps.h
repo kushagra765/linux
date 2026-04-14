@@ -5,7 +5,7 @@
 
 #include <asm/cpucap-defs.h>
 
-#ifndef __ASSEMBLY__
+#ifndef __ASSEMBLER__
 #include <linux/types.h>
 /*
  * Check whether a cpucap is possible at compiletime.
@@ -19,8 +19,6 @@ cpucap_is_possible(const unsigned int cap)
 			   "cap must be < ARM64_NCAPS");
 
 	switch (cap) {
-	case ARM64_HAS_PAN:
-		return IS_ENABLED(CONFIG_ARM64_PAN);
 	case ARM64_HAS_EPAN:
 		return IS_ENABLED(CONFIG_ARM64_EPAN);
 	case ARM64_SVE:
@@ -46,6 +44,8 @@ cpucap_is_possible(const unsigned int cap)
 		return IS_ENABLED(CONFIG_ARM64_POE);
 	case ARM64_HAS_GCS:
 		return IS_ENABLED(CONFIG_ARM64_GCS);
+	case ARM64_HAFT:
+		return IS_ENABLED(CONFIG_ARM64_HAFT);
 	case ARM64_UNMAP_KERNEL_AT_EL0:
 		return IS_ENABLED(CONFIG_UNMAP_KERNEL_AT_EL0);
 	case ARM64_WORKAROUND_843419:
@@ -69,10 +69,12 @@ cpucap_is_possible(const unsigned int cap)
 		 * KVM MPAM support doesn't rely on the host kernel supporting MPAM.
 		*/
 		return true;
+	case ARM64_HAS_PMUV3:
+		return IS_ENABLED(CONFIG_HW_PERF_EVENTS);
 	}
 
 	return true;
 }
-#endif /* __ASSEMBLY__ */
+#endif /* __ASSEMBLER__ */
 
 #endif /* __ASM_CPUCAPS_H */

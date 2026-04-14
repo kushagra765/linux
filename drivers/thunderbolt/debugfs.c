@@ -12,6 +12,7 @@
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/pm_runtime.h>
+#include <linux/string_choices.h>
 #include <linux/uaccess.h>
 
 #include "tb.h"
@@ -168,6 +169,13 @@ static bool parse_line(char **line, u32 *offs, u32 *val, int short_fmt_len,
 	 * offset relative_offset cap_id vs_cap_id value\n
 	 * v[0]   v[1]            v[2]   v[3]      v[4]
 	 *
+	 * For Path configuration space:
+	 * Short format is: offset value\n
+	 *		    v[0]   v[1]
+	 * Long format as produced from the read side:
+	 * offset relative_offset in_hop_id value\n
+	 * v[0]   v[1]            v[2]      v[3]
+	 *
 	 * For Counter configuration space:
 	 * Short format is: offset\n
 	 *		    v[0]
@@ -191,14 +199,33 @@ static bool parse_line(char **line, u32 *offs, u32 *val, int short_fmt_len,
 }
 
 #if IS_ENABLED(CONFIG_USB4_DEBUGFS_WRITE)
-static ssize_t regs_write(struct tb_switch *sw, struct tb_port *port,
-			  const char __user *user_buf, size_t count,
-			  loff_t *ppos)
+/*
+ * Path registers need to be written in double word pairs and they both must be
+ * read before written. This writes one double word in path config space
+ * following the spec flow.
+ */
+static int path_write_one(struct tb_port *port, u32 val, u32 offset)
 {
+	u32 index = offset % PATH_LEN;
+	u32 offs = offset - index;
+	u32 data[PATH_LEN];
+	int ret;
+
+	ret = tb_port_read(port, data, TB_CFG_HOPS, offs, PATH_LEN);
+	if (ret)
+		return ret;
+	data[index] = val;
+	return tb_port_write(port, data, TB_CFG_HOPS, offs, PATH_LEN);
+}
+
+static ssize_t regs_write(struct tb_switch *sw, struct tb_port *port,
+			  enum tb_cfg_space space, const char __user *user_buf,
+			  size_t count, loff_t *ppos)
+{
+	int long_fmt_len, ret = 0;
 	struct tb *tb = sw->tb;
 	char *line, *buf;
 	u32 val, offset;
-	int ret = 0;
 
 	buf = validate_and_copy_from_user(user_buf, &count);
 	if (IS_ERR(buf))
@@ -214,12 +241,21 @@ static ssize_t regs_write(struct tb_switch *sw, struct tb_port *port,
 	/* User did hardware changes behind the driver's back */
 	add_taint(TAINT_USER, LOCKDEP_STILL_OK);
 
+	if (space == TB_CFG_HOPS)
+		long_fmt_len = 4;
+	else
+		long_fmt_len = 5;
+
 	line = buf;
-	while (parse_line(&line, &offset, &val, 2, 5)) {
-		if (port)
-			ret = tb_port_write(port, &val, TB_CFG_PORT, offset, 1);
-		else
+	while (parse_line(&line, &offset, &val, 2, long_fmt_len)) {
+		if (port) {
+			if (space == TB_CFG_HOPS)
+				ret = path_write_one(port, val, offset);
+			else
+				ret = tb_port_write(port, &val, space, offset, 1);
+		} else {
 			ret = tb_sw_write(sw, &val, TB_CFG_SWITCH, offset, 1);
+		}
 		if (ret)
 			break;
 	}
@@ -240,7 +276,16 @@ static ssize_t port_regs_write(struct file *file, const char __user *user_buf,
 	struct seq_file *s = file->private_data;
 	struct tb_port *port = s->private;
 
-	return regs_write(port->sw, port, user_buf, count, ppos);
+	return regs_write(port->sw, port, TB_CFG_PORT, user_buf, count, ppos);
+}
+
+static ssize_t path_write(struct file *file, const char __user *user_buf,
+			  size_t count, loff_t *ppos)
+{
+	struct seq_file *s = file->private_data;
+	struct tb_port *port = s->private;
+
+	return regs_write(port->sw, port, TB_CFG_HOPS, user_buf, count, ppos);
 }
 
 static ssize_t switch_regs_write(struct file *file, const char __user *user_buf,
@@ -249,7 +294,7 @@ static ssize_t switch_regs_write(struct file *file, const char __user *user_buf,
 	struct seq_file *s = file->private_data;
 	struct tb_switch *sw = s->private;
 
-	return regs_write(sw, NULL, user_buf, count, ppos);
+	return regs_write(sw, NULL, TB_CFG_SWITCH, user_buf, count, ppos);
 }
 
 static bool parse_sb_line(char **line, u8 *reg, u8 *data, size_t data_size,
@@ -401,6 +446,7 @@ out:
 #define DEBUGFS_MODE		0600
 #else
 #define port_regs_write		NULL
+#define path_write		NULL
 #define switch_regs_write	NULL
 #define port_sb_regs_write	NULL
 #define retimer_sb_regs_write	NULL
@@ -646,7 +692,7 @@ static int margining_caps_show(struct seq_file *s, void *not_used)
 		seq_printf(s, "0x%08x\n", margining->caps[i]);
 
 	seq_printf(s, "# software margining: %s\n",
-		   supports_software(margining) ? "yes" : "no");
+		   str_yes_no(supports_software(margining)));
 	if (supports_hardware(margining)) {
 		seq_puts(s, "# hardware margining: yes\n");
 		seq_puts(s, "# minimum BER level contour: ");
@@ -1150,7 +1196,7 @@ static int validate_margining(struct tb_margining *margining)
 {
 	/*
 	 * For running on RX2 the link must be asymmetric with 3
-	 * receivers. Because this is can change dynamically, check it
+	 * receivers. Because this can change dynamically, check it
 	 * here before we start the margining and report back error if
 	 * expectations are not met.
 	 */
@@ -1611,7 +1657,7 @@ static struct tb_margining *margining_alloc(struct tb_port *port,
 		return NULL;
 	}
 
-	margining = kzalloc(sizeof(*margining), GFP_KERNEL);
+	margining = kzalloc_obj(*margining);
 	if (!margining)
 		return NULL;
 
@@ -2243,7 +2289,7 @@ out_rpm_put:
 
 	return ret;
 }
-DEBUGFS_ATTR_RO(path);
+DEBUGFS_ATTR_RW(path);
 
 static int counter_set_regs_show(struct tb_port *port, struct seq_file *s,
 				 int counter)
@@ -2368,6 +2414,8 @@ void tb_switch_debugfs_init(struct tb_switch *sw)
 	sw->debugfs_dir = debugfs_dir;
 	debugfs_create_file("regs", DEBUGFS_MODE, debugfs_dir, sw,
 			    &switch_regs_fops);
+	if (sw->drom)
+		debugfs_create_blob("drom", 0400, debugfs_dir, &sw->drom_blob);
 
 	tb_switch_for_each_port(sw, port) {
 		struct dentry *debugfs_dir;

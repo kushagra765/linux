@@ -361,7 +361,7 @@ static void wcn36xx_change_opchannel(struct wcn36xx *wcn, int ch)
 	return;
 }
 
-static int wcn36xx_config(struct ieee80211_hw *hw, u32 changed)
+static int wcn36xx_config(struct ieee80211_hw *hw, int radio_idx, u32 changed)
 {
 	struct wcn36xx *wcn = hw->priv;
 	int ret;
@@ -462,7 +462,7 @@ static u64 wcn36xx_prepare_multicast(struct ieee80211_hw *hw,
 	struct netdev_hw_addr *ha;
 
 	wcn36xx_dbg(WCN36XX_DBG_MAC, "mac prepare multicast list\n");
-	fp = kzalloc(sizeof(*fp), GFP_ATOMIC);
+	fp = kzalloc_obj(*fp, GFP_ATOMIC);
 	if (!fp) {
 		wcn36xx_err("Out of memory setting filters.\n");
 		return 0;
@@ -965,7 +965,8 @@ out:
 }
 
 /* this is required when using IEEE80211_HW_HAS_RATE_CONTROL */
-static int wcn36xx_set_rts_threshold(struct ieee80211_hw *hw, u32 value)
+static int wcn36xx_set_rts_threshold(struct ieee80211_hw *hw, int radio_idx,
+				     u32 value)
 {
 	struct wcn36xx *wcn = hw->priv;
 	wcn36xx_dbg(WCN36XX_DBG_MAC, "mac set RTS threshold %d\n", value);
@@ -1590,7 +1591,10 @@ static int wcn36xx_probe(struct platform_device *pdev)
 	}
 
 	n_channels = wcn_band_2ghz.n_channels + wcn_band_5ghz.n_channels;
-	wcn->chan_survey = devm_kmalloc(wcn->dev, n_channels, GFP_KERNEL);
+	wcn->chan_survey = devm_kcalloc(wcn->dev,
+					n_channels,
+					sizeof(struct wcn36xx_chan_survey),
+					GFP_KERNEL);
 	if (!wcn->chan_survey) {
 		ret = -ENOMEM;
 		goto out_wq;

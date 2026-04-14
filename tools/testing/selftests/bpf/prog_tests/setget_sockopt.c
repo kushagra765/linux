@@ -202,7 +202,7 @@ err_out:
 void test_setget_sockopt(void)
 {
 	cg_fd = test__join_cgroup(CG_NAME);
-	if (cg_fd < 0)
+	if (!ASSERT_OK_FD(cg_fd, "join cgroup"))
 		return;
 
 	if (create_netns())
@@ -212,7 +212,7 @@ void test_setget_sockopt(void)
 	if (!ASSERT_OK_PTR(skel, "open skel"))
 		goto done;
 
-	strcpy(skel->rodata->veth, "binddevtest1");
+	strscpy(skel->rodata->veth, "binddevtest1");
 	skel->rodata->veth_ifindex = if_nametoindex("binddevtest1");
 	if (!ASSERT_GT(skel->rodata->veth_ifindex, 0, "if_nametoindex"))
 		goto done;

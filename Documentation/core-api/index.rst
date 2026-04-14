@@ -24,6 +24,8 @@ it.
    printk-index
    symbol-namespaces
    asm-annotations
+   real-time/index
+   housekeeping.rst
 
 Data structures and low-level utilities
 =======================================
@@ -53,6 +55,8 @@ Library functionality that is used throughout the kernel.
    floating-point
    union_find
    min_heap
+   parser
+   list
 
 Low level entry and exit
 ========================
@@ -109,10 +113,12 @@ more memory-management documentation in Documentation/mm/index.rst.
    dma-isa-lpc
    swiotlb
    mm-api
+   cgroup
    genalloc
    pin_user_pages
    boot-time-mm
    gfp_mask-from-fs-io
+   kho/index
 
 Interfaces for kernel debugging
 ===============================
@@ -133,11 +139,5 @@ Documents that don't fit elsewhere or which have yet to be categorized.
    :maxdepth: 1
 
    librs
+   liveupdate
    netlink
-
-.. only:: subproject and html
-
-   Indices
-   =======
-
-   * :ref:`genindex`

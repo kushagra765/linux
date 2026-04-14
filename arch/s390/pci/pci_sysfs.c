@@ -6,8 +6,7 @@
  *   Jan Glauber <jang@linux.vnet.ibm.com>
  */
 
-#define KMSG_COMPONENT "zpci"
-#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
+#define pr_fmt(fmt) "zpci: " fmt
 
 #include <linux/kernel.h>
 #include <linux/stat.h>
@@ -41,6 +40,9 @@ zpci_attr(segment1, "0x%02x\n", pfip[1]);
 zpci_attr(segment2, "0x%02x\n", pfip[2]);
 zpci_attr(segment3, "0x%02x\n", pfip[3]);
 
+#define ZPCI_FW_ATTR_RO(_name)						\
+	static struct kobj_attribute _name##_attr = __ATTR_RO(_name)
+
 static ssize_t mio_enabled_show(struct device *dev,
 				struct device_attribute *attr, char *buf)
 {
@@ -52,7 +54,6 @@ static DEVICE_ATTR_RO(mio_enabled);
 
 static int _do_recover(struct pci_dev *pdev, struct zpci_dev *zdev)
 {
-	u8 status;
 	int ret;
 
 	pci_stop_and_remove_bus_device(pdev);
@@ -70,16 +71,8 @@ static int _do_recover(struct pci_dev *pdev, struct zpci_dev *zdev)
 			return ret;
 	}
 
-	ret = zpci_enable_device(zdev);
-	if (ret)
-		return ret;
+	ret = zpci_reenable_device(zdev);
 
-	if (zdev->dma_table) {
-		ret = zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
-					 virt_to_phys(zdev->dma_table), &status);
-		if (ret)
-			zpci_disable_device(zdev);
-	}
 	return ret;
 }
 
@@ -135,7 +128,7 @@ out:
 static DEVICE_ATTR_WO(recover);
 
 static ssize_t util_string_read(struct file *filp, struct kobject *kobj,
-				struct bin_attribute *attr, char *buf,
+				const struct bin_attribute *attr, char *buf,
 				loff_t off, size_t count)
 {
 	struct device *dev = kobj_to_dev(kobj);
@@ -145,10 +138,10 @@ static ssize_t util_string_read(struct file *filp, struct kobject *kobj,
 	return memory_read_from_buffer(buf, count, &off, zdev->util_str,
 				       sizeof(zdev->util_str));
 }
-static BIN_ATTR_RO(util_string, CLP_UTIL_STR_LEN);
+static const BIN_ATTR_RO(util_string, CLP_UTIL_STR_LEN);
 
 static ssize_t report_error_write(struct file *filp, struct kobject *kobj,
-				  struct bin_attribute *attr, char *buf,
+				  const struct bin_attribute *attr, char *buf,
 				  loff_t off, size_t count)
 {
 	struct zpci_report_error_header *report = (void *) buf;
@@ -164,7 +157,7 @@ static ssize_t report_error_write(struct file *filp, struct kobject *kobj,
 
 	return ret ? ret : count;
 }
-static BIN_ATTR(report_error, S_IWUSR, NULL, report_error_write, PAGE_SIZE);
+static const BIN_ATTR(report_error, S_IWUSR, NULL, report_error_write, PAGE_SIZE);
 
 static ssize_t uid_is_unique_show(struct device *dev,
 				  struct device_attribute *attr, char *buf)
@@ -172,6 +165,13 @@ static ssize_t uid_is_unique_show(struct device *dev,
 	return sysfs_emit(buf, "%d\n", zpci_unique_uid ? 1 : 0);
 }
 static DEVICE_ATTR_RO(uid_is_unique);
+
+static ssize_t uid_checking_show(struct kobject *kobj,
+				 struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%d\n", zpci_unique_uid ? 1 : 0);
+}
+ZPCI_FW_ATTR_RO(uid_checking);
 
 /* analogous to smbios index */
 static ssize_t index_show(struct device *dev,
@@ -203,7 +203,7 @@ const struct attribute_group zpci_ident_attr_group = {
 	.is_visible = zpci_index_is_visible,
 };
 
-static struct bin_attribute *zpci_bin_attrs[] = {
+static const struct bin_attribute *const zpci_bin_attrs[] = {
 	&bin_attr_util_string,
 	&bin_attr_report_error,
 	NULL,
@@ -242,3 +242,18 @@ const struct attribute_group pfip_attr_group = {
 	.name = "pfip",
 	.attrs = pfip_attrs,
 };
+
+static struct attribute *clp_fw_attrs[] = {
+	&uid_checking_attr.attr,
+	NULL,
+};
+
+static struct attribute_group clp_fw_attr_group = {
+	.name = "clp",
+	.attrs = clp_fw_attrs,
+};
+
+int __init __zpci_fw_sysfs_init(void)
+{
+	return sysfs_create_group(firmware_kobj, &clp_fw_attr_group);
+}

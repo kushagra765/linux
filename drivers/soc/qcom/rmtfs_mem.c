@@ -125,7 +125,7 @@ static int qcom_rmtfs_mem_release(struct inode *inode, struct file *filp)
 	return 0;
 }
 
-static struct class rmtfs_class = {
+static const struct class rmtfs_class = {
 	.name           = "rmtfs",
 };
 
@@ -192,7 +192,7 @@ static int qcom_rmtfs_mem_probe(struct platform_device *pdev)
 
 	}
 
-	rmtfs_mem = kzalloc(sizeof(*rmtfs_mem), GFP_KERNEL);
+	rmtfs_mem = kzalloc_obj(*rmtfs_mem);
 	if (!rmtfs_mem)
 		return -ENOMEM;
 

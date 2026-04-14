@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <inttypes.h>
 #include <signal.h>
+#include <assert.h>
 #include <libgen.h>
 #include <bpf/bpf.h>
 #include <scx/common.h>
@@ -49,24 +50,37 @@ int main(int argc, char **argv)
 	__u64 seq = 0, ecode;
 	__s32 opt;
 	cpu_set_t *cpuset;
+	size_t cpuset_size;
 
 	libbpf_set_print(libbpf_print_fn);
 	signal(SIGINT, sigint_handler);
 	signal(SIGTERM, sigint_handler);
 restart:
+	optind = 1;
 	skel = SCX_OPS_OPEN(central_ops, scx_central);
 
 	skel->rodata->central_cpu = 0;
 	skel->rodata->nr_cpu_ids = libbpf_num_possible_cpus();
+	skel->rodata->slice_ns = __COMPAT_ENUM_OR_ZERO("scx_public_consts", "SCX_SLICE_DFL");
 
-	while ((opt = getopt(argc, argv, "s:c:pvh")) != -1) {
+	assert(skel->rodata->nr_cpu_ids > 0);
+	assert(skel->rodata->nr_cpu_ids <= INT32_MAX);
+
+	while ((opt = getopt(argc, argv, "s:c:vh")) != -1) {
 		switch (opt) {
 		case 's':
 			skel->rodata->slice_ns = strtoull(optarg, NULL, 0) * 1000;
 			break;
-		case 'c':
-			skel->rodata->central_cpu = strtoul(optarg, NULL, 0);
+		case 'c': {
+			u32 central_cpu = strtoul(optarg, NULL, 0);
+			if (central_cpu >= skel->rodata->nr_cpu_ids) {
+				fprintf(stderr, "invalid central CPU id value, %u given (%u max)\n", central_cpu, skel->rodata->nr_cpu_ids);
+				scx_central__destroy(skel);
+				return -1;
+			}
+			skel->rodata->central_cpu = (s32)central_cpu;
 			break;
+		}
 		case 'v':
 			verbose = true;
 			break;
@@ -95,9 +109,10 @@ restart:
 	 */
 	cpuset = CPU_ALLOC(skel->rodata->nr_cpu_ids);
 	SCX_BUG_ON(!cpuset, "Failed to allocate cpuset");
-	CPU_ZERO(cpuset);
-	CPU_SET(skel->rodata->central_cpu, cpuset);
-	SCX_BUG_ON(sched_setaffinity(0, sizeof(cpuset), cpuset),
+	cpuset_size = CPU_ALLOC_SIZE(skel->rodata->nr_cpu_ids);
+	CPU_ZERO_S(cpuset_size, cpuset);
+	CPU_SET_S(skel->rodata->central_cpu, cpuset_size, cpuset);
+	SCX_BUG_ON(sched_setaffinity(0, cpuset_size, cpuset),
 		   "Failed to affinitize to central CPU %d (max %d)",
 		   skel->rodata->central_cpu, skel->rodata->nr_cpu_ids - 1);
 	CPU_FREE(cpuset);

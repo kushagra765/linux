@@ -91,6 +91,17 @@ HOSTRUSTFLAGS
 -------------
 Additional flags to be passed to $(HOSTRUSTC) when building host programs.
 
+PROCMACROLDFLAGS
+----------------
+Flags to be passed when linking Rust proc macros. Since proc macros are loaded
+by rustc at build time, they must be linked in a way that is compatible with
+the rustc toolchain being used.
+
+For instance, it can be useful when rustc uses a different C library than
+the one the user wants to use for host programs.
+
+If unset, it defaults to the flags passed when linking host programs.
+
 HOSTLDFLAGS
 -----------
 Additional flags to be passed when linking host programs.
@@ -169,7 +180,7 @@ architecture.
 KDOCFLAGS
 ---------
 Specify extra (warning/error) flags for kernel-doc checks during the build,
-see scripts/kernel-doc for which flags are supported. Note that this doesn't
+see tools/docs/kernel-doc for which flags are supported. Note that this doesn't
 (currently) apply to documentation builds.
 
 ARCH
@@ -317,8 +328,14 @@ KBUILD_BUILD_TIMESTAMP
 ----------------------
 Setting this to a date string overrides the timestamp used in the
 UTS_VERSION definition (uname -v in the running kernel). The value has to
-be a string that can be passed to date -d. The default value
-is the output of the date command at one point during build.
+be a string that can be passed to date -d. E.g.::
+
+    $ KBUILD_BUILD_TIMESTAMP="Mon Oct 13 00:00:00 UTC 2025" make
+
+The default value is the output of the date command at one point during
+build. If provided, this timestamp will also be used for mtime fields
+within any initramfs archive. Initramfs mtimes are 32-bit, so dates before
+the 1970 Unix epoch, or after 2106-02-07 06:28:15 UTC will fail.
 
 KBUILD_BUILD_USER, KBUILD_BUILD_HOST
 ------------------------------------

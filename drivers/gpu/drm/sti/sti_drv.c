@@ -13,15 +13,16 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 
+#include <drm/clients/drm_client_setup.h>
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
-#include <drm/drm_client_setup.h>
 #include <drm/drm_debugfs.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_fbdev_dma.h>
 #include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_of.h>
+#include <drm/drm_print.h>
 #include <drm/drm_probe_helper.h>
 
 #include "sti_drv.h"
@@ -29,7 +30,6 @@
 
 #define DRIVER_NAME	"sti"
 #define DRIVER_DESC	"STMicroelectronics SoC DRM"
-#define DRIVER_DATE	"20140601"
 #define DRIVER_MAJOR	1
 #define DRIVER_MINOR	0
 
@@ -143,7 +143,6 @@ static const struct drm_driver sti_driver = {
 
 	.name = DRIVER_NAME,
 	.desc = DRIVER_DESC,
-	.date = DRIVER_DATE,
 	.major = DRIVER_MAJOR,
 	.minor = DRIVER_MINOR,
 };
@@ -152,7 +151,7 @@ static int sti_init(struct drm_device *ddev)
 {
 	struct sti_private *private;
 
-	private = kzalloc(sizeof(*private), GFP_KERNEL);
+	private = kzalloc_obj(*private);
 	if (!private)
 		return -ENOMEM;
 
@@ -233,23 +232,15 @@ static const struct component_master_ops sti_ops = {
 static int sti_platform_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
-	struct device_node *node = dev->of_node;
-	struct device_node *child_np;
-	struct component_match *match = NULL;
+	int ret;
 
-	dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
+	ret = dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
+	if (ret)
+		return ret;
 
 	devm_of_platform_populate(dev);
 
-	child_np = of_get_next_available_child(node, NULL);
-
-	while (child_np) {
-		drm_of_component_match_add(dev, &match, component_compare_of,
-					   child_np);
-		child_np = of_get_next_available_child(node, child_np);
-	}
-
-	return component_master_add_with_match(dev, &sti_ops, match);
+	return drm_of_component_probe(dev, component_compare_of, &sti_ops);
 }
 
 static void sti_platform_remove(struct platform_device *pdev)

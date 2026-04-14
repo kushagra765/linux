@@ -1,7 +1,7 @@
 /*******************************************************************
  * This file is part of the Emulex Linux Device Driver for         *
  * Fibre Channel Host Bus Adapters.                                *
- * Copyright (C) 2017-2024 Broadcom. All Rights Reserved. The term *
+ * Copyright (C) 2017-2025 Broadcom. All Rights Reserved. The term *
  * “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.  *
  * Copyright (C) 2004-2016 Emulex.  All rights reserved.           *
  * EMULEX and SLI are trademarks of Emulex.                        *
@@ -98,7 +98,7 @@ lpfc_nvme_create_queue(struct nvme_fc_local_port *pnvme_lport,
 	    test_bit(HBA_IOQ_FLUSH, &vport->phba->hba_flag))
 		return -ENODEV;
 
-	qhandle = kzalloc(sizeof(struct lpfc_nvme_qhandle), GFP_KERNEL);
+	qhandle = kzalloc_obj(struct lpfc_nvme_qhandle);
 	if (qhandle == NULL)
 		return -ENOMEM;
 
@@ -587,7 +587,7 @@ __lpfc_nvme_ls_req(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 	 * in the nvme-fc layer.
 	 */
 
-	bmp = kmalloc(sizeof(*bmp), GFP_KERNEL);
+	bmp = kmalloc_obj(*bmp);
 	if (!bmp) {
 		lpfc_printf_vlog(vport, KERN_ERR, LOG_TRACE_EVENT,
 				 "6044 NVMEx LS REQ: Could not alloc LS buf "
@@ -1234,12 +1234,8 @@ lpfc_nvme_prep_io_cmd(struct lpfc_vport *vport,
 			if ((phba->cfg_nvme_enable_fb) &&
 			    test_bit(NLP_FIRSTBURST, &pnode->nlp_flag)) {
 				req_len = lpfc_ncmd->nvmeCmd->payload_length;
-				if (req_len < pnode->nvme_fb_size)
-					wqe->fcp_iwrite.initial_xfer_len =
-						req_len;
-				else
-					wqe->fcp_iwrite.initial_xfer_len =
-						pnode->nvme_fb_size;
+				wqe->fcp_iwrite.initial_xfer_len = min(req_len,
+								       pnode->nvme_fb_size);
 			} else {
 				wqe->fcp_iwrite.initial_xfer_len = 0;
 			}
@@ -2237,7 +2233,7 @@ lpfc_nvme_lport_unreg_wait(struct lpfc_vport *vport,
 	 * wait. Print a message if a 10 second wait expires and renew the
 	 * wait. This is unexpected.
 	 */
-	wait_tmo = msecs_to_jiffies(LPFC_NVME_WAIT_TMO * 1000);
+	wait_tmo = secs_to_jiffies(LPFC_NVME_WAIT_TMO);
 	while (true) {
 		ret = wait_for_completion_timeout(lport_unreg_cmp, wait_tmo);
 		if (unlikely(!ret)) {
@@ -2508,7 +2504,10 @@ lpfc_nvme_register_port(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp)
 				 "6031 RemotePort Registration failed "
 				 "err: %d, DID x%06x ref %u\n",
 				 ret, ndlp->nlp_DID, kref_read(&ndlp->kref));
-		lpfc_nlp_put(ndlp);
+
+		/* Only release reference if one was taken for this request */
+		if (!oldrport)
+			lpfc_nlp_put(ndlp);
 	}
 
 	return ret;
@@ -2614,7 +2613,8 @@ lpfc_nvme_unregister_port(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp)
 	 * clear any rport state until the transport calls back.
 	 */
 
-	if (ndlp->nlp_type & NLP_NVME_TARGET) {
+	if ((ndlp->nlp_type & NLP_NVME_TARGET) ||
+	    (remoteport->port_role & FC_PORT_ROLE_NVME_TARGET)) {
 		/* No concern about the role change on the nvme remoteport.
 		 * The transport will update it.
 		 */

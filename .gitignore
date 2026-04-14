@@ -13,6 +13,7 @@
 .*
 *.a
 *.asn1.[ch]
+*.bc
 *.bin
 *.bz2
 *.c.[012]*.*
@@ -22,6 +23,7 @@
 *.dtb.S
 *.dtbo.S
 *.dwo
+*.dylib
 *.elf
 *.gcno
 *.gcda
@@ -39,6 +41,8 @@
 *.o
 *.o.*
 *.patch
+*.pyc
+*.rlib
 *.rmeta
 *.rpm
 *.rsi
@@ -64,6 +68,7 @@ modules.order
 /vmlinux.32
 /vmlinux.map
 /vmlinux.symvers
+/vmlinux.unstripped
 /vmlinux-gdb.py
 /vmlinuz
 /System.map
@@ -111,6 +116,7 @@ modules.order
 !.gitignore
 !.kunitconfig
 !.mailmap
+!.pylintrc
 !.rustfmt.toml
 
 #
@@ -172,10 +178,13 @@ x509.genkey
 *.kdev4
 
 # Clang's compilation database file
-/compile_commands.json
+compile_commands.json
 
 # Documentation toolchain
 sphinx_*/
 
 # Rust analyzer configuration
 /rust-project.json
+
+# bc language scripts (not LLVM bitcode)
+!kernel/time/timeconst.bc

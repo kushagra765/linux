@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <dirent.h>
 #include <stdbool.h>
+#include <ctype.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
@@ -21,7 +22,9 @@
 #include <sys/eventfd.h>
 #include <asm/unistd.h>
 #include <linux/perf_event.h>
-#include "../kselftest.h"
+#include <linux/compiler.h>
+#include <linux/bits.h>
+#include "kselftest.h"
 
 #define MB			(1024 * 1024)
 #define RESCTRL_PATH		"/sys/fs/resctrl"
@@ -34,8 +37,9 @@
  * Define as bits because they're used for vendor_specific bitmask in
  * the struct resctrl_test.
  */
-#define ARCH_INTEL     1
-#define ARCH_AMD       2
+#define ARCH_INTEL	BIT(0)
+#define ARCH_AMD	BIT(1)
+#define ARCH_HYGON	BIT(2)
 
 #define END_OF_TESTS	1
 
@@ -156,9 +160,12 @@ struct perf_event_read {
  */
 extern volatile int *value_sink;
 
+extern int snc_unreliable;
+
 extern char llc_occup_path[1024];
 
-int get_vendor(void);
+int snc_nodes_per_l3_cache(void);
+unsigned int get_vendor(void);
 bool check_resctrlfs_support(void);
 int filter_dmesg(void);
 int get_domain_id(const char *resource, int cpu_no, int *domain_id);
@@ -198,6 +205,7 @@ void ctrlc_handler(int signum, siginfo_t *info, void *ptr);
 int signal_handler_register(const struct resctrl_test *test);
 void signal_handler_unregister(void);
 unsigned int count_bits(unsigned long n);
+int snc_kernel_support(void);
 
 void perf_event_attr_initialize(struct perf_event_attr *pea, __u64 config);
 void perf_event_initialize_read_format(struct perf_event_read *pe_read);

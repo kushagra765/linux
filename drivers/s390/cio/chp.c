@@ -111,8 +111,9 @@ static int s390_vary_chpid(struct chp_id chpid, int on)
 	char dbf_text[15];
 	int status;
 
-	sprintf(dbf_text, on?"varyon%x.%02x":"varyoff%x.%02x", chpid.cssid,
-		chpid.id);
+	scnprintf(dbf_text, sizeof(dbf_text),
+		  on ? "varyon%x.%02x" : "varyoff%x.%02x",
+		  chpid.cssid, chpid.id);
 	CIO_TRACE_EVENT(2, dbf_text);
 
 	status = chp_get_status(chpid);
@@ -128,7 +129,7 @@ static int s390_vary_chpid(struct chp_id chpid, int on)
  * Channel measurement related functions
  */
 static ssize_t measurement_chars_read(struct file *filp, struct kobject *kobj,
-				      struct bin_attribute *bin_attr,
+				      const struct bin_attribute *bin_attr,
 				      char *buf, loff_t off, size_t count)
 {
 	struct channel_path *chp;
@@ -142,11 +143,11 @@ static ssize_t measurement_chars_read(struct file *filp, struct kobject *kobj,
 	return memory_read_from_buffer(buf, count, &off, &chp->cmg_chars,
 				       sizeof(chp->cmg_chars));
 }
-static BIN_ATTR_ADMIN_RO(measurement_chars, sizeof(struct cmg_chars));
+static const BIN_ATTR_ADMIN_RO(measurement_chars, sizeof(struct cmg_chars));
 
 static ssize_t measurement_chars_full_read(struct file *filp,
 					   struct kobject *kobj,
-					   struct bin_attribute *bin_attr,
+					   const struct bin_attribute *bin_attr,
 					   char *buf, loff_t off, size_t count)
 {
 	struct channel_path *chp = to_channelpath(kobj_to_dev(kobj));
@@ -196,22 +197,22 @@ static ssize_t chp_measurement_copy_block(void *buf, loff_t off, size_t count,
 }
 
 static ssize_t measurement_read(struct file *filp, struct kobject *kobj,
-				struct bin_attribute *bin_attr,
+				const struct bin_attribute *bin_attr,
 				char *buf, loff_t off, size_t count)
 {
 	return chp_measurement_copy_block(buf, off, count, kobj, false);
 }
-static BIN_ATTR_ADMIN_RO(measurement, sizeof(struct cmg_entry));
+static const BIN_ATTR_ADMIN_RO(measurement, sizeof(struct cmg_entry));
 
 static ssize_t ext_measurement_read(struct file *filp, struct kobject *kobj,
-				    struct bin_attribute *bin_attr,
+				    const struct bin_attribute *bin_attr,
 				    char *buf, loff_t off, size_t count)
 {
 	return chp_measurement_copy_block(buf, off, count, kobj, true);
 }
-static BIN_ATTR_ADMIN_RO(ext_measurement, sizeof(struct cmg_ext_entry));
+static const BIN_ATTR_ADMIN_RO(ext_measurement, sizeof(struct cmg_ext_entry));
 
-static struct bin_attribute *measurement_attrs[] = {
+static const struct bin_attribute *measurement_attrs[] = {
 	&bin_attr_measurement_chars,
 	&bin_attr_measurement_chars_full,
 	&bin_attr_measurement,
@@ -435,7 +436,7 @@ static ssize_t speed_bps_show(struct device *dev,
 static DEVICE_ATTR_RO(speed_bps);
 
 static ssize_t util_string_read(struct file *filp, struct kobject *kobj,
-				struct bin_attribute *attr, char *buf,
+				const struct bin_attribute *attr, char *buf,
 				loff_t off, size_t count)
 {
 	struct channel_path *chp = to_channelpath(kobj_to_dev(kobj));
@@ -448,10 +449,10 @@ static ssize_t util_string_read(struct file *filp, struct kobject *kobj,
 
 	return rc;
 }
-static BIN_ATTR_RO(util_string,
-		   sizeof(((struct channel_path_desc_fmt3 *)0)->util_str));
+static const BIN_ATTR_RO(util_string,
+			 sizeof(((struct channel_path_desc_fmt3 *)0)->util_str));
 
-static struct bin_attribute *chp_bin_attrs[] = {
+static const struct bin_attribute *const chp_bin_attrs[] = {
 	&bin_attr_util_string,
 	NULL,
 };
@@ -468,7 +469,7 @@ static struct attribute *chp_attrs[] = {
 	&dev_attr_speed_bps.attr,
 	NULL,
 };
-static struct attribute_group chp_attr_group = {
+static const struct attribute_group chp_attr_group = {
 	.attrs = chp_attrs,
 	.bin_attrs = chp_bin_attrs,
 };
@@ -529,7 +530,7 @@ int chp_new(struct chp_id chpid)
 	if (chp_is_registered(chpid))
 		goto out;
 
-	chp = kzalloc(sizeof(struct channel_path), GFP_KERNEL);
+	chp = kzalloc_obj(struct channel_path);
 	if (!chp) {
 		ret = -ENOMEM;
 		goto out;
@@ -592,7 +593,7 @@ struct channel_path_desc_fmt0 *chp_get_chp_desc(struct chp_id chpid)
 	chp = chpid_to_chp(chpid);
 	if (!chp)
 		return NULL;
-	desc = kmalloc(sizeof(*desc), GFP_KERNEL);
+	desc = kmalloc_obj(*desc);
 	if (!desc)
 		return NULL;
 
@@ -695,7 +696,8 @@ static int info_update(void)
 	if (time_after(jiffies, chp_info_expires)) {
 		/* Data is too old, update. */
 		rc = sclp_chp_read_info(&chp_info);
-		chp_info_expires = jiffies + CHP_INFO_UPDATE_INTERVAL ;
+		if (!rc)
+			chp_info_expires = jiffies + CHP_INFO_UPDATE_INTERVAL;
 	}
 	mutex_unlock(&info_lock);
 

@@ -14,6 +14,7 @@
 #include <linux/net_tstamp.h>
 #include <linux/ptp_clock_kernel.h>
 #include <linux/timecounter.h>
+#include <linux/soc/marvell/silicons.h>
 #include <linux/soc/marvell/octeontx2/asm.h>
 #include <net/macsec.h>
 #include <net/pkt_cls.h>
@@ -21,15 +22,19 @@
 #include <linux/time64.h>
 #include <linux/dim.h>
 #include <uapi/linux/if_macsec.h>
+#include <net/page_pool/helpers.h>
 
 #include <mbox.h>
 #include <npc.h>
 #include "otx2_reg.h"
 #include "otx2_txrx.h"
 #include "otx2_devlink.h"
+#include <rvu.h>
 #include <rvu_trace.h>
 #include "qos.h"
 #include "rep.h"
+#include "cn10k_ipsec.h"
+#include "cn20k.h"
 
 /* IPv4 flag more fragment bit */
 #define IPV4_FLAG_MORE				0x20
@@ -40,6 +45,7 @@
 #define PCI_DEVID_OCTEONTX2_RVU_AFVF		0xA0F8
 
 #define PCI_SUBSYS_DEVID_96XX_RVU_PFVF		0xB200
+#define PCI_SUBSYS_DEVID_CN10K_A_RVU_PFVF	0xB900
 #define PCI_SUBSYS_DEVID_CN10K_B_RVU_PFVF	0xBD00
 
 #define PCI_DEVID_OCTEONTX2_SDP_REP		0xA0F7
@@ -54,6 +60,15 @@
 /* Max priority supported for PFC */
 #define NIX_PF_PFC_PRIO_MAX			8
 #endif
+
+/* Number of segments per SG structure */
+#define MAX_SEGS_PER_SG 3
+
+irqreturn_t otx2_pfaf_mbox_intr_handler(int irq, void *pf_irq);
+irqreturn_t cn20k_pfaf_mbox_intr_handler(int irq, void *pf_irq);
+irqreturn_t cn20k_vfaf_mbox_intr_handler(int irq, void *vf_irq);
+irqreturn_t cn20k_pfvf_mbox_intr_handler(int irq, void *pf_irq);
+irqreturn_t otx2_pfvf_mbox_intr_handler(int irq, void *pf_irq);
 
 enum arua_mapped_qtypes {
 	AURA_NIX_RQ,
@@ -79,10 +94,6 @@ struct otx2_lmt_info {
 	u64 lmt_addr;
 	u16 lmt_id;
 };
-/* RSS configuration */
-struct otx2_rss_ctx {
-	u8  ind_tbl[MAX_RSS_INDIR_TBL_SIZE];
-};
 
 struct otx2_rss_info {
 	u8 enable;
@@ -90,7 +101,7 @@ struct otx2_rss_info {
 	u16 rss_size;
 #define RSS_HASH_KEY_SIZE	44   /* 352 bit key */
 	u8  key[RSS_HASH_KEY_SIZE];
-	struct otx2_rss_ctx	*rss_ctx[MAX_RSS_GROUPS];
+	u32 ind_tbl[MAX_RSS_INDIR_TBL_SIZE];
 };
 
 /* NIX (or NPC) RX errors */
@@ -123,6 +134,12 @@ enum otx2_errcodes_re {
 	ERRCODE_IL4_CSUM = 0x22,
 };
 
+enum otx2_xdp_action {
+	OTX2_XDP_TX	  = BIT(0),
+	OTX2_XDP_REDIRECT = BIT(1),
+	OTX2_AF_XDP_FRAME = BIT(2),
+};
+
 struct otx2_dev_stats {
 	u64 rx_bytes;
 	u64 rx_frames;
@@ -137,6 +154,7 @@ struct otx2_dev_stats {
 	u64 tx_bcast_frames;
 	u64 tx_mcast_frames;
 	u64 tx_drops;
+	atomic_long_t tx_discards;
 };
 
 /* Driver counted stats */
@@ -233,6 +251,7 @@ struct otx2_hw {
 	u16			nix_msixoff; /* Offset of NIX vectors */
 	char			*irq_name;
 	cpumask_var_t           *affinity_mask;
+	struct pf_irq_data	*pfvf_irq_devid[4];
 
 	/* Stats */
 	struct otx2_dev_stats	dev_stats;
@@ -344,6 +363,7 @@ struct otx2_flow_config {
 	struct list_head	flow_list_tc;
 	u8			ucast_flt_cnt;
 	bool			ntuple;
+	u16			ntuple_cnt;
 };
 
 struct dev_hw_ops {
@@ -353,6 +373,14 @@ struct dev_hw_ops {
 			     int size, int qidx);
 	int	(*refill_pool_ptrs)(void *dev, struct otx2_cq_queue *cq);
 	void	(*aura_freeptr)(void *dev, int aura, u64 buf);
+	irqreturn_t (*pfaf_mbox_intr_handler)(int irq, void *pf_irq);
+	irqreturn_t (*vfaf_mbox_intr_handler)(int irq, void *pf_irq);
+	irqreturn_t (*pfvf_mbox_intr_handler)(int irq, void *pf_irq);
+	int	(*aura_aq_init)(struct otx2_nic *pfvf, int aura_id,
+				int pool_id, int numptrs);
+	int	(*pool_aq_init)(struct otx2_nic *pfvf, u16 pool_id,
+				int stack_pages, int numptrs, int buf_size,
+				int type);
 };
 
 #define CN10K_MCS_SA_PER_SC	4
@@ -420,6 +448,16 @@ struct cn10k_mcs_cfg {
 	struct list_head rxsc_list;
 };
 
+struct pf_irq_data {
+	u64 intr_status;
+	void (*pf_queue_work_hdlr)(struct mbox *mb, struct workqueue_struct *mw,
+				   int first, int mdevs, u64 intr);
+	struct otx2_nic *pf;
+	int vec_num;
+	int start;
+	int mdevs;
+};
+
 struct otx2_nic {
 	void __iomem		*reg_base;
 	struct net_device	*netdev;
@@ -448,6 +486,7 @@ struct otx2_nic {
 #define OTX2_FLAG_TC_MARK_ENABLED		BIT_ULL(17)
 #define OTX2_FLAG_REP_MODE_ENABLED		 BIT_ULL(18)
 #define OTX2_FLAG_PORT_UP			BIT_ULL(19)
+#define OTX2_FLAG_IPSEC_OFFLOAD_ENABLED		BIT_ULL(20)
 	u64			flags;
 	u64			*cq_op_addr;
 
@@ -462,6 +501,7 @@ struct otx2_nic {
 	struct mbox		*mbox_pfvf;
 	struct workqueue_struct *mbox_wq;
 	struct workqueue_struct *mbox_pfvf_wq;
+	struct qmem		*pfvf_mbox_addr;
 
 	u8			total_vfs;
 	u16			pcifunc; /* RVU PF_FUNC */
@@ -493,15 +533,15 @@ struct otx2_nic {
 	u32			nix_lmt_size;
 
 	struct otx2_ptp		*ptp;
-	struct hwtstamp_config	tstamp;
+	struct kernel_hwtstamp_config tstamp;
 
 	unsigned long		rq_bmap;
 
 	/* Devlink */
 	struct otx2_devlink	*dl;
-#ifdef CONFIG_DCB
 	/* PFC */
 	u8			pfc_en;
+#ifdef CONFIG_DCB
 	u8			*queue_to_pfc_map;
 	u16			pfc_schq_list[NIX_TXSCH_LVL_CNT][MAX_TXSCHQ_PER_FUNC];
 	bool			pfc_alloc_status[NIX_PF_PFC_PRIO_MAX];
@@ -522,6 +562,11 @@ struct otx2_nic {
 	u16			rep_pf_map[RVU_MAX_REP];
 	u16			esw_mode;
 #endif
+
+	/* Inline ipsec */
+	struct cn10k_ipsec	ipsec;
+	/* af_xdp zero-copy */
+	unsigned long		*af_xdp_zc_qidx;
 };
 
 static inline bool is_otx2_lbkvf(struct pci_dev *pdev)
@@ -572,6 +617,15 @@ static inline bool is_dev_cn10kb(struct pci_dev *pdev)
 	return pdev->subsystem_device == PCI_SUBSYS_DEVID_CN10K_B_RVU_PFVF;
 }
 
+static inline bool is_dev_cn10ka_b0(struct pci_dev *pdev)
+{
+	if (pdev->subsystem_device == PCI_SUBSYS_DEVID_CN10K_A_RVU_PFVF &&
+	    (pdev->revision & 0xFF) == 0x54)
+		return true;
+
+	return false;
+}
+
 static inline void otx2_setup_dev_hw_settings(struct otx2_nic *pfvf)
 {
 	struct otx2_hw *hw = &pfvf->hw;
@@ -604,9 +658,6 @@ static inline void otx2_setup_dev_hw_settings(struct otx2_nic *pfvf)
 		__set_bit(CN10K_PTP_ONESTEP, &hw->cap_flag);
 		__set_bit(QOS_CIR_PIR_SUPPORT, &hw->cap_flag);
 	}
-
-	if (is_dev_cn10kb(pfvf->pdev))
-		__set_bit(CN10K_HW_MACSEC, &hw->cap_flag);
 }
 
 /* Register read/write APIs */
@@ -620,6 +671,9 @@ static inline void __iomem *otx2_get_regaddr(struct otx2_nic *nic, u64 offset)
 		break;
 	case BLKTYPE_NPA:
 		blkaddr = BLKADDR_NPA;
+		break;
+	case BLKTYPE_CPT:
+		blkaddr = BLKADDR_CPT0;
 		break;
 	default:
 		blkaddr = BLKADDR_RVUM;
@@ -702,8 +756,9 @@ static inline void otx2_write128(u64 lo, u64 hi, void __iomem *addr)
 			 ::[x0]"r"(lo), [x1]"r"(hi), [p1]"r"(addr));
 }
 
-static inline u64 otx2_atomic64_add(u64 incr, u64 *ptr)
+static inline u64 otx2_atomic64_add(u64 incr, void __iomem *addr)
 {
+	u64 __iomem *ptr = addr;
 	u64 result;
 
 	__asm__ volatile(".cpu   generic+lse\n"
@@ -716,7 +771,11 @@ static inline u64 otx2_atomic64_add(u64 incr, u64 *ptr)
 
 #else
 #define otx2_write128(lo, hi, addr)		writeq((hi) | (lo), addr)
-#define otx2_atomic64_add(incr, ptr)		({ *ptr += incr; })
+
+static inline u64 otx2_atomic64_add(u64 incr, void __iomem *addr)
+{
+	return 0;
+}
 #endif
 
 static inline void __cn10k_aura_freeptr(struct otx2_nic *pfvf, u64 aura,
@@ -730,8 +789,15 @@ static inline void __cn10k_aura_freeptr(struct otx2_nic *pfvf, u64 aura,
 	tar_addr = (__force u64)otx2_get_regaddr(pfvf, NPA_LF_AURA_BATCH_FREE0);
 	/* LMTID is same as AURA Id */
 	val = (lmt_info->lmt_id & 0x7FF) | BIT_ULL(63);
-	/* Set if [127:64] of last 128bit word has a valid pointer */
-	count_eot = (num_ptrs % 2) ? 0ULL : 1ULL;
+	/* Meaning of count_eot
+	 * CN10K: count_eot = 0 if the number of pointers to free is even,
+	 *	  count_eot = 1 if the number of pointers to free is odd.
+	 *
+	 * CN20K: count_eot represents the least significant 2 bits of the
+	 *	  total number of valid pointers to free.
+	 *        Example: if 7 pointers are freed (0b111), count_eot = 0b11.
+	 */
+	count_eot = (num_ptrs - 1) & 0x3ULL;
 	/* Set AURA ID to free pointer */
 	ptrs[0] = (count_eot << 32) | (aura & 0xFFFFF);
 	/* Target address for LMTST flush tells HW how many 128bit
@@ -741,7 +807,7 @@ static inline void __cn10k_aura_freeptr(struct otx2_nic *pfvf, u64 aura,
 	 */
 	if (num_ptrs > 2) {
 		size = (sizeof(u64) * num_ptrs) / 16;
-		if (!count_eot)
+		if (!(count_eot & 1))
 			size++;
 		tar_addr |=  ((size - 1) & 0x7) << 4;
 	}
@@ -766,7 +832,7 @@ static inline void cn10k_aura_freeptr(void *dev, int aura, u64 buf)
 /* Alloc pointer from pool/aura */
 static inline u64 otx2_aura_allocptr(struct otx2_nic *pfvf, int aura)
 {
-	u64 *ptr = (__force u64 *)otx2_get_regaddr(pfvf, NPA_LF_AURA_OP_ALLOCX(0));
+	void __iomem *ptr = otx2_get_regaddr(pfvf, NPA_LF_AURA_OP_ALLOCX(0));
 	u64 incr = (u64)aura | BIT_ULL(63);
 
 	return otx2_atomic64_add(incr, ptr);
@@ -841,6 +907,7 @@ static struct _req_type __maybe_unused					\
 *otx2_mbox_alloc_msg_ ## _fn_name(struct mbox *mbox)                    \
 {									\
 	struct _req_type *req;						\
+	u16 pcifunc = mbox->pfvf->pcifunc;				\
 									\
 	req = (struct _req_type *)otx2_mbox_alloc_msg_rsp(		\
 		&mbox->mbox, 0, sizeof(struct _req_type),		\
@@ -849,7 +916,8 @@ static struct _req_type __maybe_unused					\
 		return NULL;						\
 	req->hdr.sig = OTX2_MBOX_REQ_SIG;				\
 	req->hdr.id = _id;						\
-	trace_otx2_msg_alloc(mbox->mbox.pdev, _id, sizeof(*req));	\
+	req->hdr.pcifunc = pcifunc;					\
+	trace_otx2_msg_alloc(mbox->mbox.pdev, _id, sizeof(*req), pcifunc); \
 	return req;							\
 }
 
@@ -869,19 +937,9 @@ MBOX_UP_MCS_MESSAGES
 /* Time to wait before watchdog kicks off */
 #define OTX2_TX_TIMEOUT		(100 * HZ)
 
-#define	RVU_PFVF_PF_SHIFT	10
-#define	RVU_PFVF_PF_MASK	0x3F
-#define	RVU_PFVF_FUNC_SHIFT	0
-#define	RVU_PFVF_FUNC_MASK	0x3FF
-
 static inline bool is_otx2_vf(u16 pcifunc)
 {
 	return !!(pcifunc & RVU_PFVF_FUNC_MASK);
-}
-
-static inline int rvu_get_pf(u16 pcifunc)
-{
-	return (pcifunc >> RVU_PFVF_PF_SHIFT) & RVU_PFVF_PF_MASK;
 }
 
 static inline dma_addr_t otx2_dma_map_page(struct otx2_nic *pfvf,
@@ -889,13 +947,8 @@ static inline dma_addr_t otx2_dma_map_page(struct otx2_nic *pfvf,
 					   size_t offset, size_t size,
 					   enum dma_data_direction dir)
 {
-	dma_addr_t iova;
-
-	iova = dma_map_page_attrs(pfvf->dev, page,
+	return dma_map_page_attrs(pfvf->dev, page,
 				  offset, size, dir, DMA_ATTR_SKIP_CPU_SYNC);
-	if (unlikely(dma_mapping_error(pfvf->dev, iova)))
-		return (dma_addr_t)NULL;
-	return iova;
 }
 
 static inline void otx2_dma_unmap_page(struct otx2_nic *pfvf,
@@ -981,10 +1034,11 @@ void otx2_txschq_free_one(struct otx2_nic *pfvf, u16 lvl, u16 schq);
 void otx2_free_pending_sqe(struct otx2_nic *pfvf);
 void otx2_sqb_flush(struct otx2_nic *pfvf);
 int otx2_alloc_rbuf(struct otx2_nic *pfvf, struct otx2_pool *pool,
-		    dma_addr_t *dma);
+		    dma_addr_t *dma, int qidx, int idx);
 int otx2_rxtx_enable(struct otx2_nic *pfvf, bool enable);
 void otx2_ctx_disable(struct mbox *mbox, int type, bool npa);
 int otx2_nix_config_bp(struct otx2_nic *pfvf, bool enable);
+int otx2_nix_cpt_config_bp(struct otx2_nic *pfvf, bool enable);
 void otx2_cleanup_rx_cqes(struct otx2_nic *pfvf, struct otx2_cq_queue *cq, int qidx);
 void otx2_cleanup_tx_cqes(struct otx2_nic *pfvf, struct otx2_cq_queue *cq);
 int otx2_sq_init(struct otx2_nic *pfvf, u16 qidx, u16 sqb_aura);
@@ -1010,12 +1064,19 @@ void otx2_pfaf_mbox_destroy(struct otx2_nic *pf);
 void otx2_disable_mbox_intr(struct otx2_nic *pf);
 void otx2_disable_napi(struct otx2_nic *pf);
 irqreturn_t otx2_cq_intr_handler(int irq, void *cq_irq);
+int otx2_rq_init(struct otx2_nic *pfvf, u16 qidx, u16 lpb_aura);
+int otx2_cq_init(struct otx2_nic *pfvf, u16 qidx);
+int otx2_set_hw_capabilities(struct otx2_nic *pfvf);
+int otx2_aura_aq_init(struct otx2_nic *pfvf, int aura_id,
+		      int pool_id, int numptrs);
+int otx2_pool_aq_init(struct otx2_nic *pfvf, u16 pool_id,
+		      int stack_pages, int numptrs, int buf_size, int type);
 
 /* RSS configuration APIs*/
 int otx2_rss_init(struct otx2_nic *pfvf);
 int otx2_set_flowkey_cfg(struct otx2_nic *pfvf);
 void otx2_set_rss_key(struct otx2_nic *pfvf);
-int otx2_set_rss_table(struct otx2_nic *pfvf, int ctx_id);
+int otx2_set_rss_table(struct otx2_nic *pfvf, int ctx_id, const u32 *ind_tbl);
 
 /* Mbox handlers */
 void mbox_handler_msix_offset(struct otx2_nic *pfvf,
@@ -1049,8 +1110,11 @@ int otx2_open(struct net_device *netdev);
 int otx2_stop(struct net_device *netdev);
 int otx2_set_real_num_queues(struct net_device *netdev,
 			     int tx_queues, int rx_queues);
-int otx2_ioctl(struct net_device *netdev, struct ifreq *req, int cmd);
-int otx2_config_hwtstamp(struct net_device *netdev, struct ifreq *ifr);
+int otx2_config_hwtstamp_get(struct net_device *netdev,
+			     struct kernel_hwtstamp_config *config);
+int otx2_config_hwtstamp_set(struct net_device *netdev,
+			     struct kernel_hwtstamp_config *config,
+			     struct netlink_ext_ack *extack);
 
 /* MCAM filter related APIs */
 int otx2_mcam_flow_init(struct otx2_nic *pf);
@@ -1072,7 +1136,10 @@ int otx2_del_macfilter(struct net_device *netdev, const u8 *mac);
 int otx2_add_macfilter(struct net_device *netdev, const u8 *mac);
 int otx2_enable_rxvlan(struct otx2_nic *pf, bool enable);
 int otx2_install_rxvlan_offload_flow(struct otx2_nic *pfvf);
-bool otx2_xdp_sq_append_pkt(struct otx2_nic *pfvf, u64 iova, int len, u16 qidx);
+bool otx2_xdp_sq_append_pkt(struct otx2_nic *pfvf, struct xdp_frame *xdpf,
+			    u64 iova, int len, u16 qidx, u16 flags);
+void otx2_xdp_sqe_add_sg(struct otx2_snd_queue *sq, struct xdp_frame *xdpf,
+			 u64 dma_addr, int len, int *offset, u16 flags);
 u16 otx2_get_max_mtu(struct otx2_nic *pfvf);
 int otx2_handle_ntuple_tc_features(struct net_device *netdev,
 				   netdev_features_t features);
@@ -1149,4 +1216,11 @@ static inline int mcam_entry_cmp(const void *a, const void *b)
 {
 	return *(u16 *)a - *(u16 *)b;
 }
+
+dma_addr_t otx2_dma_map_skb_frag(struct otx2_nic *pfvf,
+				 struct sk_buff *skb, int seg, int *len);
+void otx2_dma_unmap_skb_frags(struct otx2_nic *pfvf, struct sg_list *sg);
+int otx2_read_free_sqe(struct otx2_nic *pfvf, u16 qidx);
+void otx2_queue_vf_work(struct mbox *mw, struct workqueue_struct *mbox_wq,
+			int first, int mdevs, u64 intr);
 #endif /* OTX2_COMMON_H */

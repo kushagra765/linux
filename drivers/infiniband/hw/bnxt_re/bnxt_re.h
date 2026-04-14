@@ -53,12 +53,6 @@
 #define BNXT_RE_MAX_MR_SIZE_HIGH	BIT_ULL(39)
 #define BNXT_RE_MAX_MR_SIZE		BNXT_RE_MAX_MR_SIZE_HIGH
 
-#define BNXT_RE_MAX_QPC_COUNT		(64 * 1024)
-#define BNXT_RE_MAX_MRW_COUNT		(64 * 1024)
-#define BNXT_RE_MAX_SRQC_COUNT		(64 * 1024)
-#define BNXT_RE_MAX_CQ_COUNT		(64 * 1024)
-#define BNXT_RE_MAX_MRW_COUNT_64K	(64 * 1024)
-#define BNXT_RE_MAX_MRW_COUNT_256K	(256 * 1024)
 
 /* Number of MRs to reserve for PF, leaving remainder for VFs */
 #define BNXT_RE_RESVD_MR_FOR_PF         (32 * 1024)
@@ -178,24 +172,20 @@ struct bnxt_re_dev {
 	struct list_head		list;
 	unsigned long			flags;
 #define BNXT_RE_FLAG_NETDEV_REGISTERED		0
+#define BNXT_RE_FLAG_STATS_CTX3_ALLOC		1
 #define BNXT_RE_FLAG_HAVE_L2_REF		3
 #define BNXT_RE_FLAG_RCFW_CHANNEL_EN		4
-#define BNXT_RE_FLAG_QOS_WORK_REG		5
 #define BNXT_RE_FLAG_RESOURCES_ALLOCATED	7
 #define BNXT_RE_FLAG_RESOURCES_INITIALIZED	8
 #define BNXT_RE_FLAG_ERR_DEVICE_DETACHED       17
 #define BNXT_RE_FLAG_ISSUE_ROCE_STATS          29
 	struct net_device		*netdev;
 	struct auxiliary_device         *adev;
-	struct notifier_block		nb;
 	unsigned int			version, major, minor;
 	struct bnxt_qplib_chip_ctx	*chip_ctx;
 	struct bnxt_en_dev		*en_dev;
 
 	int				id;
-
-	struct delayed_work		worker;
-	u8				cur_prio_map;
 
 	/* RCFW Channel */
 	struct bnxt_qplib_rcfw		rcfw;
@@ -204,7 +194,7 @@ struct bnxt_re_dev {
 	struct bnxt_re_nq_record	*nqr;
 
 	/* Device Resources */
-	struct bnxt_qplib_dev_attr	dev_attr;
+	struct bnxt_qplib_dev_attr	*dev_attr;
 	struct bnxt_qplib_ctx		qplib_ctx;
 	struct bnxt_qplib_res		qplib_res;
 	struct bnxt_qplib_dpi		dpi_privileged;
@@ -229,6 +219,20 @@ struct bnxt_re_dev {
 	DECLARE_HASHTABLE(srq_hash, MAX_SRQ_HASH_BITS);
 	struct dentry			*dbg_root;
 	struct dentry			*qp_debugfs;
+	unsigned long			event_bitmap;
+	struct bnxt_qplib_cc_param	cc_param;
+	struct workqueue_struct		*dcb_wq;
+	struct dentry                   *cc_config;
+	struct bnxt_re_dbg_cc_config_params *cc_config_params;
+	struct dentry			*cq_coal_cfg;
+	struct bnxt_re_dbg_cq_coal_params *cq_coal_cfg_params;
+#define BNXT_VPD_FLD_LEN		32
+	char board_partno[BNXT_VPD_FLD_LEN];
+	/* RoCE mirror */
+	u16 mirror_vnic_id;
+	union ib_gid ugid;
+	u32 ugid_index;
+	u8 sniffer_flow_created : 1;
 };
 
 #define to_bnxt_re_dev(ptr, member)	\
@@ -240,6 +244,14 @@ struct bnxt_re_dev {
 
 #define BNXT_RE_CHECK_RC(x) ((x) && ((x) != -ETIMEDOUT))
 void bnxt_re_pacing_alert(struct bnxt_re_dev *rdev);
+
+int bnxt_re_assign_pma_port_counters(struct bnxt_re_dev *rdev, struct ib_mad *out_mad);
+int bnxt_re_assign_pma_port_ext_counters(struct bnxt_re_dev *rdev,
+					 struct ib_mad *out_mad);
+
+void bnxt_re_hwrm_free_vnic(struct bnxt_re_dev *rdev);
+int bnxt_re_hwrm_alloc_vnic(struct bnxt_re_dev *rdev);
+int bnxt_re_hwrm_cfg_vnic(struct bnxt_re_dev *rdev, u32 qp_id);
 
 static inline struct device *rdev_to_dev(struct bnxt_re_dev *rdev)
 {
@@ -273,5 +285,8 @@ static inline int bnxt_re_read_context_allowed(struct bnxt_re_dev *rdev)
 #define BNXT_RE_CONTEXT_TYPE_CQ_SIZE_P7		192
 #define BNXT_RE_CONTEXT_TYPE_MRW_SIZE_P7	192
 #define BNXT_RE_CONTEXT_TYPE_SRQ_SIZE_P7	192
+
+#define BNXT_RE_HWRM_CMD_TIMEOUT(rdev)		\
+		((rdev)->chip_ctx->hwrm_cmd_max_timeout * 1000)
 
 #endif

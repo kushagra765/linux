@@ -47,7 +47,7 @@ static inline void nlm_debug_print_file(char *msg, struct nlm_file *file)
 {
 	struct inode *inode = nlmsvc_file_inode(file);
 
-	dprintk("lockd: %s %s/%ld\n",
+	dprintk("lockd: %s %s/%llu\n",
 		msg, inode->i_sb->s_id, inode->i_ino);
 }
 #else
@@ -128,7 +128,7 @@ nlm_lookup_file(struct svc_rqst *rqstp, struct nlm_file **result,
 	nlm_debug_print_fh("creating file for", &lock->fh);
 
 	nfserr = nlm_lck_denied_nolocks;
-	file = kzalloc(sizeof(*file), GFP_KERNEL);
+	file = kzalloc_obj(*file);
 	if (!file)
 		goto out_free;
 

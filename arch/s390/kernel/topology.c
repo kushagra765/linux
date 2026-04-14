@@ -3,9 +3,9 @@
  *    Copyright IBM Corp. 2007, 2011
  */
 
-#define KMSG_COMPONENT "cpu"
-#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
+#define pr_fmt(fmt) "cpu: " fmt
 
+#include <linux/cpufeature.h>
 #include <linux/workqueue.h>
 #include <linux/memblock.h>
 #include <linux/uaccess.h>
@@ -240,7 +240,7 @@ int topology_set_cpu_management(int fc)
 {
 	int cpu, rc;
 
-	if (!MACHINE_HAS_TOPOLOGY)
+	if (!cpu_has_topology())
 		return -EOPNOTSUPP;
 	if (fc)
 		rc = ptf(PTF_VERTICAL);
@@ -315,13 +315,13 @@ static int __arch_update_cpu_topology(void)
 	hd_status = 0;
 	rc = 0;
 	mutex_lock(&smp_cpu_state_mutex);
-	if (MACHINE_HAS_TOPOLOGY) {
+	if (cpu_has_topology()) {
 		rc = 1;
 		store_topology(info);
 		tl_to_masks(info);
 	}
 	update_cpu_masks();
-	if (!MACHINE_HAS_TOPOLOGY)
+	if (!cpu_has_topology())
 		topology_update_polarization_simple();
 	if (cpu_management == 1)
 		hd_status = hd_enable_hiperdispatch();
@@ -371,12 +371,12 @@ static void set_topology_timer(void)
 	if (atomic_add_unless(&topology_poll, -1, 0))
 		mod_timer(&topology_timer, jiffies + msecs_to_jiffies(100));
 	else
-		mod_timer(&topology_timer, jiffies + msecs_to_jiffies(60 * MSEC_PER_SEC));
+		mod_timer(&topology_timer, jiffies + secs_to_jiffies(60));
 }
 
 void topology_expect_change(void)
 {
-	if (!MACHINE_HAS_TOPOLOGY)
+	if (!cpu_has_topology())
 		return;
 	/* This is racy, but it doesn't matter since it is just a heuristic.
 	 * Worst case is that we poll in a higher frequency for a bit longer.
@@ -500,7 +500,7 @@ int topology_cpu_init(struct cpu *cpu)
 	int rc;
 
 	rc = sysfs_create_group(&cpu->dev.kobj, &topology_cpu_attr_group);
-	if (rc || !MACHINE_HAS_TOPOLOGY)
+	if (rc || !cpu_has_topology())
 		return rc;
 	rc = sysfs_create_group(&cpu->dev.kobj, &topology_extra_cpu_attr_group);
 	if (rc)
@@ -508,33 +508,27 @@ int topology_cpu_init(struct cpu *cpu)
 	return rc;
 }
 
-static const struct cpumask *cpu_thread_mask(int cpu)
-{
-	return &cpu_topology[cpu].thread_mask;
-}
-
-
 const struct cpumask *cpu_coregroup_mask(int cpu)
 {
 	return &cpu_topology[cpu].core_mask;
 }
 
-static const struct cpumask *cpu_book_mask(int cpu)
+static const struct cpumask *tl_book_mask(struct sched_domain_topology_level *tl, int cpu)
 {
 	return &cpu_topology[cpu].book_mask;
 }
 
-static const struct cpumask *cpu_drawer_mask(int cpu)
+static const struct cpumask *tl_drawer_mask(struct sched_domain_topology_level *tl, int cpu)
 {
 	return &cpu_topology[cpu].drawer_mask;
 }
 
 static struct sched_domain_topology_level s390_topology[] = {
-	{ cpu_thread_mask, cpu_smt_flags, SD_INIT_NAME(SMT) },
-	{ cpu_coregroup_mask, cpu_core_flags, SD_INIT_NAME(MC) },
-	{ cpu_book_mask, SD_INIT_NAME(BOOK) },
-	{ cpu_drawer_mask, SD_INIT_NAME(DRAWER) },
-	{ cpu_cpu_mask, SD_INIT_NAME(PKG) },
+	SDTL_INIT(tl_smt_mask, cpu_smt_flags, SMT),
+	SDTL_INIT(tl_mc_mask, cpu_core_flags, MC),
+	SDTL_INIT(tl_book_mask, NULL, BOOK),
+	SDTL_INIT(tl_drawer_mask, NULL, DRAWER),
+	SDTL_INIT(tl_pkg_mask, NULL, PKG),
 	{ NULL, },
 };
 
@@ -548,12 +542,19 @@ static void __init alloc_masks(struct sysinfo_15_1_x *info,
 		nr_masks *= info->mag[TOPOLOGY_NR_MAG - offset - 1 - i];
 	nr_masks = max(nr_masks, 1);
 	for (i = 0; i < nr_masks; i++) {
-		mask->next = memblock_alloc(sizeof(*mask->next), 8);
-		if (!mask->next)
-			panic("%s: Failed to allocate %zu bytes align=0x%x\n",
-			      __func__, sizeof(*mask->next), 8);
+		mask->next = memblock_alloc_or_panic(sizeof(*mask->next), 8);
 		mask = mask->next;
 	}
+}
+
+static int __init detect_polarization(union topology_entry *tle)
+{
+	struct topology_core *tl_core;
+
+	while (tle->nl)
+		tle = next_tle(tle);
+	tl_core = (struct topology_core *)tle;
+	return tl_core->pp != POLARIZATION_HRZ;
 }
 
 void __init topology_init_early(void)
@@ -562,19 +563,17 @@ void __init topology_init_early(void)
 
 	set_sched_topology(s390_topology);
 	if (topology_mode == TOPOLOGY_MODE_UNINITIALIZED) {
-		if (MACHINE_HAS_TOPOLOGY)
+		if (cpu_has_topology())
 			topology_mode = TOPOLOGY_MODE_HW;
 		else
 			topology_mode = TOPOLOGY_MODE_SINGLE;
 	}
-	if (!MACHINE_HAS_TOPOLOGY)
+	if (!cpu_has_topology())
 		goto out;
-	tl_info = memblock_alloc(PAGE_SIZE, PAGE_SIZE);
-	if (!tl_info)
-		panic("%s: Failed to allocate %lu bytes align=0x%lx\n",
-		      __func__, PAGE_SIZE, PAGE_SIZE);
+	tl_info = memblock_alloc_or_panic(PAGE_SIZE, PAGE_SIZE);
 	info = tl_info;
 	store_topology(info);
+	cpu_management = detect_polarization(info->tle);
 	pr_info("The CPU configuration topology of the machine is: %d %d %d %d %d %d / %d\n",
 		info->mag[0], info->mag[1], info->mag[2], info->mag[3],
 		info->mag[4], info->mag[5], info->mnest);
@@ -591,7 +590,7 @@ static inline int topology_get_mode(int enabled)
 {
 	if (!enabled)
 		return TOPOLOGY_MODE_SINGLE;
-	return MACHINE_HAS_TOPOLOGY ? TOPOLOGY_MODE_HW : TOPOLOGY_MODE_PACKAGE;
+	return cpu_has_topology() ? TOPOLOGY_MODE_HW : TOPOLOGY_MODE_PACKAGE;
 }
 
 static inline int topology_is_enabled(void)
@@ -662,7 +661,7 @@ static int polarization_ctl_handler(const struct ctl_table *ctl, int write,
 	return set_polarization(polarization);
 }
 
-static struct ctl_table topology_ctl_table[] = {
+static const struct ctl_table topology_ctl_table[] = {
 	{
 		.procname	= "topology",
 		.mode		= 0644,
@@ -681,7 +680,7 @@ static int __init topology_init(void)
 	int rc = 0;
 
 	timer_setup(&topology_timer, topology_timer_fn, TIMER_DEFERRABLE);
-	if (MACHINE_HAS_TOPOLOGY)
+	if (cpu_has_topology())
 		set_topology_timer();
 	else
 		topology_update_polarization_simple();

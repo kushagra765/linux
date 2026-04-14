@@ -3,7 +3,7 @@
  * Copyright (c) 2000-2006 Silicon Graphics, Inc.
  * All Rights Reserved.
  */
-#include "xfs.h"
+#include "xfs_platform.h"
 #include "xfs_fs.h"
 #include "xfs_shared.h"
 #include "xfs_format.h"
@@ -90,7 +90,7 @@ xlog_add_buffer_cancelled(
 		return false;
 	}
 
-	bcp = kmalloc(sizeof(struct xfs_buf_cancel), GFP_KERNEL | __GFP_NOFAIL);
+	bcp = kmalloc_obj(struct xfs_buf_cancel, GFP_KERNEL | __GFP_NOFAIL);
 	bcp->bc_blkno = blkno;
 	bcp->bc_len = len;
 	bcp->bc_refcount = 1;
@@ -159,7 +159,7 @@ STATIC enum xlog_recover_reorder
 xlog_recover_buf_reorder(
 	struct xlog_recover_item	*item)
 {
-	struct xfs_buf_log_format	*buf_f = item->ri_buf[0].i_addr;
+	struct xfs_buf_log_format	*buf_f = item->ri_buf[0].iov_base;
 
 	if (buf_f->blf_flags & XFS_BLF_CANCEL)
 		return XLOG_REORDER_CANCEL_LIST;
@@ -173,7 +173,7 @@ xlog_recover_buf_ra_pass2(
 	struct xlog                     *log,
 	struct xlog_recover_item        *item)
 {
-	struct xfs_buf_log_format	*buf_f = item->ri_buf[0].i_addr;
+	struct xfs_buf_log_format	*buf_f = item->ri_buf[0].iov_base;
 
 	xlog_buf_readahead(log, buf_f->blf_blkno, buf_f->blf_len, NULL);
 }
@@ -187,11 +187,11 @@ xlog_recover_buf_commit_pass1(
 	struct xlog			*log,
 	struct xlog_recover_item	*item)
 {
-	struct xfs_buf_log_format	*bf = item->ri_buf[0].i_addr;
+	struct xfs_buf_log_format	*bf = item->ri_buf[0].iov_base;
 
 	if (!xfs_buf_log_check_iovec(&item->ri_buf[0])) {
-		xfs_err(log->l_mp, "bad buffer log item size (%d)",
-				item->ri_buf[0].i_len);
+		xfs_err(log->l_mp, "bad buffer log item size (%zd)",
+				item->ri_buf[0].iov_len);
 		return -EFSCORRUPTED;
 	}
 
@@ -262,11 +262,17 @@ xlog_recover_validate_buf_type(
 		case XFS_BMAP_MAGIC:
 			bp->b_ops = &xfs_bmbt_buf_ops;
 			break;
+		case XFS_RTRMAP_CRC_MAGIC:
+			bp->b_ops = &xfs_rtrmapbt_buf_ops;
+			break;
 		case XFS_RMAP_CRC_MAGIC:
 			bp->b_ops = &xfs_rmapbt_buf_ops;
 			break;
 		case XFS_REFC_CRC_MAGIC:
 			bp->b_ops = &xfs_refcountbt_buf_ops;
+			break;
+		case XFS_RTREFC_CRC_MAGIC:
+			bp->b_ops = &xfs_rtrefcountbt_buf_ops;
 			break;
 		default:
 			warnmsg = "Bad btree block magic!";
@@ -481,8 +487,8 @@ xlog_recover_do_reg_buffer(
 		nbits = xfs_contig_bits(buf_f->blf_data_map,
 					buf_f->blf_map_size, bit);
 		ASSERT(nbits > 0);
-		ASSERT(item->ri_buf[i].i_addr != NULL);
-		ASSERT(item->ri_buf[i].i_len % XFS_BLF_CHUNK == 0);
+		ASSERT(item->ri_buf[i].iov_base != NULL);
+		ASSERT(item->ri_buf[i].iov_len % XFS_BLF_CHUNK == 0);
 		ASSERT(BBTOB(bp->b_length) >=
 		       ((uint)bit << XFS_BLF_SHIFT) + (nbits << XFS_BLF_SHIFT));
 
@@ -494,8 +500,8 @@ xlog_recover_do_reg_buffer(
 		 * the log. Hence we need to trim nbits back to the length of
 		 * the current region being copied out of the log.
 		 */
-		if (item->ri_buf[i].i_len < (nbits << XFS_BLF_SHIFT))
-			nbits = item->ri_buf[i].i_len >> XFS_BLF_SHIFT;
+		if (item->ri_buf[i].iov_len < (nbits << XFS_BLF_SHIFT))
+			nbits = item->ri_buf[i].iov_len >> XFS_BLF_SHIFT;
 
 		/*
 		 * Do a sanity check if this is a dquot buffer. Just checking
@@ -505,18 +511,18 @@ xlog_recover_do_reg_buffer(
 		fa = NULL;
 		if (buf_f->blf_flags &
 		   (XFS_BLF_UDQUOT_BUF|XFS_BLF_PDQUOT_BUF|XFS_BLF_GDQUOT_BUF)) {
-			if (item->ri_buf[i].i_addr == NULL) {
+			if (item->ri_buf[i].iov_base == NULL) {
 				xfs_alert(mp,
 					"XFS: NULL dquot in %s.", __func__);
 				goto next;
 			}
-			if (item->ri_buf[i].i_len < size_disk_dquot) {
+			if (item->ri_buf[i].iov_len < size_disk_dquot) {
 				xfs_alert(mp,
-					"XFS: dquot too small (%d) in %s.",
-					item->ri_buf[i].i_len, __func__);
+					"XFS: dquot too small (%zd) in %s.",
+					item->ri_buf[i].iov_len, __func__);
 				goto next;
 			}
-			fa = xfs_dquot_verify(mp, item->ri_buf[i].i_addr, -1);
+			fa = xfs_dquot_verify(mp, item->ri_buf[i].iov_base, -1);
 			if (fa) {
 				xfs_alert(mp,
 	"dquot corrupt at %pS trying to replay into block 0x%llx",
@@ -527,7 +533,7 @@ xlog_recover_do_reg_buffer(
 
 		memcpy(xfs_buf_offset(bp,
 			(uint)bit << XFS_BLF_SHIFT),	/* dest */
-			item->ri_buf[i].i_addr,		/* source */
+			item->ri_buf[i].iov_base,		/* source */
 			nbits<<XFS_BLF_SHIFT);		/* length */
  next:
 		i++;
@@ -663,8 +669,8 @@ xlog_recover_do_inode_buffer(
 		if (next_unlinked_offset < reg_buf_offset)
 			continue;
 
-		ASSERT(item->ri_buf[item_index].i_addr != NULL);
-		ASSERT((item->ri_buf[item_index].i_len % XFS_BLF_CHUNK) == 0);
+		ASSERT(item->ri_buf[item_index].iov_base != NULL);
+		ASSERT((item->ri_buf[item_index].iov_len % XFS_BLF_CHUNK) == 0);
 		ASSERT((reg_buf_offset + reg_buf_bytes) <= BBTOB(bp->b_length));
 
 		/*
@@ -672,7 +678,7 @@ xlog_recover_do_inode_buffer(
 		 * current di_next_unlinked field.  Extract its value
 		 * and copy it to the buffer copy.
 		 */
-		logged_nextp = item->ri_buf[item_index].i_addr +
+		logged_nextp = item->ri_buf[item_index].iov_base +
 				next_unlinked_offset - reg_buf_offset;
 		if (XFS_IS_CORRUPT(mp, *logged_nextp == 0)) {
 			xfs_alert(mp,
@@ -729,6 +735,16 @@ xlog_recover_do_primary_sb_buffer(
 	 * Update the in-core super block from the freshly recovered on-disk one.
 	 */
 	xfs_sb_from_disk(&mp->m_sb, dsb);
+
+	/*
+	 * Grow can change the device size.  Mirror that into the buftarg.
+	 */
+	mp->m_ddev_targp->bt_nr_sectors =
+		XFS_FSB_TO_BB(mp, mp->m_sb.sb_dblocks);
+	if (mp->m_rtdev_targp && mp->m_rtdev_targp != mp->m_ddev_targp) {
+		mp->m_rtdev_targp->bt_nr_sectors =
+			XFS_FSB_TO_BB(mp, mp->m_sb.sb_rblocks);
+	}
 
 	if (mp->m_sb.sb_agcount < orig_agcount) {
 		xfs_alert(mp, "Shrinking AG count in log recovery not supported");
@@ -855,6 +871,8 @@ xlog_recover_get_buf_lsn(
 		uuid = &btb->bb_u.s.bb_uuid;
 		break;
 	}
+	case XFS_RTRMAP_CRC_MAGIC:
+	case XFS_RTREFC_CRC_MAGIC:
 	case XFS_BMAP_CRC_MAGIC:
 	case XFS_BMAP_MAGIC: {
 		struct xfs_btree_block *btb = blk;
@@ -994,11 +1012,10 @@ xlog_recover_buf_commit_pass2(
 	struct xlog_recover_item	*item,
 	xfs_lsn_t			current_lsn)
 {
-	struct xfs_buf_log_format	*buf_f = item->ri_buf[0].i_addr;
+	struct xfs_buf_log_format	*buf_f = item->ri_buf[0].iov_base;
 	struct xfs_mount		*mp = log->l_mp;
 	struct xfs_buf			*bp;
 	int				error;
-	uint				buf_flags;
 	xfs_lsn_t			lsn;
 
 	/*
@@ -1017,13 +1034,8 @@ xlog_recover_buf_commit_pass2(
 	}
 
 	trace_xfs_log_recover_buf_recover(log, buf_f);
-
-	buf_flags = 0;
-	if (buf_f->blf_flags & XFS_BLF_INODE_BUF)
-		buf_flags |= XBF_UNMAPPED;
-
 	error = xfs_buf_read(mp->m_ddev_targp, buf_f->blf_blkno, buf_f->blf_len,
-			  buf_flags, &bp, NULL);
+			  0, &bp, NULL);
 	if (error)
 		return error;
 
@@ -1079,7 +1091,7 @@ xlog_recover_buf_commit_pass2(
 		error = xlog_recover_do_primary_sb_buffer(mp, item, bp, buf_f,
 				current_lsn);
 		if (error)
-			goto out_release;
+			goto out_writebuf;
 
 		/* Update the rt superblock if we have one. */
 		if (xfs_has_rtsb(mp) && mp->m_rtsb_bp) {
@@ -1095,6 +1107,15 @@ xlog_recover_buf_commit_pass2(
 	} else {
 		xlog_recover_do_reg_buffer(mp, item, bp, buf_f, current_lsn);
 	}
+
+	/*
+	 * Buffer held by buf log item during 'normal' buffer recovery must
+	 * be committed through buffer I/O submission path to ensure proper
+	 * release. When error occurs during sb buffer recovery, log shutdown
+	 * will be done before submitting buffer list so that buffers can be
+	 * released correctly through ioend failure path.
+	 */
+out_writebuf:
 
 	/*
 	 * Perform delayed write on the buffer.  Asynchronous writes will be
@@ -1159,8 +1180,7 @@ xlog_alloc_buf_cancel_table(
 
 	ASSERT(log->l_buf_cancel_table == NULL);
 
-	p = kmalloc_array(XLOG_BC_TABLE_SIZE, sizeof(struct list_head),
-			  GFP_KERNEL);
+	p = kmalloc_objs(struct list_head, XLOG_BC_TABLE_SIZE);
 	if (!p)
 		return -ENOMEM;
 

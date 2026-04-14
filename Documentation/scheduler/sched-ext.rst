@@ -1,3 +1,5 @@
+.. _sched-ext:
+
 ==========================
 Extensible Scheduler Class
 ==========================
@@ -16,12 +18,12 @@ programs - the BPF scheduler.
 * The system integrity is maintained no matter what the BPF scheduler does.
   The default scheduling behavior is restored anytime an error is detected,
   a runnable task stalls, or on invoking the SysRq key sequence
-  :kbd:`SysRq-S`.
+  `SysRq-S`.
 
 * When the BPF scheduler triggers an error, debug information is dumped to
   aid debugging. The debug dump is passed to and printed out by the
   scheduler binary. The debug dump can also be accessed through the
-  `sched_ext_dump` tracepoint. The SysRq key sequence :kbd:`SysRq-D`
+  `sched_ext_dump` tracepoint. The SysRq key sequence `SysRq-D`
   triggers a debug dump. This doesn't terminate the BPF scheduler and can
   only be read through the tracepoint.
 
@@ -41,14 +43,12 @@ options should be enabled to use sched_ext:
     CONFIG_DEBUG_INFO_BTF=y
     CONFIG_BPF_JIT_ALWAYS_ON=y
     CONFIG_BPF_JIT_DEFAULT_ON=y
-    CONFIG_PAHOLE_HAS_SPLIT_BTF=y
-    CONFIG_PAHOLE_HAS_BTF_TAG=y
 
 sched_ext is used only when the BPF scheduler is loaded and running.
 
 If a task explicitly sets its scheduling policy to ``SCHED_EXT``, it will be
-treated as ``SCHED_NORMAL`` and scheduled by CFS until the BPF scheduler is
-loaded.
+treated as ``SCHED_NORMAL`` and scheduled by the fair-class scheduler until the
+BPF scheduler is loaded.
 
 When the BPF scheduler is loaded and ``SCX_OPS_SWITCH_PARTIAL`` is not set
 in ``ops->flags``, all ``SCHED_NORMAL``, ``SCHED_BATCH``, ``SCHED_IDLE``, and
@@ -57,11 +57,12 @@ in ``ops->flags``, all ``SCHED_NORMAL``, ``SCHED_BATCH``, ``SCHED_IDLE``, and
 However, when the BPF scheduler is loaded and ``SCX_OPS_SWITCH_PARTIAL`` is
 set in ``ops->flags``, only tasks with the ``SCHED_EXT`` policy are scheduled
 by sched_ext, while tasks with ``SCHED_NORMAL``, ``SCHED_BATCH`` and
-``SCHED_IDLE`` policies are scheduled by CFS.
+``SCHED_IDLE`` policies are scheduled by the fair-class scheduler which has
+higher sched_class precedence than ``SCHED_EXT``.
 
-Terminating the sched_ext scheduler program, triggering :kbd:`SysRq-S`, or
+Terminating the sched_ext scheduler program, triggering `SysRq-S`, or
 detection of any internal error including stalled runnable tasks aborts the
-BPF scheduler and reverts all tasks back to CFS.
+BPF scheduler and reverts all tasks back to the fair-class scheduler.
 
 .. code-block:: none
 
@@ -107,8 +108,7 @@ detailed information:
     nr_rejected   : 0
     enable_seq    : 1
 
-If ``CONFIG_SCHED_DEBUG`` is set, whether a given task is on sched_ext can
-be determined as follows:
+Whether a given task is on sched_ext can be determined as follows:
 
 .. code-block:: none
 
@@ -198,8 +198,8 @@ Dispatch Queues
 To match the impedance between the scheduler core and the BPF scheduler,
 sched_ext uses DSQs (dispatch queues) which can operate as both a FIFO and a
 priority queue. By default, there is one global FIFO (``SCX_DSQ_GLOBAL``),
-and one local dsq per CPU (``SCX_DSQ_LOCAL``). The BPF scheduler can manage
-an arbitrary number of dsq's using ``scx_bpf_create_dsq()`` and
+and one local DSQ per CPU (``SCX_DSQ_LOCAL``). The BPF scheduler can manage
+an arbitrary number of DSQs using ``scx_bpf_create_dsq()`` and
 ``scx_bpf_destroy_dsq()``.
 
 A CPU always executes a task from its local DSQ. A task is "inserted" into a
@@ -242,9 +242,9 @@ The following briefly shows how a waking task is scheduled and executed.
    task was inserted directly from ``ops.select_cpu()``). ``ops.enqueue()``
    can make one of the following decisions:
 
-   * Immediately insert the task into either the global or local DSQ by
-     calling ``scx_bpf_dsq_insert()`` with ``SCX_DSQ_GLOBAL`` or
-     ``SCX_DSQ_LOCAL``, respectively.
+   * Immediately insert the task into either the global or a local DSQ by
+     calling ``scx_bpf_dsq_insert()`` with one of the following options:
+     ``SCX_DSQ_GLOBAL``, ``SCX_DSQ_LOCAL``, or ``SCX_DSQ_LOCAL_ON | cpu``.
 
    * Immediately insert the task into a custom DSQ by calling
      ``scx_bpf_dsq_insert()`` with a DSQ ID which is smaller than 2^63.
@@ -294,6 +294,47 @@ dispatching, and must be dispatched to with ``scx_bpf_dsq_insert()``. See
 the function documentation and usage in ``tools/sched_ext/scx_simple.bpf.c``
 for more information.
 
+Task Lifecycle
+--------------
+
+The following pseudo-code summarizes the entire lifecycle of a task managed
+by a sched_ext scheduler:
+
+.. code-block:: c
+
+    ops.init_task();            /* A new task is created */
+    ops.enable();               /* Enable BPF scheduling for the task */
+
+    while (task in SCHED_EXT) {
+        if (task can migrate)
+            ops.select_cpu();   /* Called on wakeup (optimization) */
+
+        ops.runnable();         /* Task becomes ready to run */
+
+        while (task is runnable) {
+            if (task is not in a DSQ && task->scx.slice == 0) {
+                ops.enqueue();  /* Task can be added to a DSQ */
+
+                /* Any usable CPU becomes available */
+
+                ops.dispatch(); /* Task is moved to a local DSQ */
+            }
+            ops.running();      /* Task starts running on its assigned CPU */
+            while (task->scx.slice > 0 && task is runnable)
+                ops.tick();     /* Called every 1/HZ seconds */
+            ops.stopping();     /* Task stops running (time slice expires or wait) */
+
+            /* Task's CPU becomes available */
+
+            ops.dispatch();     /* task->scx.slice can be refilled */
+        }
+
+        ops.quiescent();        /* Task releases its assigned CPU (wait) */
+    }
+
+    ops.disable();              /* Disable BPF scheduling for the task */
+    ops.exit_task();            /* Task is destroyed */
+
 Where to Look
 =============
 
@@ -304,6 +345,8 @@ Where to Look
   The functions prefixed with ``scx_bpf_`` can be called from the BPF
   scheduler.
 
+* ``kernel/sched/ext_idle.c`` contains the built-in idle CPU selection policy.
+
 * ``tools/sched_ext/`` hosts example BPF scheduler implementations.
 
   * ``scx_simple[.bpf].c``: Minimal global FIFO scheduler example using a
@@ -312,13 +355,35 @@ Where to Look
   * ``scx_qmap[.bpf].c``: A multi-level FIFO scheduler supporting five
     levels of priority implemented with ``BPF_MAP_TYPE_QUEUE``.
 
+  * ``scx_central[.bpf].c``: A central FIFO scheduler where all scheduling
+    decisions are made on one CPU, demonstrating ``LOCAL_ON`` dispatching,
+    tickless operation, and kthread preemption.
+
+  * ``scx_cpu0[.bpf].c``: A scheduler that queues all tasks to a shared DSQ
+    and only dispatches them on CPU0 in FIFO order. Useful for testing bypass
+    behavior.
+
+  * ``scx_flatcg[.bpf].c``: A flattened cgroup hierarchy scheduler
+    implementing hierarchical weight-based cgroup CPU control by compounding
+    each cgroup's share at every level into a single flat scheduling layer.
+
+  * ``scx_pair[.bpf].c``: A core-scheduling example that always makes
+    sibling CPU pairs execute tasks from the same CPU cgroup.
+
+  * ``scx_sdt[.bpf].c``: A variation of ``scx_simple`` demonstrating BPF
+    arena memory management for per-task data.
+
+  * ``scx_userland[.bpf].c``: A minimal scheduler demonstrating user space
+    scheduling. Tasks with CPU affinity are direct-dispatched in FIFO order;
+    all others are scheduled in user space by a simple vruntime scheduler.
+
 ABI Instability
 ===============
 
 The APIs provided by sched_ext to BPF schedulers programs have no stability
 guarantees. This includes the ops table callbacks and constants defined in
 ``include/linux/sched/ext.h``, as well as the ``scx_bpf_`` kfuncs defined in
-``kernel/sched/ext.c``.
+``kernel/sched/ext.c`` and ``kernel/sched/ext_idle.c``.
 
 While we will attempt to provide a relatively stable API surface when
 possible, they are subject to change without warning between kernel

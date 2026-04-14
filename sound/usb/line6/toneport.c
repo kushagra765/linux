@@ -199,7 +199,7 @@ static int snd_toneport_source_info(struct snd_kcontrol *kcontrol,
 	if (uinfo->value.enumerated.item >= size)
 		uinfo->value.enumerated.item = size - 1;
 
-	strcpy(uinfo->value.enumerated.name,
+	strscpy(uinfo->value.enumerated.name,
 	       toneport_source_info[uinfo->value.enumerated.item].name);
 
 	return 0;
@@ -363,7 +363,7 @@ static int toneport_setup(struct usb_line6_toneport *toneport)
 	struct usb_line6 *line6 = &toneport->line6;
 	struct usb_device *usbdev = line6->usbdev;
 
-	ticks = kmalloc(sizeof(*ticks), GFP_KERNEL);
+	ticks = kmalloc_obj(*ticks);
 	if (!ticks)
 		return -ENOMEM;
 
@@ -386,7 +386,7 @@ static int toneport_setup(struct usb_line6_toneport *toneport)
 		toneport_update_led(toneport);
 
 	schedule_delayed_work(&toneport->line6.startup_work,
-			      msecs_to_jiffies(TONEPORT_PCM_DELAY * 1000));
+			      secs_to_jiffies(TONEPORT_PCM_DELAY));
 	return 0;
 }
 

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * Quick & dirty crypto testing module.
+ * Quick & dirty crypto benchmarking module.
  *
- * This will only exist until we have a better testing mechanism
+ * This will only exist until we have a better benchmarking mechanism
  * (e.g. a char device).
  *
  * Copyright (c) 2002 James Morris <jmorris@intercode.com.au>
@@ -39,7 +39,7 @@
 #include "tcrypt.h"
 
 /*
- * Need slab memory for testing (size in number of pages).
+ * Need slab memory for benchmarking (size in number of pages).
  */
 #define TVMEMSIZE	4
 
@@ -180,7 +180,7 @@ static int test_mb_aead_jiffies(struct test_mb_aead_data *data, int enc,
 	int ret = 0;
 	int *rc;
 
-	rc = kcalloc(num_mb, sizeof(*rc), GFP_KERNEL);
+	rc = kzalloc_objs(*rc, num_mb);
 	if (!rc)
 		return -ENOMEM;
 
@@ -207,7 +207,7 @@ static int test_mb_aead_cycles(struct test_mb_aead_data *data, int enc,
 	int i;
 	int *rc;
 
-	rc = kcalloc(num_mb, sizeof(*rc), GFP_KERNEL);
+	rc = kzalloc_objs(*rc, num_mb);
 	if (!rc)
 		return -ENOMEM;
 
@@ -270,7 +270,7 @@ static void test_mb_aead_speed(const char *algo, int enc, int secs,
 	else
 		e = "decryption";
 
-	data = kcalloc(num_mb, sizeof(*data), GFP_KERNEL);
+	data = kzalloc_objs(*data, num_mb);
 	if (!data)
 		goto out_free_iv;
 
@@ -997,7 +997,7 @@ static int test_mb_acipher_jiffies(struct test_mb_skcipher_data *data, int enc,
 	int ret = 0;
 	int *rc;
 
-	rc = kcalloc(num_mb, sizeof(*rc), GFP_KERNEL);
+	rc = kzalloc_objs(*rc, num_mb);
 	if (!rc)
 		return -ENOMEM;
 
@@ -1024,7 +1024,7 @@ static int test_mb_acipher_cycles(struct test_mb_skcipher_data *data, int enc,
 	int i;
 	int *rc;
 
-	rc = kcalloc(num_mb, sizeof(*rc), GFP_KERNEL);
+	rc = kzalloc_objs(*rc, num_mb);
 	if (!rc)
 		return -ENOMEM;
 
@@ -1075,7 +1075,7 @@ static void test_mb_skcipher_speed(const char *algo, int enc, int secs,
 	else
 		e = "decryption";
 
-	data = kcalloc(num_mb, sizeof(*data), GFP_KERNEL);
+	data = kzalloc_objs(*data, num_mb);
 	if (!data)
 		return;
 
@@ -1650,14 +1650,6 @@ static int do_test(const char *alg, u32 type, u32 mask, int m, u32 num_mb)
 		ret = min(ret, tcrypt_test("rfc4309(ccm(aes))"));
 		break;
 
-	case 46:
-		ret = min(ret, tcrypt_test("ghash"));
-		break;
-
-	case 47:
-		ret = min(ret, tcrypt_test("crct10dif"));
-		break;
-
 	case 48:
 		ret = min(ret, tcrypt_test("sha3-224"));
 		break;
@@ -1692,10 +1684,6 @@ static int do_test(const char *alg, u32 type, u32 mask, int m, u32 num_mb)
 
 	case 56:
 		ret = min(ret, tcrypt_test("ccm(sm4)"));
-		break;
-
-	case 57:
-		ret = min(ret, tcrypt_test("polyval"));
 		break;
 
 	case 58:
@@ -1738,10 +1726,6 @@ static int do_test(const char *alg, u32 type, u32 mask, int m, u32 num_mb)
 		ret = min(ret, tcrypt_test("hmac(rmd160)"));
 		break;
 
-	case 109:
-		ret = min(ret, tcrypt_test("vmac64(aes)"));
-		break;
-
 	case 111:
 		ret = min(ret, tcrypt_test("hmac(sha3-224)"));
 		break;
@@ -1764,10 +1748,6 @@ static int do_test(const char *alg, u32 type, u32 mask, int m, u32 num_mb)
 
 	case 116:
 		ret = min(ret, tcrypt_test("hmac(streebog512)"));
-		break;
-
-	case 150:
-		ret = min(ret, tcrypt_test("ansi_cprng"));
 		break;
 
 	case 151:
@@ -2267,21 +2247,8 @@ static int do_test(const char *alg, u32 type, u32 mask, int m, u32 num_mb)
 		test_hash_speed("blake2b-512", sec, generic_hash_speed_template);
 		if (mode > 300 && mode < 400) break;
 		fallthrough;
-	case 318:
-		klen = 16;
-		test_hash_speed("ghash", sec, generic_hash_speed_template);
-		if (mode > 300 && mode < 400) break;
-		fallthrough;
 	case 319:
 		test_hash_speed("crc32c", sec, generic_hash_speed_template);
-		if (mode > 300 && mode < 400) break;
-		fallthrough;
-	case 320:
-		test_hash_speed("crct10dif", sec, generic_hash_speed_template);
-		if (mode > 300 && mode < 400) break;
-		fallthrough;
-	case 321:
-		test_hash_speed("poly1305", sec, poly1305_speed_template);
 		if (mode > 300 && mode < 400) break;
 		fallthrough;
 	case 322:
@@ -2880,5 +2847,5 @@ module_param(klen, uint, 0);
 MODULE_PARM_DESC(klen, "Key length (defaults to 0)");
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Quick & dirty crypto testing module");
+MODULE_DESCRIPTION("Quick & dirty crypto benchmarking module");
 MODULE_AUTHOR("James Morris <jmorris@intercode.com.au>");

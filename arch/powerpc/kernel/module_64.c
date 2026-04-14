@@ -209,8 +209,7 @@ static unsigned long get_stubs_size(const Elf64_Ehdr *hdr,
 				    char *secstrings,
 				    struct module *me)
 {
-	/* One extra reloc so it's always 0-addr terminated */
-	unsigned long relocs = 1;
+	unsigned long relocs = 0;
 	unsigned i;
 
 	/* Every relocated section... */
@@ -257,10 +256,6 @@ static unsigned long get_stubs_size(const Elf64_Ehdr *hdr,
 				  sizeof(struct ppc64_stub_entry);
 			break;
 		}
-	}
-	if (i == hdr->e_shnum) {
-		pr_err("%s: doesn't contain __patchable_function_entries.\n", me->name);
-		return -ENOEXEC;
 	}
 #endif
 
@@ -369,6 +364,24 @@ static void dedotify_versions(struct modversion_info *vers,
 		}
 }
 
+/* Same as normal versions, remove a leading dot if present. */
+static void dedotify_ext_version_names(char *str_seq, unsigned long size)
+{
+	unsigned long out = 0;
+	unsigned long in;
+	char last = '\0';
+
+	for (in = 0; in < size; in++) {
+		/* Skip one leading dot */
+		if (last == '\0' && str_seq[in] == '.')
+			in++;
+		last = str_seq[in];
+		str_seq[out++] = last;
+	}
+	/* Zero the trailing portion of the names table for robustness */
+	memset(&str_seq[out], 0, size - out);
+}
+
 /*
  * Undefined symbols which refer to .funcname, hack to funcname. Make .TOC.
  * seem to be defined (value set later).
@@ -438,10 +451,12 @@ int module_frob_arch_sections(Elf64_Ehdr *hdr,
 			me->arch.toc_section = i;
 			if (sechdrs[i].sh_addralign < 8)
 				sechdrs[i].sh_addralign = 8;
-		}
-		else if (strcmp(secstrings+sechdrs[i].sh_name,"__versions")==0)
+		} else if (strcmp(secstrings + sechdrs[i].sh_name, "__versions") == 0)
 			dedotify_versions((void *)hdr + sechdrs[i].sh_offset,
 					  sechdrs[i].sh_size);
+		else if (strcmp(secstrings + sechdrs[i].sh_name, "__version_ext_names") == 0)
+			dedotify_ext_version_names((void *)hdr + sechdrs[i].sh_offset,
+						   sechdrs[i].sh_size);
 
 		if (sechdrs[i].sh_type == SHT_SYMTAB)
 			dedotify((void *)hdr + sechdrs[i].sh_offset,
@@ -689,7 +704,7 @@ static unsigned long stub_for_addr(const Elf64_Shdr *sechdrs,
 
 	/* Find this stub, or if that fails, the next avail. entry */
 	stubs = (void *)sechdrs[me->arch.stubs_section].sh_addr;
-	for (i = 0; stub_func_addr(stubs[i].funcdata); i++) {
+	for (i = 0; i < me->arch.stub_count; i++) {
 		if (WARN_ON(i >= num_stubs))
 			return 0;
 
@@ -700,6 +715,7 @@ static unsigned long stub_for_addr(const Elf64_Shdr *sechdrs,
 	if (!create_stub(sechdrs, &stubs[i], addr, me, name))
 		return 0;
 
+	me->arch.stub_count++;
 	return (unsigned long)&stubs[i];
 }
 
@@ -1102,29 +1118,19 @@ int module_trampoline_target(struct module *mod, unsigned long addr,
 static int setup_ftrace_ool_stubs(const Elf64_Shdr *sechdrs, unsigned long addr, struct module *me)
 {
 #ifdef CONFIG_PPC_FTRACE_OUT_OF_LINE
-	unsigned int i, total_stubs, num_stubs;
+	unsigned int total_stubs, num_stubs;
 	struct ppc64_stub_entry *stub;
 
 	total_stubs = sechdrs[me->arch.stubs_section].sh_size / sizeof(*stub);
 	num_stubs = roundup(me->arch.ool_stub_count * sizeof(struct ftrace_ool_stub),
 			    sizeof(struct ppc64_stub_entry)) / sizeof(struct ppc64_stub_entry);
 
-	/* Find the next available entry */
-	stub = (void *)sechdrs[me->arch.stubs_section].sh_addr;
-	for (i = 0; stub_func_addr(stub[i].funcdata); i++)
-		if (WARN_ON(i >= total_stubs))
-			return -1;
-
-	if (WARN_ON(i + num_stubs > total_stubs))
+	if (WARN_ON(me->arch.stub_count + num_stubs > total_stubs))
 		return -1;
 
-	stub += i;
-	me->arch.ool_stubs = (struct ftrace_ool_stub *)stub;
-
-	/* reserve stubs */
-	for (i = 0; i < num_stubs; i++)
-		if (patch_u32((void *)&stub->funcdata, PPC_RAW_NOP()))
-			return -1;
+	stub = (void *)sechdrs[me->arch.stubs_section].sh_addr;
+	me->arch.ool_stubs = (struct ftrace_ool_stub *)(stub + me->arch.stub_count);
+	me->arch.stub_count += num_stubs;
 #endif
 
 	return 0;

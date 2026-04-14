@@ -461,6 +461,7 @@ const char *reg_type_str(struct bpf_verifier_env *env, enum bpf_reg_type type)
 		[PTR_TO_ARENA]		= "arena",
 		[PTR_TO_BUF]		= "buf",
 		[PTR_TO_FUNC]		= "func",
+		[PTR_TO_INSN]		= "insn",
 		[PTR_TO_MAP_KEY]	= "map_key",
 		[CONST_PTR_TO_DYNPTR]	= "dynptr_ptr",
 	};
@@ -498,6 +499,10 @@ const char *dynptr_type_str(enum bpf_dynptr_type type)
 		return "skb";
 	case BPF_DYNPTR_TYPE_XDP:
 		return "xdp";
+	case BPF_DYNPTR_TYPE_SKB_META:
+		return "skb_meta";
+	case BPF_DYNPTR_TYPE_FILE:
+		return "file";
 	case BPF_DYNPTR_TYPE_INVALID:
 		return "<invalid>";
 	default:
@@ -537,20 +542,8 @@ static char slot_type_char[] = {
 	[STACK_ZERO]	= '0',
 	[STACK_DYNPTR]	= 'd',
 	[STACK_ITER]	= 'i',
+	[STACK_IRQ_FLAG] = 'f'
 };
-
-static void print_liveness(struct bpf_verifier_env *env,
-			   enum bpf_reg_liveness live)
-{
-	if (live & (REG_LIVE_READ | REG_LIVE_WRITTEN | REG_LIVE_DONE))
-	    verbose(env, "_");
-	if (live & REG_LIVE_READ)
-		verbose(env, "r");
-	if (live & REG_LIVE_WRITTEN)
-		verbose(env, "w");
-	if (live & REG_LIVE_DONE)
-		verbose(env, "D");
-}
 
 #define UNUM_MAX_DECIMAL U16_MAX
 #define SNUM_MAX_DECIMAL S16_MAX
@@ -753,9 +746,10 @@ static void print_reg_state(struct bpf_verifier_env *env,
 	verbose(env, ")");
 }
 
-void print_verifier_state(struct bpf_verifier_env *env, const struct bpf_func_state *state,
-			  bool print_all)
+void print_verifier_state(struct bpf_verifier_env *env, const struct bpf_verifier_state *vstate,
+			  u32 frameno, bool print_all)
 {
+	const struct bpf_func_state *state = vstate->frame[frameno];
 	const struct bpf_reg_state *reg;
 	int i;
 
@@ -768,7 +762,6 @@ void print_verifier_state(struct bpf_verifier_env *env, const struct bpf_func_st
 		if (!print_all && !reg_scratched(env, i))
 			continue;
 		verbose(env, " R%d", i);
-		print_liveness(env, reg->live);
 		verbose(env, "=");
 		print_reg_state(env, state, reg);
 	}
@@ -801,9 +794,7 @@ void print_verifier_state(struct bpf_verifier_env *env, const struct bpf_func_st
 					break;
 			types_buf[j] = '\0';
 
-			verbose(env, " fp%d", (-i - 1) * BPF_REG_SIZE);
-			print_liveness(env, reg->live);
-			verbose(env, "=%s", types_buf);
+			verbose(env, " fp%d=%s", (-i - 1) * BPF_REG_SIZE, types_buf);
 			print_reg_state(env, state, reg);
 			break;
 		case STACK_DYNPTR:
@@ -812,7 +803,6 @@ void print_verifier_state(struct bpf_verifier_env *env, const struct bpf_func_st
 			reg = &state->stack[i].spilled_ptr;
 
 			verbose(env, " fp%d", (-i - 1) * BPF_REG_SIZE);
-			print_liveness(env, reg->live);
 			verbose(env, "=dynptr_%s(", dynptr_type_str(reg->dynptr.type));
 			if (reg->id)
 				verbose_a("id=%d", reg->id);
@@ -827,9 +817,8 @@ void print_verifier_state(struct bpf_verifier_env *env, const struct bpf_func_st
 			if (!reg->ref_obj_id)
 				continue;
 
-			verbose(env, " fp%d", (-i - 1) * BPF_REG_SIZE);
-			print_liveness(env, reg->live);
-			verbose(env, "=iter_%s(ref_id=%d,state=%s,depth=%u)",
+			verbose(env, " fp%d=iter_%s(ref_id=%d,state=%s,depth=%u)",
+				(-i - 1) * BPF_REG_SIZE,
 				iter_type_str(reg->iter.btf, reg->iter.btf_id),
 				reg->ref_obj_id, iter_state_str(reg->iter.state),
 				reg->iter.depth);
@@ -837,17 +826,15 @@ void print_verifier_state(struct bpf_verifier_env *env, const struct bpf_func_st
 		case STACK_MISC:
 		case STACK_ZERO:
 		default:
-			verbose(env, " fp%d", (-i - 1) * BPF_REG_SIZE);
-			print_liveness(env, reg->live);
-			verbose(env, "=%s", types_buf);
+			verbose(env, " fp%d=%s", (-i - 1) * BPF_REG_SIZE, types_buf);
 			break;
 		}
 	}
-	if (state->acquired_refs && state->refs[0].id) {
-		verbose(env, " refs=%d", state->refs[0].id);
-		for (i = 1; i < state->acquired_refs; i++)
-			if (state->refs[i].id)
-				verbose(env, ",%d", state->refs[i].id);
+	if (vstate->acquired_refs && vstate->refs[0].id) {
+		verbose(env, " refs=%d", vstate->refs[0].id);
+		for (i = 1; i < vstate->acquired_refs; i++)
+			if (vstate->refs[i].id)
+				verbose(env, ",%d", vstate->refs[i].id);
 	}
 	if (state->in_callback_fn)
 		verbose(env, " cb");
@@ -864,7 +851,8 @@ static inline u32 vlog_alignment(u32 pos)
 			BPF_LOG_MIN_ALIGNMENT) - pos - 1;
 }
 
-void print_insn_state(struct bpf_verifier_env *env, const struct bpf_func_state *state)
+void print_insn_state(struct bpf_verifier_env *env, const struct bpf_verifier_state *vstate,
+		      u32 frameno)
 {
 	if (env->prev_log_pos && env->prev_log_pos == env->log.end_pos) {
 		/* remove new line character */
@@ -873,5 +861,5 @@ void print_insn_state(struct bpf_verifier_env *env, const struct bpf_func_state 
 	} else {
 		verbose(env, "%d:", env->insn_idx);
 	}
-	print_verifier_state(env, state, false);
+	print_verifier_state(env, vstate, frameno, false);
 }

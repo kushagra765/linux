@@ -374,11 +374,8 @@ int cpsw_ethtool_op_begin(struct net_device *ndev)
 void cpsw_ethtool_op_complete(struct net_device *ndev)
 {
 	struct cpsw_priv *priv = netdev_priv(ndev);
-	int ret;
 
-	ret = pm_runtime_put(priv->cpsw->dev);
-	if (ret < 0)
-		cpsw_err(priv, drv, "ethtool complete failed %d\n", ret);
+	pm_runtime_put(priv->cpsw->dev);
 }
 
 void cpsw_get_channels(struct net_device *ndev, struct ethtool_channels *ch)
@@ -430,18 +427,6 @@ int cpsw_get_eee(struct net_device *ndev, struct ethtool_keee *edata)
 
 	if (cpsw->slaves[slave_no].phy)
 		return phy_ethtool_get_eee(cpsw->slaves[slave_no].phy, edata);
-	else
-		return -EOPNOTSUPP;
-}
-
-int cpsw_set_eee(struct net_device *ndev, struct ethtool_keee *edata)
-{
-	struct cpsw_priv *priv = netdev_priv(ndev);
-	struct cpsw_common *cpsw = priv->cpsw;
-	int slave_no = cpsw_slave_index(cpsw, priv);
-
-	if (cpsw->slaves[slave_no].phy)
-		return phy_ethtool_set_eee(cpsw->slaves[slave_no].phy, edata);
 	else
 		return -EOPNOTSUPP;
 }

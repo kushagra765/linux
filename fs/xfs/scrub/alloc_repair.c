@@ -3,7 +3,7 @@
  * Copyright (C) 2018-2023 Oracle.  All Rights Reserved.
  * Author: Darrick J. Wong <djwong@kernel.org>
  */
-#include "xfs.h"
+#include "xfs_platform.h"
 #include "xfs_fs.h"
 #include "xfs_shared.h"
 #include "xfs_format.h"
@@ -542,8 +542,9 @@ xrep_abt_dispose_one(
 
 	/* Add a deferred rmap for each extent we used. */
 	if (resv->used > 0)
-		xfs_rmap_alloc_extent(sc->tp, pag_agno(pag), resv->agbno,
-				resv->used, XFS_RMAP_OWN_AG);
+		xfs_rmap_alloc_extent(sc->tp, false,
+				xfs_agbno_to_fsb(pag, resv->agbno), resv->used,
+				XFS_RMAP_OWN_AG);
 
 	/*
 	 * For each reserved btree block we didn't use, add it to the free
@@ -849,14 +850,13 @@ xrep_allocbt(
 	struct xrep_abt		*ra;
 	struct xfs_mount	*mp = sc->mp;
 	unsigned int		busy_gen;
-	char			*descr;
 	int			error;
 
 	/* We require the rmapbt to rebuild anything. */
 	if (!xfs_has_rmapbt(mp))
 		return -EOPNOTSUPP;
 
-	ra = kzalloc(sizeof(struct xrep_abt), XCHK_GFP_FLAGS);
+	ra = kzalloc_obj(struct xrep_abt, XCHK_GFP_FLAGS);
 	if (!ra)
 		return -ENOMEM;
 	ra->sc = sc;
@@ -875,11 +875,9 @@ xrep_allocbt(
 	}
 
 	/* Set up enough storage to handle maximally fragmented free space. */
-	descr = xchk_xfile_ag_descr(sc, "free space records");
-	error = xfarray_create(descr, mp->m_sb.sb_agblocks / 2,
+	error = xfarray_create("free space records", mp->m_sb.sb_agblocks / 2,
 			sizeof(struct xfs_alloc_rec_incore),
 			&ra->free_records);
-	kfree(descr);
 	if (error)
 		goto out_ra;
 
@@ -925,7 +923,22 @@ xrep_revalidate_allocbt(
 	if (error)
 		goto out;
 
+	/*
+	 * If the bnobt is still corrupt, we've failed to repair the filesystem
+	 * and should just bail out.
+	 *
+	 * If the bnobt fails cross-examination with the cntbt, the scan will
+	 * free the cntbt cursor, so we need to mark the repair incomplete
+	 * and avoid walking off the end of the NULL cntbt cursor.
+	 */
+	if (sc->sm->sm_flags & XFS_SCRUB_OFLAG_CORRUPT)
+		goto out;
+
 	sc->sm->sm_type = XFS_SCRUB_TYPE_CNTBT;
+	if (!sc->sa.cnt_cur) {
+		xchk_set_incomplete(sc);
+		goto out;
+	}
 	error = xchk_allocbt(sc);
 out:
 	sc->sm->sm_type = old_type;

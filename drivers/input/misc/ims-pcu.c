@@ -286,7 +286,7 @@ static int ims_pcu_setup_gamepad(struct ims_pcu *pcu)
 	struct input_dev *input;
 	int error;
 
-	gamepad = kzalloc(sizeof(*gamepad), GFP_KERNEL);
+	gamepad = kzalloc_obj(*gamepad);
 	input = input_allocate_device();
 	if (!gamepad || !input) {
 		dev_err(pcu->dev,
@@ -843,6 +843,12 @@ static int ims_pcu_flash_firmware(struct ims_pcu *pcu,
 		 */
 		addr = be32_to_cpu(rec->addr) / 2;
 		len = be16_to_cpu(rec->len);
+
+		if (len > sizeof(pcu->cmd_buf) - 1 - sizeof(*fragment)) {
+			dev_err(pcu->dev,
+				"Invalid record length in firmware: %d\n", len);
+			return -EINVAL;
+		}
 
 		fragment = (void *)&pcu->cmd_buf[1];
 		put_unaligned_le32(addr, &fragment->addr);
@@ -1985,7 +1991,7 @@ static int ims_pcu_probe(struct usb_interface *intf,
 	struct ims_pcu *pcu;
 	int error;
 
-	pcu = kzalloc(sizeof(*pcu), GFP_KERNEL);
+	pcu = kzalloc_obj(*pcu);
 	if (!pcu)
 		return -ENOMEM;
 

@@ -251,6 +251,8 @@ static bool gscps2_report_data(struct gscps2port *ps2port)
 
 /**
  * gscps2_interrupt() - Interruption service routine
+ * @irq: interrupt number which triggered (unused)
+ * @dev: device pointer (unused)
  *
  * This function reads received PS/2 bytes and processes them on
  * all interfaces.
@@ -329,6 +331,8 @@ static void gscps2_close(struct serio *port)
 
 /**
  * gscps2_probe() - Probes PS2 devices
+ * @dev: pointer to parisc_device struct which will be probed
+ *
  * @return: success/error report
  */
 
@@ -346,8 +350,8 @@ static int __init gscps2_probe(struct parisc_device *dev)
 	if (dev->id.sversion == 0x96)
 		hpa += GSC_DINO_OFFSET;
 
-	ps2port = kzalloc(sizeof(*ps2port), GFP_KERNEL);
-	serio = kzalloc(sizeof(*serio), GFP_KERNEL);
+	ps2port = kzalloc_obj(*ps2port);
+	serio = kzalloc_obj(*serio);
 	if (!ps2port || !serio) {
 		ret = -ENOMEM;
 		goto fail_nomem;
@@ -420,6 +424,8 @@ fail_nomem:
 
 /**
  * gscps2_remove() - Removes PS2 devices
+ * @dev: pointer to parisc_device which shall be removed
+ *
  * @return: success/error report
  */
 

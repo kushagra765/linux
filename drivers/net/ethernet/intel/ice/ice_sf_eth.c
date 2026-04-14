@@ -5,8 +5,8 @@
 #include "ice_txrx.h"
 #include "ice_fltr.h"
 #include "ice_sf_eth.h"
-#include "devlink/devlink_port.h"
 #include "devlink/devlink.h"
+#include "devlink/port.h"
 
 static const struct net_device_ops ice_sf_netdev_ops = {
 	.ndo_open = ice_open,
@@ -273,7 +273,7 @@ ice_sf_eth_activate(struct ice_dynamic_port *dyn_port,
 		return err;
 	}
 
-	sf_dev = kzalloc(sizeof(*sf_dev), GFP_KERNEL);
+	sf_dev = kzalloc_obj(*sf_dev);
 	if (!sf_dev) {
 		err = -ENOMEM;
 		NL_SET_ERR_MSG_MOD(extack, "Could not allocate SF memory");

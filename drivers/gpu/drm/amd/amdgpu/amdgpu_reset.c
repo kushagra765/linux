@@ -183,6 +183,7 @@ int amdgpu_reset_init(struct amdgpu_device *adev)
 	switch (amdgpu_ip_version(adev, MP1_HWIP, 0)) {
 	case IP_VERSION(13, 0, 2):
 	case IP_VERSION(13, 0, 6):
+	case IP_VERSION(13, 0, 12):
 	case IP_VERSION(13, 0, 14):
 		ret = aldebaran_reset_init(adev);
 		break;
@@ -206,6 +207,7 @@ int amdgpu_reset_fini(struct amdgpu_device *adev)
 	switch (amdgpu_ip_version(adev, MP1_HWIP, 0)) {
 	case IP_VERSION(13, 0, 2):
 	case IP_VERSION(13, 0, 6):
+	case IP_VERSION(13, 0, 12):
 	case IP_VERSION(13, 0, 14):
 		ret = aldebaran_reset_fini(adev);
 		break;
@@ -274,7 +276,7 @@ struct amdgpu_reset_domain *amdgpu_reset_create_reset_domain(enum amdgpu_reset_d
 {
 	struct amdgpu_reset_domain *reset_domain;
 
-	reset_domain = kvzalloc(sizeof(struct amdgpu_reset_domain), GFP_KERNEL);
+	reset_domain = kvzalloc_obj(struct amdgpu_reset_domain);
 	if (!reset_domain) {
 		DRM_ERROR("Failed to allocate amdgpu_reset_domain!");
 		return NULL;
@@ -337,6 +339,9 @@ void amdgpu_reset_get_desc(struct amdgpu_reset_context *rst_ctxt, char *buf,
 		break;
 	case AMDGPU_RESET_SRC_USER:
 		strscpy(buf, "user trigger", len);
+		break;
+	case AMDGPU_RESET_SRC_USERQ:
+		strscpy(buf, "user queue trigger", len);
 		break;
 	default:
 		strscpy(buf, "unknown", len);

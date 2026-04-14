@@ -1569,8 +1569,6 @@ DEFINE_OCFS2_ULL_ULL_UINT_EVENT(ocfs2_delete_inode);
 
 DEFINE_OCFS2_ULL_UINT_EVENT(ocfs2_clear_inode);
 
-DEFINE_OCFS2_ULL_UINT_UINT_EVENT(ocfs2_drop_inode);
-
 TRACE_EVENT(ocfs2_inode_revalidate,
 	TP_PROTO(void *inode, unsigned long long ino,
 		 unsigned int flags),
@@ -1658,34 +1656,34 @@ TRACE_EVENT(ocfs2_remount,
 );
 
 TRACE_EVENT(ocfs2_fill_super,
-	TP_PROTO(void *sb, void *data, int silent),
-	TP_ARGS(sb, data, silent),
+	TP_PROTO(void *sb, void *fc, int silent),
+	TP_ARGS(sb, fc, silent),
 	TP_STRUCT__entry(
 		__field(void *, sb)
-		__field(void *, data)
+		__field(void *, fc)
 		__field(int, silent)
 	),
 	TP_fast_assign(
 		__entry->sb = sb;
-		__entry->data = data;
+		__entry->fc = fc;
 		__entry->silent = silent;
 	),
 	TP_printk("%p %p %d", __entry->sb,
-		  __entry->data, __entry->silent)
+		  __entry->fc, __entry->silent)
 );
 
 TRACE_EVENT(ocfs2_parse_options,
-	TP_PROTO(int is_remount, char *options),
-	TP_ARGS(is_remount, options),
+	TP_PROTO(int is_remount, const char *option),
+	TP_ARGS(is_remount, option),
 	TP_STRUCT__entry(
 		__field(int, is_remount)
-		__string(options, options)
+		__string(option, option)
 	),
 	TP_fast_assign(
 		__entry->is_remount = is_remount;
-		__assign_str(options);
+		__assign_str(option);
 	),
-	TP_printk("%d %s", __entry->is_remount, __get_str(options))
+	TP_printk("%d %s", __entry->is_remount, __get_str(option))
 );
 
 DEFINE_OCFS2_POINTER_EVENT(ocfs2_put_super);

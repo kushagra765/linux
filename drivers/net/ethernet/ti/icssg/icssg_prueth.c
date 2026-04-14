@@ -47,8 +47,13 @@
 						 NETIF_F_HW_HSR_TAG_INS | \
 						 NETIF_F_HW_HSR_TAG_RM)
 
+#define PRUETH_RX_DMA_ATTR			(DMA_ATTR_SKIP_CPU_SYNC |\
+						 DMA_ATTR_WEAK_ORDERING)
+
 /* CTRLMMR_ICSSG_RGMII_CTRL register bits */
 #define ICSSG_CTRL_RGMII_ID_MODE                BIT(24)
+
+static void emac_adjust_link(struct net_device *ndev);
 
 static int emac_get_tx_ts(struct prueth_emac *emac,
 			  struct emac_tx_ts_response *rsp)
@@ -125,99 +130,204 @@ static irqreturn_t prueth_tx_ts_irq(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
-static struct icssg_firmwares icssg_hsr_firmwares[] = {
-	{
-		.pru = "ti-pruss/am65x-sr2-pru0-pruhsr-fw.elf",
-		.rtu = "ti-pruss/am65x-sr2-rtu0-pruhsr-fw.elf",
-		.txpru = "ti-pruss/am65x-sr2-txpru0-pruhsr-fw.elf",
-	},
-	{
-		.pru = "ti-pruss/am65x-sr2-pru1-pruhsr-fw.elf",
-		.rtu = "ti-pruss/am65x-sr2-rtu1-pruhsr-fw.elf",
-		.txpru = "ti-pruss/am65x-sr2-txpru1-pruhsr-fw.elf",
-	}
-};
+static int prueth_start(struct rproc *rproc, const char *fw_name)
+{
+	int ret;
 
-static struct icssg_firmwares icssg_switch_firmwares[] = {
-	{
-		.pru = "ti-pruss/am65x-sr2-pru0-prusw-fw.elf",
-		.rtu = "ti-pruss/am65x-sr2-rtu0-prusw-fw.elf",
-		.txpru = "ti-pruss/am65x-sr2-txpru0-prusw-fw.elf",
-	},
-	{
-		.pru = "ti-pruss/am65x-sr2-pru1-prusw-fw.elf",
-		.rtu = "ti-pruss/am65x-sr2-rtu1-prusw-fw.elf",
-		.txpru = "ti-pruss/am65x-sr2-txpru1-prusw-fw.elf",
-	}
-};
+	ret = rproc_set_firmware(rproc, fw_name);
+	if (ret)
+		return ret;
+	return rproc_boot(rproc);
+}
 
-static struct icssg_firmwares icssg_emac_firmwares[] = {
-	{
-		.pru = "ti-pruss/am65x-sr2-pru0-prueth-fw.elf",
-		.rtu = "ti-pruss/am65x-sr2-rtu0-prueth-fw.elf",
-		.txpru = "ti-pruss/am65x-sr2-txpru0-prueth-fw.elf",
-	},
-	{
-		.pru = "ti-pruss/am65x-sr2-pru1-prueth-fw.elf",
-		.rtu = "ti-pruss/am65x-sr2-rtu1-prueth-fw.elf",
-		.txpru = "ti-pruss/am65x-sr2-txpru1-prueth-fw.elf",
-	}
-};
+static void prueth_shutdown(struct rproc *rproc)
+{
+	rproc_shutdown(rproc);
+}
 
-static int prueth_emac_start(struct prueth *prueth, struct prueth_emac *emac)
+static int prueth_emac_start(struct prueth *prueth)
 {
 	struct icssg_firmwares *firmwares;
 	struct device *dev = prueth->dev;
-	int slice, ret;
+	int ret, slice;
 
 	if (prueth->is_switch_mode)
-		firmwares = icssg_switch_firmwares;
-	else if (prueth->is_hsr_offload_mode)
-		firmwares = icssg_hsr_firmwares;
+		firmwares = prueth->icssg_switch_firmwares;
+	else if (prueth->is_hsr_offload_mode && HSR_V1 == prueth->hsr_prp_version)
+		firmwares = prueth->icssg_hsr_firmwares;
+	else if (prueth->is_hsr_offload_mode && PRP_V1 == prueth->hsr_prp_version)
+		firmwares = prueth->icssg_prp_firmwares;
 	else
-		firmwares = icssg_emac_firmwares;
+		firmwares = prueth->icssg_emac_firmwares;
 
-	slice = prueth_emac_slice(emac);
-	if (slice < 0) {
-		netdev_err(emac->ndev, "invalid port\n");
-		return -EINVAL;
+	for (slice = 0; slice < PRUETH_NUM_MACS; slice++) {
+		ret = prueth_start(prueth->pru[slice], firmwares[slice].pru);
+		if (ret) {
+			dev_err(dev, "failed to boot PRU%d: %d\n", slice, ret);
+			goto unwind_slices;
+		}
+
+		ret = prueth_start(prueth->rtu[slice], firmwares[slice].rtu);
+		if (ret) {
+			dev_err(dev, "failed to boot RTU%d: %d\n", slice, ret);
+			rproc_shutdown(prueth->pru[slice]);
+			goto unwind_slices;
+		}
+
+		ret = prueth_start(prueth->txpru[slice], firmwares[slice].txpru);
+		if (ret) {
+			dev_err(dev, "failed to boot TX_PRU%d: %d\n", slice, ret);
+			rproc_shutdown(prueth->rtu[slice]);
+			rproc_shutdown(prueth->pru[slice]);
+			goto unwind_slices;
+		}
 	}
 
-	ret = icssg_config(prueth, emac, slice);
-	if (ret)
-		return ret;
-
-	ret = rproc_set_firmware(prueth->pru[slice], firmwares[slice].pru);
-	ret = rproc_boot(prueth->pru[slice]);
-	if (ret) {
-		dev_err(dev, "failed to boot PRU%d: %d\n", slice, ret);
-		return -EINVAL;
-	}
-
-	ret = rproc_set_firmware(prueth->rtu[slice], firmwares[slice].rtu);
-	ret = rproc_boot(prueth->rtu[slice]);
-	if (ret) {
-		dev_err(dev, "failed to boot RTU%d: %d\n", slice, ret);
-		goto halt_pru;
-	}
-
-	ret = rproc_set_firmware(prueth->txpru[slice], firmwares[slice].txpru);
-	ret = rproc_boot(prueth->txpru[slice]);
-	if (ret) {
-		dev_err(dev, "failed to boot TX_PRU%d: %d\n", slice, ret);
-		goto halt_rtu;
-	}
-
-	emac->fw_running = 1;
 	return 0;
 
-halt_rtu:
-	rproc_shutdown(prueth->rtu[slice]);
-
-halt_pru:
-	rproc_shutdown(prueth->pru[slice]);
+unwind_slices:
+	while (--slice >= 0) {
+		prueth_shutdown(prueth->txpru[slice]);
+		prueth_shutdown(prueth->rtu[slice]);
+		prueth_shutdown(prueth->pru[slice]);
+	}
 
 	return ret;
+}
+
+static void prueth_emac_stop(struct prueth *prueth)
+{
+	int slice;
+
+	for (slice = 0; slice < PRUETH_NUM_MACS; slice++) {
+		prueth_shutdown(prueth->txpru[slice]);
+		prueth_shutdown(prueth->rtu[slice]);
+		prueth_shutdown(prueth->pru[slice]);
+	}
+}
+
+static void icssg_enable_fw_offload(struct prueth *prueth)
+{
+	struct prueth_emac *emac;
+	int mac;
+
+	for (mac = PRUETH_MAC0; mac < PRUETH_NUM_MACS; mac++) {
+		emac = prueth->emac[mac];
+		if (prueth->is_hsr_offload_mode) {
+			if (emac->ndev->features & NETIF_F_HW_HSR_TAG_RM)
+				icssg_set_port_state(emac, ICSSG_EMAC_HSR_RX_OFFLOAD_ENABLE);
+			else
+				icssg_set_port_state(emac, ICSSG_EMAC_HSR_RX_OFFLOAD_DISABLE);
+		}
+
+		if (prueth->is_switch_mode || prueth->is_hsr_offload_mode) {
+			if (netif_running(emac->ndev)) {
+				icssg_fdb_add_del(emac, eth_stp_addr, prueth->default_vlan,
+						  ICSSG_FDB_ENTRY_P0_MEMBERSHIP |
+						  ICSSG_FDB_ENTRY_P1_MEMBERSHIP |
+						  ICSSG_FDB_ENTRY_P2_MEMBERSHIP |
+						  ICSSG_FDB_ENTRY_BLOCK,
+						  true);
+				icssg_vtbl_modify(emac, emac->port_vlan | DEFAULT_VID,
+						  BIT(emac->port_id) | DEFAULT_PORT_MASK,
+						  BIT(emac->port_id) | DEFAULT_UNTAG_MASK,
+						  true);
+				if (prueth->is_hsr_offload_mode)
+					icssg_vtbl_modify(emac, DEFAULT_VID,
+							  DEFAULT_PORT_MASK,
+							  DEFAULT_UNTAG_MASK, true);
+				icssg_set_pvid(prueth, emac->port_vlan, emac->port_id);
+				if (prueth->is_switch_mode)
+					icssg_set_port_state(emac, ICSSG_EMAC_PORT_VLAN_AWARE_ENABLE);
+			}
+		}
+	}
+}
+
+static int prueth_emac_common_start(struct prueth *prueth)
+{
+	struct prueth_emac *emac;
+	int ret = 0;
+	int slice;
+
+	if (!prueth->emac[ICSS_SLICE0] && !prueth->emac[ICSS_SLICE1])
+		return -EINVAL;
+
+	/* clear SMEM and MSMC settings for all slices */
+	memset_io(prueth->msmcram.va, 0, prueth->msmcram.size);
+	memset_io(prueth->shram.va, 0, ICSSG_CONFIG_OFFSET_SLICE1 * PRUETH_NUM_MACS);
+
+	icssg_class_default(prueth->miig_rt, ICSS_SLICE0, 0, false);
+	icssg_class_default(prueth->miig_rt, ICSS_SLICE1, 0, false);
+
+	if (prueth->is_switch_mode || prueth->is_hsr_offload_mode)
+		icssg_init_fw_offload_mode(prueth);
+	else
+		icssg_init_emac_mode(prueth);
+
+	for (slice = 0; slice < PRUETH_NUM_MACS; slice++) {
+		emac = prueth->emac[slice];
+		if (!emac)
+			continue;
+		ret = icssg_config(prueth, emac, slice);
+		if (ret)
+			goto disable_class;
+
+		/* Reset link state to force reconfiguration in
+		 * emac_adjust_link(). Without this, if the link was already up
+		 * before restart, emac_adjust_link() won't detect any state
+		 * change and will skip critical configuration like writing
+		 * speed to firmware.
+		 */
+		emac->link = 0;
+
+		mutex_lock(&emac->ndev->phydev->lock);
+		emac_adjust_link(emac->ndev);
+		mutex_unlock(&emac->ndev->phydev->lock);
+	}
+
+	ret = prueth_emac_start(prueth);
+	if (ret)
+		goto disable_class;
+
+	emac = prueth->emac[ICSS_SLICE0] ? prueth->emac[ICSS_SLICE0] :
+	       prueth->emac[ICSS_SLICE1];
+	ret = icss_iep_init(emac->iep, &prueth_iep_clockops,
+			    emac, IEP_DEFAULT_CYCLE_TIME_NS);
+	if (ret) {
+		dev_err(prueth->dev, "Failed to initialize IEP module\n");
+		goto stop_pruss;
+	}
+
+	return 0;
+
+stop_pruss:
+	prueth_emac_stop(prueth);
+
+disable_class:
+	icssg_class_disable(prueth->miig_rt, ICSS_SLICE0);
+	icssg_class_disable(prueth->miig_rt, ICSS_SLICE1);
+
+	return ret;
+}
+
+static int prueth_emac_common_stop(struct prueth *prueth)
+{
+	struct prueth_emac *emac;
+
+	if (!prueth->emac[ICSS_SLICE0] && !prueth->emac[ICSS_SLICE1])
+		return -EINVAL;
+
+	icssg_class_disable(prueth->miig_rt, ICSS_SLICE0);
+	icssg_class_disable(prueth->miig_rt, ICSS_SLICE1);
+
+	prueth_emac_stop(prueth);
+
+	emac = prueth->emac[ICSS_SLICE0] ? prueth->emac[ICSS_SLICE0] :
+	       prueth->emac[ICSS_SLICE1];
+	icss_iep_exit(emac->iep);
+
+	return 0;
 }
 
 /* called back by PHY layer if there is change in link state of hw port*/
@@ -293,7 +403,11 @@ static enum hrtimer_restart emac_rx_timer_callback(struct hrtimer *timer)
 			container_of(timer, struct prueth_emac, rx_hrtimer);
 	int rx_flow = PRUETH_RX_FLOW_DATA;
 
-	enable_irq(emac->rx_chns.irq[rx_flow]);
+	if (emac->rx_chns.irq_disabled) {
+		/* re-enable the RX IRQ */
+		emac->rx_chns.irq_disabled = false;
+		enable_irq(emac->rx_chns.irq[rx_flow]);
+	}
 	return HRTIMER_NORESTART;
 }
 
@@ -373,9 +487,6 @@ static void prueth_iep_settime(void *clockops_data, u64 ns)
 	u64 cyclecount;
 	u32 cycletime;
 	int timeout;
-
-	if (!emac->fw_running)
-		return;
 
 	sc_descp = emac->prueth->shram.va + TIMESYNC_FW_WC_SETCLOCK_DESC_OFFSET;
 
@@ -470,65 +581,305 @@ const struct icss_iep_clockops prueth_iep_clockops = {
 	.perout_enable = prueth_perout_enable,
 };
 
+static void prueth_destroy_xdp_rxqs(struct prueth_emac *emac)
+{
+	struct xdp_rxq_info *rxq = &emac->rx_chns.xdp_rxq;
+
+	if (xdp_rxq_info_is_reg(rxq))
+		xdp_rxq_info_unreg(rxq);
+}
+
+static int prueth_create_xdp_rxqs(struct prueth_emac *emac)
+{
+	struct xdp_rxq_info *rxq = &emac->rx_chns.xdp_rxq;
+	struct page_pool *pool = emac->rx_chns.pg_pool;
+	struct prueth_rx_chn *rx_chn = &emac->rx_chns;
+	int ret;
+
+	ret = xdp_rxq_info_reg(rxq, emac->ndev, 0, emac->napi_rx.napi_id);
+	if (ret)
+		return ret;
+
+	if (rx_chn->xsk_pool) {
+		ret = xdp_rxq_info_reg_mem_model(rxq, MEM_TYPE_XSK_BUFF_POOL, NULL);
+		if (ret)
+			goto xdp_unreg;
+		xsk_pool_set_rxq_info(rx_chn->xsk_pool, rxq);
+	} else {
+		ret = xdp_rxq_info_reg_mem_model(rxq, MEM_TYPE_PAGE_POOL, pool);
+		if (ret)
+			goto xdp_unreg;
+	}
+
+	return 0;
+
+xdp_unreg:
+	prueth_destroy_xdp_rxqs(emac);
+	return ret;
+}
+
 static int icssg_prueth_add_mcast(struct net_device *ndev, const u8 *addr)
 {
-	struct prueth_emac *emac = netdev_priv(ndev);
-	int port_mask = BIT(emac->port_id);
+	struct net_device *real_dev;
+	struct prueth_emac *emac;
+	int port_mask;
+	u8 vlan_id;
 
-	port_mask |= icssg_fdb_lookup(emac, addr, 0);
-	icssg_fdb_add_del(emac, addr, 0, port_mask, true);
-	icssg_vtbl_modify(emac, 0, port_mask, port_mask, true);
+	vlan_id = is_vlan_dev(ndev) ? vlan_dev_vlan_id(ndev) : PRUETH_DFLT_VLAN_MAC;
+	real_dev = is_vlan_dev(ndev) ? vlan_dev_real_dev(ndev) : ndev;
+	emac = netdev_priv(real_dev);
+
+	port_mask = BIT(emac->port_id) | icssg_fdb_lookup(emac, addr, vlan_id);
+	icssg_fdb_add_del(emac, addr, vlan_id, port_mask, true);
+	icssg_vtbl_modify(emac, vlan_id, port_mask, port_mask, true);
 
 	return 0;
 }
 
 static int icssg_prueth_del_mcast(struct net_device *ndev, const u8 *addr)
 {
-	struct prueth_emac *emac = netdev_priv(ndev);
-	int port_mask = BIT(emac->port_id);
+	struct net_device *real_dev;
+	struct prueth_emac *emac;
 	int other_port_mask;
+	int port_mask;
+	u8 vlan_id;
 
-	other_port_mask = port_mask ^ icssg_fdb_lookup(emac, addr, 0);
+	vlan_id = is_vlan_dev(ndev) ? vlan_dev_vlan_id(ndev) : PRUETH_DFLT_VLAN_MAC;
+	real_dev = is_vlan_dev(ndev) ? vlan_dev_real_dev(ndev) : ndev;
+	emac = netdev_priv(real_dev);
 
-	icssg_fdb_add_del(emac, addr, 0, port_mask, false);
-	icssg_vtbl_modify(emac, 0, port_mask, port_mask, false);
+	port_mask = BIT(emac->port_id);
+	other_port_mask = port_mask ^ icssg_fdb_lookup(emac, addr, vlan_id);
+
+	icssg_fdb_add_del(emac, addr, vlan_id, port_mask, false);
+	icssg_vtbl_modify(emac, vlan_id, port_mask, port_mask, false);
 
 	if (other_port_mask) {
-		icssg_fdb_add_del(emac, addr, 0, other_port_mask, true);
-		icssg_vtbl_modify(emac, 0, other_port_mask, other_port_mask, true);
+		icssg_fdb_add_del(emac, addr, vlan_id, other_port_mask, true);
+		icssg_vtbl_modify(emac, vlan_id, other_port_mask,
+				  other_port_mask, true);
 	}
 
 	return 0;
 }
 
-static int icssg_prueth_hsr_add_mcast(struct net_device *ndev, const u8 *addr)
+static void icssg_prueth_hsr_fdb_add_del(struct prueth_emac *emac,
+					 const u8 *addr, u8 vid, bool add)
 {
-	struct prueth_emac *emac = netdev_priv(ndev);
-	struct prueth *prueth = emac->prueth;
-
-	icssg_fdb_add_del(emac, addr, prueth->default_vlan,
+	icssg_fdb_add_del(emac, addr, vid,
 			  ICSSG_FDB_ENTRY_P0_MEMBERSHIP |
 			  ICSSG_FDB_ENTRY_P1_MEMBERSHIP |
 			  ICSSG_FDB_ENTRY_P2_MEMBERSHIP |
-			  ICSSG_FDB_ENTRY_BLOCK, true);
+			  ICSSG_FDB_ENTRY_BLOCK, add);
 
-	icssg_vtbl_modify(emac, emac->port_vlan, BIT(emac->port_id),
-			  BIT(emac->port_id), true);
+	if (add)
+		icssg_vtbl_modify(emac, vid, BIT(emac->port_id),
+				  BIT(emac->port_id), add);
+}
+
+static int icssg_prueth_hsr_add_mcast(struct net_device *ndev, const u8 *addr)
+{
+	struct net_device *real_dev, *port_dev;
+	struct prueth_emac *emac;
+	u8 vlan_id, i;
+
+	vlan_id = is_vlan_dev(ndev) ? vlan_dev_vlan_id(ndev) : PRUETH_DFLT_VLAN_HSR;
+	real_dev = is_vlan_dev(ndev) ? vlan_dev_real_dev(ndev) : ndev;
+
+	if (is_hsr_master(real_dev)) {
+		for (i = HSR_PT_SLAVE_A; i < HSR_PT_INTERLINK; i++) {
+			port_dev = hsr_get_port_ndev(real_dev, i);
+			emac = netdev_priv(port_dev);
+			if (!emac) {
+				dev_put(port_dev);
+				return -EINVAL;
+			}
+			icssg_prueth_hsr_fdb_add_del(emac, addr, vlan_id,
+						     true);
+			dev_put(port_dev);
+		}
+	} else {
+		emac = netdev_priv(real_dev);
+		icssg_prueth_hsr_fdb_add_del(emac, addr, vlan_id, true);
+	}
+
 	return 0;
 }
 
 static int icssg_prueth_hsr_del_mcast(struct net_device *ndev, const u8 *addr)
 {
-	struct prueth_emac *emac = netdev_priv(ndev);
-	struct prueth *prueth = emac->prueth;
+	struct net_device *real_dev, *port_dev;
+	struct prueth_emac *emac;
+	u8 vlan_id, i;
 
-	icssg_fdb_add_del(emac, addr, prueth->default_vlan,
-			  ICSSG_FDB_ENTRY_P0_MEMBERSHIP |
-			  ICSSG_FDB_ENTRY_P1_MEMBERSHIP |
-			  ICSSG_FDB_ENTRY_P2_MEMBERSHIP |
-			  ICSSG_FDB_ENTRY_BLOCK, false);
+	vlan_id = is_vlan_dev(ndev) ? vlan_dev_vlan_id(ndev) : PRUETH_DFLT_VLAN_HSR;
+	real_dev = is_vlan_dev(ndev) ? vlan_dev_real_dev(ndev) : ndev;
+
+	if (is_hsr_master(real_dev)) {
+		for (i = HSR_PT_SLAVE_A; i < HSR_PT_INTERLINK; i++) {
+			port_dev = hsr_get_port_ndev(real_dev, i);
+			emac = netdev_priv(port_dev);
+			if (!emac) {
+				dev_put(port_dev);
+				return -EINVAL;
+			}
+			icssg_prueth_hsr_fdb_add_del(emac, addr, vlan_id,
+						     false);
+			dev_put(port_dev);
+		}
+	} else {
+		emac = netdev_priv(real_dev);
+		icssg_prueth_hsr_fdb_add_del(emac, addr, vlan_id, false);
+	}
 
 	return 0;
+}
+
+static int icssg_update_vlan_mcast(struct net_device *vdev, int vid,
+				   void *args)
+{
+	struct prueth_emac *emac = args;
+
+	if (!vdev || !vid)
+		return 0;
+
+	netif_addr_lock_bh(vdev);
+	__hw_addr_sync_multiple(&emac->vlan_mcast_list[vid], &vdev->mc,
+				vdev->addr_len);
+	netif_addr_unlock_bh(vdev);
+
+	if (emac->prueth->is_hsr_offload_mode)
+		__hw_addr_sync_dev(&emac->vlan_mcast_list[vid], vdev,
+				   icssg_prueth_hsr_add_mcast,
+				   icssg_prueth_hsr_del_mcast);
+	else
+		__hw_addr_sync_dev(&emac->vlan_mcast_list[vid], vdev,
+				   icssg_prueth_add_mcast,
+				   icssg_prueth_del_mcast);
+
+	return 0;
+}
+
+static void prueth_set_xsk_pool(struct prueth_emac *emac, u16 queue_id)
+{
+	struct prueth_tx_chn *tx_chn = &emac->tx_chns[queue_id];
+	struct prueth_rx_chn *rx_chn = &emac->rx_chns;
+
+	if (emac->xsk_qid != queue_id) {
+		rx_chn->xsk_pool = NULL;
+		tx_chn->xsk_pool = NULL;
+	} else {
+		rx_chn->xsk_pool = xsk_get_pool_from_qid(emac->ndev, queue_id);
+		tx_chn->xsk_pool = xsk_get_pool_from_qid(emac->ndev, queue_id);
+	}
+}
+
+static void prueth_destroy_txq(struct prueth_emac *emac)
+{
+	int ret, i;
+
+	atomic_set(&emac->tdown_cnt, emac->tx_ch_num);
+	/* ensure new tdown_cnt value is visible */
+	smp_mb__after_atomic();
+	/* tear down and disable UDMA channels */
+	reinit_completion(&emac->tdown_complete);
+	for (i = 0; i < emac->tx_ch_num; i++)
+		k3_udma_glue_tdown_tx_chn(emac->tx_chns[i].tx_chn, false);
+
+	ret = wait_for_completion_timeout(&emac->tdown_complete,
+					  msecs_to_jiffies(1000));
+	if (!ret)
+		netdev_err(emac->ndev, "tx teardown timeout\n");
+
+	for (i = 0; i < emac->tx_ch_num; i++) {
+		napi_disable(&emac->tx_chns[i].napi_tx);
+		hrtimer_cancel(&emac->tx_chns[i].tx_hrtimer);
+		k3_udma_glue_reset_tx_chn(emac->tx_chns[i].tx_chn,
+					  &emac->tx_chns[i],
+					  prueth_tx_cleanup);
+		k3_udma_glue_disable_tx_chn(emac->tx_chns[i].tx_chn);
+	}
+}
+
+static void prueth_destroy_rxq(struct prueth_emac *emac)
+{
+	int i, ret;
+
+	/* tear down and disable UDMA channels */
+	reinit_completion(&emac->tdown_complete);
+	k3_udma_glue_tdown_rx_chn(emac->rx_chns.rx_chn, true);
+
+	/* When RX DMA Channel Teardown is initiated, it will result in an
+	 * interrupt and a Teardown Completion Marker (TDCM) is queued into
+	 * the RX Completion queue. Acknowledging the interrupt involves
+	 * popping the TDCM descriptor from the RX Completion queue via the
+	 * RX NAPI Handler. To avoid timing out when waiting for the TDCM to
+	 * be popped, schedule the RX NAPI handler to run immediately.
+	 */
+	if (!napi_if_scheduled_mark_missed(&emac->napi_rx)) {
+		if (napi_schedule_prep(&emac->napi_rx))
+			__napi_schedule(&emac->napi_rx);
+	}
+
+	ret = wait_for_completion_timeout(&emac->tdown_complete,
+					  msecs_to_jiffies(1000));
+	if (!ret)
+		netdev_err(emac->ndev, "rx teardown timeout\n");
+
+	for (i = 0; i < PRUETH_MAX_RX_FLOWS; i++) {
+		napi_disable(&emac->napi_rx);
+		hrtimer_cancel(&emac->rx_hrtimer);
+		k3_udma_glue_reset_rx_chn(emac->rx_chns.rx_chn, i,
+					  &emac->rx_chns,
+					  prueth_rx_cleanup);
+	}
+
+	prueth_destroy_xdp_rxqs(emac);
+	k3_udma_glue_disable_rx_chn(emac->rx_chns.rx_chn);
+}
+
+static int prueth_create_txq(struct prueth_emac *emac)
+{
+	int ret, i;
+
+	for (i = 0; i < emac->tx_ch_num; i++) {
+		ret = k3_udma_glue_enable_tx_chn(emac->tx_chns[i].tx_chn);
+		if (ret)
+			goto reset_tx_chan;
+		napi_enable(&emac->tx_chns[i].napi_tx);
+	}
+	return 0;
+
+reset_tx_chan:
+	/* Since interface is not yet up, there is wouldn't be
+	 * any SKB for completion. So set false to free_skb
+	 */
+	prueth_reset_tx_chan(emac, i, false);
+	return ret;
+}
+
+static int prueth_create_rxq(struct prueth_emac *emac)
+{
+	int ret;
+
+	ret = prueth_prepare_rx_chan(emac, &emac->rx_chns, PRUETH_MAX_PKT_SIZE);
+	if (ret)
+		return ret;
+
+	ret = k3_udma_glue_enable_rx_chn(emac->rx_chns.rx_chn);
+	if (ret)
+		goto reset_rx_chn;
+
+	ret = prueth_create_xdp_rxqs(emac);
+	if (ret)
+		goto reset_rx_chn;
+
+	napi_enable(&emac->napi_rx);
+	return 0;
+
+reset_rx_chn:
+	prueth_reset_rx_chan(&emac->rx_chns, PRUETH_MAX_RX_FLOWS, false);
+	return ret;
 }
 
 /**
@@ -542,24 +893,18 @@ static int icssg_prueth_hsr_del_mcast(struct net_device *ndev, const u8 *addr)
 static int emac_ndo_open(struct net_device *ndev)
 {
 	struct prueth_emac *emac = netdev_priv(ndev);
-	int ret, i, num_data_chn = emac->tx_ch_num;
+	int ret, num_data_chn = emac->tx_ch_num;
+	struct icssg_flow_cfg __iomem *flow_cfg;
 	struct prueth *prueth = emac->prueth;
 	int slice = prueth_emac_slice(emac);
 	struct device *dev = prueth->dev;
 	int max_rx_flows;
 	int rx_flow;
 
-	/* clear SMEM and MSMC settings for all slices */
-	if (!prueth->emacs_initialized) {
-		memset_io(prueth->msmcram.va, 0, prueth->msmcram.size);
-		memset_io(prueth->shram.va, 0, ICSSG_CONFIG_OFFSET_SLICE1 * PRUETH_NUM_MACS);
-	}
-
 	/* set h/w MAC as user might have re-configured */
 	ether_addr_copy(emac->mac_addr, ndev->dev_addr);
 
 	icssg_class_set_mac_addr(prueth->miig_rt, slice, emac->mac_addr);
-	icssg_class_default(prueth->miig_rt, slice, 0, false);
 	icssg_ft1_set_mac_addr(prueth->miig_rt, slice, emac->mac_addr);
 
 	/* Notify the stack of the actual queue counts. */
@@ -569,6 +914,7 @@ static int emac_ndo_open(struct net_device *ndev)
 		return ret;
 	}
 
+	emac->xsk_qid = -EINVAL;
 	init_completion(&emac->cmd_complete);
 	ret = prueth_init_tx_chns(emac);
 	if (ret) {
@@ -597,17 +943,23 @@ static int emac_ndo_open(struct net_device *ndev)
 		goto cleanup_napi;
 	}
 
-	/* reset and start PRU firmware */
-	ret = prueth_emac_start(prueth, emac);
-	if (ret)
-		goto free_rx_irq;
+	if (!prueth->emacs_initialized) {
+		ret = prueth_emac_common_start(prueth);
+		if (ret)
+			goto free_rx_irq;
+		icssg_enable_fw_offload(prueth);
+	}
+
+	flow_cfg = emac->dram.va + ICSSG_CONFIG_OFFSET + PSI_L_REGULAR_FLOW_ID_BASE_OFFSET;
+	writew(emac->rx_flow_id_base, &flow_cfg->rx_base_flow);
+	ret = emac_fdb_flow_id_updated(emac);
+
+	if (ret) {
+		netdev_err(ndev, "Failed to update Rx Flow ID %d", ret);
+		goto stop;
+	}
 
 	icssg_mii_update_mtu(prueth->mii_rt, slice, ndev->max_mtu);
-
-	if (!prueth->emacs_initialized) {
-		ret = icss_iep_init(emac->iep, &prueth_iep_clockops,
-				    emac, IEP_DEFAULT_CYCLE_TIME_NS);
-	}
 
 	ret = request_threaded_irq(emac->tx_ts_irq, NULL, prueth_tx_ts_irq,
 				   IRQF_ONESHOT, dev_name(dev), emac);
@@ -615,24 +967,13 @@ static int emac_ndo_open(struct net_device *ndev)
 		goto stop;
 
 	/* Prepare RX */
-	ret = prueth_prepare_rx_chan(emac, &emac->rx_chns, PRUETH_MAX_PKT_SIZE);
+	ret = prueth_create_rxq(emac);
 	if (ret)
 		goto free_tx_ts_irq;
 
-	ret = k3_udma_glue_enable_rx_chn(emac->rx_chns.rx_chn);
+	ret = prueth_create_txq(emac);
 	if (ret)
-		goto reset_rx_chn;
-
-	for (i = 0; i < emac->tx_ch_num; i++) {
-		ret = k3_udma_glue_enable_tx_chn(emac->tx_chns[i].tx_chn);
-		if (ret)
-			goto reset_tx_chan;
-	}
-
-	/* Enable NAPI in Tx and Rx direction */
-	for (i = 0; i < emac->tx_ch_num; i++)
-		napi_enable(&emac->tx_chns[i].napi_tx);
-	napi_enable(&emac->napi_rx);
+		goto destroy_rxq;
 
 	/* start PHY */
 	phy_start(ndev->phydev);
@@ -643,17 +984,13 @@ static int emac_ndo_open(struct net_device *ndev)
 
 	return 0;
 
-reset_tx_chan:
-	/* Since interface is not yet up, there is wouldn't be
-	 * any SKB for completion. So set false to free_skb
-	 */
-	prueth_reset_tx_chan(emac, i, false);
-reset_rx_chn:
-	prueth_reset_rx_chan(&emac->rx_chns, max_rx_flows, false);
+destroy_rxq:
+	prueth_destroy_rxq(emac);
 free_tx_ts_irq:
 	free_irq(emac->tx_ts_irq, emac);
 stop:
-	prueth_emac_stop(emac);
+	if (!prueth->emacs_initialized)
+		prueth_emac_common_stop(prueth);
 free_rx_irq:
 	free_irq(emac->rx_chns.irq[rx_flow], emac);
 cleanup_napi:
@@ -678,9 +1015,6 @@ static int emac_ndo_stop(struct net_device *ndev)
 {
 	struct prueth_emac *emac = netdev_priv(ndev);
 	struct prueth *prueth = emac->prueth;
-	int rx_flow = PRUETH_RX_FLOW_DATA;
-	int max_rx_flows;
-	int ret, i;
 
 	/* inform the upper layers. */
 	netif_tx_stop_all_queues(ndev);
@@ -689,57 +1023,29 @@ static int emac_ndo_stop(struct net_device *ndev)
 	if (ndev->phydev)
 		phy_stop(ndev->phydev);
 
-	icssg_class_disable(prueth->miig_rt, prueth_emac_slice(emac));
-
 	if (emac->prueth->is_hsr_offload_mode)
 		__dev_mc_unsync(ndev, icssg_prueth_hsr_del_mcast);
 	else
 		__dev_mc_unsync(ndev, icssg_prueth_del_mcast);
 
-	atomic_set(&emac->tdown_cnt, emac->tx_ch_num);
-	/* ensure new tdown_cnt value is visible */
-	smp_mb__after_atomic();
-	/* tear down and disable UDMA channels */
-	reinit_completion(&emac->tdown_complete);
-	for (i = 0; i < emac->tx_ch_num; i++)
-		k3_udma_glue_tdown_tx_chn(emac->tx_chns[i].tx_chn, false);
-
-	ret = wait_for_completion_timeout(&emac->tdown_complete,
-					  msecs_to_jiffies(1000));
-	if (!ret)
-		netdev_err(ndev, "tx teardown timeout\n");
-
-	prueth_reset_tx_chan(emac, emac->tx_ch_num, true);
-	for (i = 0; i < emac->tx_ch_num; i++) {
-		napi_disable(&emac->tx_chns[i].napi_tx);
-		hrtimer_cancel(&emac->tx_chns[i].tx_hrtimer);
-	}
-
-	max_rx_flows = PRUETH_MAX_RX_FLOWS;
-	k3_udma_glue_tdown_rx_chn(emac->rx_chns.rx_chn, true);
-
-	prueth_reset_rx_chan(&emac->rx_chns, max_rx_flows, true);
-
-	napi_disable(&emac->napi_rx);
-	hrtimer_cancel(&emac->rx_hrtimer);
+	prueth_destroy_txq(emac);
+	prueth_destroy_rxq(emac);
 
 	cancel_work_sync(&emac->rx_mode_work);
 
 	/* Destroying the queued work in ndo_stop() */
 	cancel_delayed_work_sync(&emac->stats_work);
 
-	if (prueth->emacs_initialized == 1)
-		icss_iep_exit(emac->iep);
-
 	/* stop PRUs */
-	prueth_emac_stop(emac);
+	if (prueth->emacs_initialized == 1)
+		prueth_emac_common_stop(prueth);
 
 	free_irq(emac->tx_ts_irq, emac);
 
-	free_irq(emac->rx_chns.irq[rx_flow], emac);
+	free_irq(emac->rx_chns.irq[PRUETH_RX_FLOW_DATA], emac);
 	prueth_ndev_del_tx_napi(emac, emac->tx_ch_num);
 
-	prueth_cleanup_rx_chns(emac, &emac->rx_chns, max_rx_flows);
+	prueth_cleanup_rx_chns(emac, &emac->rx_chns, PRUETH_MAX_RX_FLOWS);
 	prueth_cleanup_tx_chns(emac);
 
 	prueth->emacs_initialized--;
@@ -772,12 +1078,22 @@ static void emac_ndo_set_rx_mode_work(struct work_struct *work)
 		return;
 	}
 
-	if (emac->prueth->is_hsr_offload_mode)
+	if (emac->prueth->is_hsr_offload_mode) {
 		__dev_mc_sync(ndev, icssg_prueth_hsr_add_mcast,
 			      icssg_prueth_hsr_del_mcast);
-	else
+		if (rtnl_trylock()) {
+			vlan_for_each(emac->prueth->hsr_dev,
+				      icssg_update_vlan_mcast, emac);
+			rtnl_unlock();
+		}
+	} else {
 		__dev_mc_sync(ndev, icssg_prueth_add_mcast,
 			      icssg_prueth_del_mcast);
+		if (rtnl_trylock()) {
+			vlan_for_each(ndev, icssg_update_vlan_mcast, emac);
+			rtnl_unlock();
+		}
+	}
 }
 
 /**
@@ -791,7 +1107,7 @@ static void emac_ndo_set_rx_mode(struct net_device *ndev)
 {
 	struct prueth_emac *emac = netdev_priv(ndev);
 
-	queue_work(emac->cmd_wq, &emac->rx_mode_work);
+	schedule_work(&emac->rx_mode_work);
 }
 
 static netdev_features_t emac_ndo_fix_features(struct net_device *ndev,
@@ -822,19 +1138,19 @@ static int emac_ndo_vlan_rx_add_vid(struct net_device *ndev,
 {
 	struct prueth_emac *emac = netdev_priv(ndev);
 	struct prueth *prueth = emac->prueth;
+	int port_mask = BIT(emac->port_id);
 	int untag_mask = 0;
-	int port_mask;
 
-	if (prueth->is_hsr_offload_mode) {
-		port_mask = BIT(PRUETH_PORT_HOST) | BIT(emac->port_id);
-		untag_mask = 0;
+	if (prueth->is_hsr_offload_mode)
+		port_mask |= BIT(PRUETH_PORT_HOST);
 
-		netdev_dbg(emac->ndev, "VID add vid:%u port_mask:%X untag_mask %X\n",
-			   vid, port_mask, untag_mask);
+	__hw_addr_init(&emac->vlan_mcast_list[vid]);
+	netdev_dbg(emac->ndev, "VID add vid:%u port_mask:%X untag_mask %X\n",
+		   vid, port_mask, untag_mask);
 
-		icssg_vtbl_modify(emac, vid, port_mask, untag_mask, true);
-		icssg_set_pvid(emac->prueth, vid, emac->port_id);
-	}
+	icssg_vtbl_modify(emac, vid, port_mask, untag_mask, true);
+	icssg_set_pvid(emac->prueth, vid, emac->port_id);
+
 	return 0;
 }
 
@@ -843,18 +1159,254 @@ static int emac_ndo_vlan_rx_del_vid(struct net_device *ndev,
 {
 	struct prueth_emac *emac = netdev_priv(ndev);
 	struct prueth *prueth = emac->prueth;
+	int port_mask = BIT(emac->port_id);
 	int untag_mask = 0;
-	int port_mask;
 
-	if (prueth->is_hsr_offload_mode) {
+	if (prueth->is_hsr_offload_mode)
 		port_mask = BIT(PRUETH_PORT_HOST);
-		untag_mask = 0;
 
-		netdev_dbg(emac->ndev, "VID del vid:%u port_mask:%X untag_mask  %X\n",
-			   vid, port_mask, untag_mask);
+	netdev_dbg(emac->ndev, "VID del vid:%u port_mask:%X untag_mask  %X\n",
+		   vid, port_mask, untag_mask);
+	icssg_vtbl_modify(emac, vid, port_mask, untag_mask, false);
 
-		icssg_vtbl_modify(emac, vid, port_mask, untag_mask, false);
+	return 0;
+}
+
+/**
+ * emac_xdp_xmit - Implements ndo_xdp_xmit
+ * @dev: netdev
+ * @n: number of frames
+ * @frames: array of XDP buffer pointers
+ * @flags: XDP extra info
+ *
+ * Return: number of frames successfully sent. Failed frames
+ * will be free'ed by XDP core.
+ *
+ * For error cases, a negative errno code is returned and no-frames
+ * are transmitted (caller must handle freeing frames).
+ **/
+static int emac_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
+			 u32 flags)
+{
+	struct prueth_emac *emac = netdev_priv(dev);
+	struct net_device *ndev = emac->ndev;
+	struct netdev_queue *netif_txq;
+	int cpu = smp_processor_id();
+	struct xdp_frame *xdpf;
+	unsigned int q_idx;
+	int nxmit = 0;
+	u32 err;
+	int i;
+
+	q_idx = cpu % emac->tx_ch_num;
+	netif_txq = netdev_get_tx_queue(ndev, q_idx);
+
+	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
+		return -EINVAL;
+
+	__netif_tx_lock(netif_txq, cpu);
+	for (i = 0; i < n; i++) {
+		xdpf = frames[i];
+		err = emac_xmit_xdp_frame(emac, xdpf, q_idx,
+					  PRUETH_TX_BUFF_TYPE_XDP_NDO);
+		if (err != ICSSG_XDP_TX) {
+			ndev->stats.tx_dropped++;
+			break;
+		}
+		nxmit++;
 	}
+	__netif_tx_unlock(netif_txq);
+
+	return nxmit;
+}
+
+/**
+ * emac_xdp_setup - add/remove an XDP program
+ * @emac: emac device
+ * @bpf: XDP program
+ *
+ * Return: Always 0 (Success)
+ **/
+static int emac_xdp_setup(struct prueth_emac *emac, struct netdev_bpf *bpf)
+{
+	struct bpf_prog *prog = bpf->prog;
+
+	if (!emac->xdpi.prog && !prog)
+		return 0;
+
+	WRITE_ONCE(emac->xdp_prog, prog);
+
+	xdp_attachment_setup(&emac->xdpi, bpf);
+
+	return 0;
+}
+
+static int prueth_xsk_pool_enable(struct prueth_emac *emac,
+				  struct xsk_buff_pool *pool, u16 queue_id)
+{
+	struct prueth_rx_chn *rx_chn = &emac->rx_chns;
+	u32 frame_size;
+	int ret;
+
+	if (queue_id >= PRUETH_MAX_RX_FLOWS ||
+	    queue_id >= emac->tx_ch_num) {
+		netdev_err(emac->ndev, "Invalid XSK queue ID %d\n", queue_id);
+		return -EINVAL;
+	}
+
+	frame_size = xsk_pool_get_rx_frame_size(pool);
+	if (frame_size < PRUETH_MAX_PKT_SIZE)
+		return -EOPNOTSUPP;
+
+	ret = xsk_pool_dma_map(pool, rx_chn->dma_dev, PRUETH_RX_DMA_ATTR);
+	if (ret) {
+		netdev_err(emac->ndev, "Failed to map XSK pool: %d\n", ret);
+		return ret;
+	}
+
+	if (netif_running(emac->ndev)) {
+		/* stop packets from wire for graceful teardown */
+		ret = icssg_set_port_state(emac, ICSSG_EMAC_PORT_DISABLE);
+		if (ret)
+			return ret;
+		prueth_destroy_rxq(emac);
+	}
+
+	emac->xsk_qid = queue_id;
+	prueth_set_xsk_pool(emac, queue_id);
+
+	if (netif_running(emac->ndev)) {
+		ret = prueth_create_rxq(emac);
+		if (ret) {
+			netdev_err(emac->ndev, "Failed to create RX queue: %d\n", ret);
+			return ret;
+		}
+		ret = icssg_set_port_state(emac, ICSSG_EMAC_PORT_FORWARD);
+		if (ret) {
+			prueth_destroy_rxq(emac);
+			return ret;
+		}
+		ret = prueth_xsk_wakeup(emac->ndev, queue_id, XDP_WAKEUP_RX);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int prueth_xsk_pool_disable(struct prueth_emac *emac, u16 queue_id)
+{
+	struct xsk_buff_pool *pool;
+	int ret;
+
+	if (queue_id >= PRUETH_MAX_RX_FLOWS ||
+	    queue_id >= emac->tx_ch_num) {
+		netdev_err(emac->ndev, "Invalid XSK queue ID %d\n", queue_id);
+		return -EINVAL;
+	}
+
+	if (emac->xsk_qid != queue_id) {
+		netdev_err(emac->ndev, "XSK queue ID %d not registered\n", queue_id);
+		return -EINVAL;
+	}
+
+	pool = xsk_get_pool_from_qid(emac->ndev, queue_id);
+	if (!pool) {
+		netdev_err(emac->ndev, "No XSK pool registered for queue %d\n", queue_id);
+		return -EINVAL;
+	}
+
+	if (netif_running(emac->ndev)) {
+		/* stop packets from wire for graceful teardown */
+		ret = icssg_set_port_state(emac, ICSSG_EMAC_PORT_DISABLE);
+		if (ret)
+			return ret;
+		prueth_destroy_rxq(emac);
+	}
+
+	xsk_pool_dma_unmap(pool, PRUETH_RX_DMA_ATTR);
+	emac->xsk_qid = -EINVAL;
+	prueth_set_xsk_pool(emac, queue_id);
+
+	if (netif_running(emac->ndev)) {
+		ret = prueth_create_rxq(emac);
+		if (ret) {
+			netdev_err(emac->ndev, "Failed to create RX queue: %d\n", ret);
+			return ret;
+		}
+		ret = icssg_set_port_state(emac, ICSSG_EMAC_PORT_FORWARD);
+		if (ret) {
+			prueth_destroy_rxq(emac);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * emac_ndo_bpf - implements ndo_bpf for icssg_prueth
+ * @ndev: network adapter device
+ * @bpf: XDP program
+ *
+ * Return: 0 on success, error code on failure.
+ **/
+static int emac_ndo_bpf(struct net_device *ndev, struct netdev_bpf *bpf)
+{
+	struct prueth_emac *emac = netdev_priv(ndev);
+
+	switch (bpf->command) {
+	case XDP_SETUP_PROG:
+		return emac_xdp_setup(emac, bpf);
+	case XDP_SETUP_XSK_POOL:
+		return bpf->xsk.pool ?
+			prueth_xsk_pool_enable(emac, bpf->xsk.pool, bpf->xsk.queue_id) :
+			prueth_xsk_pool_disable(emac, bpf->xsk.queue_id);
+	default:
+		return -EINVAL;
+	}
+}
+
+int prueth_xsk_wakeup(struct net_device *ndev, u32 qid, u32 flags)
+{
+	struct prueth_emac *emac = netdev_priv(ndev);
+	struct prueth_tx_chn *tx_chn = &emac->tx_chns[qid];
+	struct prueth_rx_chn *rx_chn = &emac->rx_chns;
+
+	if (emac->xsk_qid != qid) {
+		netdev_err(ndev, "XSK queue %d not registered\n", qid);
+		return -EINVAL;
+	}
+
+	if (qid >= PRUETH_MAX_RX_FLOWS || qid >= emac->tx_ch_num) {
+		netdev_err(ndev, "Invalid XSK queue ID %d\n", qid);
+		return -EINVAL;
+	}
+
+	if (!tx_chn->xsk_pool) {
+		netdev_err(ndev, "XSK pool not registered for queue %d\n", qid);
+		return -EINVAL;
+	}
+
+	if (!rx_chn->xsk_pool) {
+		netdev_err(ndev, "XSK pool not registered for RX queue %d\n", qid);
+		return -EINVAL;
+	}
+
+	if (flags & XDP_WAKEUP_TX) {
+		if (!napi_if_scheduled_mark_missed(&tx_chn->napi_tx)) {
+			if (likely(napi_schedule_prep(&tx_chn->napi_tx)))
+				__napi_schedule(&tx_chn->napi_tx);
+		}
+	}
+
+	if (flags & XDP_WAKEUP_RX) {
+		if (!napi_if_scheduled_mark_missed(&emac->napi_rx)) {
+			if (likely(napi_schedule_prep(&emac->napi_rx)))
+				__napi_schedule(&emac->napi_rx);
+		}
+	}
+
 	return 0;
 }
 
@@ -866,12 +1418,17 @@ static const struct net_device_ops emac_netdev_ops = {
 	.ndo_validate_addr = eth_validate_addr,
 	.ndo_tx_timeout = icssg_ndo_tx_timeout,
 	.ndo_set_rx_mode = emac_ndo_set_rx_mode,
-	.ndo_eth_ioctl = icssg_ndo_ioctl,
+	.ndo_eth_ioctl = phy_do_ioctl,
 	.ndo_get_stats64 = icssg_ndo_get_stats64,
 	.ndo_get_phys_port_name = icssg_ndo_get_phys_port_name,
 	.ndo_fix_features = emac_ndo_fix_features,
 	.ndo_vlan_rx_add_vid = emac_ndo_vlan_rx_add_vid,
 	.ndo_vlan_rx_kill_vid = emac_ndo_vlan_rx_del_vid,
+	.ndo_bpf = emac_ndo_bpf,
+	.ndo_xdp_xmit = emac_xdp_xmit,
+	.ndo_hwtstamp_get = icssg_ndo_get_ts_config,
+	.ndo_hwtstamp_set = icssg_ndo_set_ts_config,
+	.ndo_xsk_wakeup = prueth_xsk_wakeup,
 };
 
 static int prueth_netdev_init(struct prueth *prueth,
@@ -900,11 +1457,8 @@ static int prueth_netdev_init(struct prueth *prueth,
 	emac->prueth = prueth;
 	emac->ndev = ndev;
 	emac->port_id = port;
-	emac->cmd_wq = create_singlethread_workqueue("icssg_cmd_wq");
-	if (!emac->cmd_wq) {
-		ret = -ENOMEM;
-		goto free_ndev;
-	}
+	emac->xdp_prog = NULL;
+	emac->ndev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS;
 	INIT_WORK(&emac->rx_mode_work, emac_ndo_set_rx_mode_work);
 
 	INIT_DELAYED_WORK(&emac->stats_work, icssg_stats_work_handler);
@@ -916,7 +1470,7 @@ static int prueth_netdev_init(struct prueth *prueth,
 	if (ret) {
 		dev_err(prueth->dev, "unable to get DRAM: %d\n", ret);
 		ret = -ENOMEM;
-		goto free_wq;
+		goto free_ndev;
 	}
 
 	emac->tx_ch_num = 1;
@@ -942,8 +1496,7 @@ static int prueth_netdev_init(struct prueth *prueth,
 	} else if (of_phy_is_fixed_link(eth_node)) {
 		ret = of_phy_register_fixed_link(eth_node);
 		if (ret) {
-			ret = dev_err_probe(prueth->dev, ret,
-					    "failed to register fixed-link phy\n");
+			dev_err_probe(prueth->dev, ret, "failed to register fixed-link phy\n");
 			goto free;
 		}
 
@@ -1001,19 +1554,21 @@ static int prueth_netdev_init(struct prueth *prueth,
 	ndev->hw_features = NETIF_F_SG;
 	ndev->features = ndev->hw_features | NETIF_F_HW_VLAN_CTAG_FILTER;
 	ndev->hw_features |= NETIF_PRUETH_HSR_OFFLOAD_FEATURES;
+	xdp_set_features_flag(ndev,
+			      NETDEV_XDP_ACT_BASIC |
+			      NETDEV_XDP_ACT_REDIRECT |
+			      NETDEV_XDP_ACT_NDO_XMIT |
+			      NETDEV_XDP_ACT_XSK_ZEROCOPY);
 
 	netif_napi_add(ndev, &emac->napi_rx, icssg_napi_rx_poll);
-	hrtimer_init(&emac->rx_hrtimer, CLOCK_MONOTONIC,
-		     HRTIMER_MODE_REL_PINNED);
-	emac->rx_hrtimer.function = &emac_rx_timer_callback;
+	hrtimer_setup(&emac->rx_hrtimer, &emac_rx_timer_callback, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_REL_PINNED);
 	prueth->emac[mac] = emac;
 
 	return 0;
 
 free:
 	pruss_release_mem_region(prueth->pruss, &emac->dram);
-free_wq:
-	destroy_workqueue(emac->cmd_wq);
 free_ndev:
 	emac->ndev = NULL;
 	prueth->emac[mac] = NULL;
@@ -1053,10 +1608,11 @@ static void prueth_offload_fwd_mark_update(struct prueth *prueth)
 	}
 }
 
-static void prueth_emac_restart(struct prueth *prueth)
+static int prueth_emac_restart(struct prueth *prueth)
 {
 	struct prueth_emac *emac0 = prueth->emac[PRUETH_MAC0];
 	struct prueth_emac *emac1 = prueth->emac[PRUETH_MAC1];
+	int ret;
 
 	/* Detach the net_device for both PRUeth ports*/
 	if (netif_running(emac0->ndev))
@@ -1065,66 +1621,47 @@ static void prueth_emac_restart(struct prueth *prueth)
 		netif_device_detach(emac1->ndev);
 
 	/* Disable both PRUeth ports */
-	icssg_set_port_state(emac0, ICSSG_EMAC_PORT_DISABLE);
-	icssg_set_port_state(emac1, ICSSG_EMAC_PORT_DISABLE);
+	ret = icssg_set_port_state(emac0, ICSSG_EMAC_PORT_DISABLE);
+	ret |= icssg_set_port_state(emac1, ICSSG_EMAC_PORT_DISABLE);
+	if (ret)
+		return ret;
 
 	/* Stop both pru cores for both PRUeth ports*/
-	prueth_emac_stop(emac0);
-	prueth->emacs_initialized--;
-	prueth_emac_stop(emac1);
-	prueth->emacs_initialized--;
+	ret = prueth_emac_common_stop(prueth);
+	if (ret) {
+		dev_err(prueth->dev, "Failed to stop the firmwares");
+		return ret;
+	}
 
 	/* Start both pru cores for both PRUeth ports */
-	prueth_emac_start(prueth, emac0);
-	prueth->emacs_initialized++;
-	prueth_emac_start(prueth, emac1);
-	prueth->emacs_initialized++;
+	ret = prueth_emac_common_start(prueth);
+	if (ret) {
+		dev_err(prueth->dev, "Failed to start the firmwares");
+		return ret;
+	}
 
 	/* Enable forwarding for both PRUeth ports */
-	icssg_set_port_state(emac0, ICSSG_EMAC_PORT_FORWARD);
-	icssg_set_port_state(emac1, ICSSG_EMAC_PORT_FORWARD);
+	ret = icssg_set_port_state(emac0, ICSSG_EMAC_PORT_FORWARD);
+	ret |= icssg_set_port_state(emac1, ICSSG_EMAC_PORT_FORWARD);
 
 	/* Attache net_device for both PRUeth ports */
 	netif_device_attach(emac0->ndev);
 	netif_device_attach(emac1->ndev);
+
+	return ret;
 }
 
 static void icssg_change_mode(struct prueth *prueth)
 {
-	struct prueth_emac *emac;
-	int mac;
+	int ret;
 
-	prueth_emac_restart(prueth);
-
-	for (mac = PRUETH_MAC0; mac < PRUETH_NUM_MACS; mac++) {
-		emac = prueth->emac[mac];
-		if (prueth->is_hsr_offload_mode) {
-			if (emac->ndev->features & NETIF_F_HW_HSR_TAG_RM)
-				icssg_set_port_state(emac, ICSSG_EMAC_HSR_RX_OFFLOAD_ENABLE);
-			else
-				icssg_set_port_state(emac, ICSSG_EMAC_HSR_RX_OFFLOAD_DISABLE);
-		}
-
-		if (netif_running(emac->ndev)) {
-			icssg_fdb_add_del(emac, eth_stp_addr, prueth->default_vlan,
-					  ICSSG_FDB_ENTRY_P0_MEMBERSHIP |
-					  ICSSG_FDB_ENTRY_P1_MEMBERSHIP |
-					  ICSSG_FDB_ENTRY_P2_MEMBERSHIP |
-					  ICSSG_FDB_ENTRY_BLOCK,
-					  true);
-			icssg_vtbl_modify(emac, emac->port_vlan | DEFAULT_VID,
-					  BIT(emac->port_id) | DEFAULT_PORT_MASK,
-					  BIT(emac->port_id) | DEFAULT_UNTAG_MASK,
-					  true);
-			if (prueth->is_hsr_offload_mode)
-				icssg_vtbl_modify(emac, DEFAULT_VID,
-						  DEFAULT_PORT_MASK,
-						  DEFAULT_UNTAG_MASK, true);
-			icssg_set_pvid(prueth, emac->port_vlan, emac->port_id);
-			if (prueth->is_switch_mode)
-				icssg_set_port_state(emac, ICSSG_EMAC_PORT_VLAN_AWARE_ENABLE);
-		}
+	ret = prueth_emac_restart(prueth);
+	if (ret) {
+		dev_err(prueth->dev, "Failed to restart the firmwares, aborting the process");
+		return;
 	}
+
+	icssg_enable_fw_offload(prueth);
 }
 
 static int prueth_netdevice_port_link(struct net_device *ndev,
@@ -1158,7 +1695,7 @@ static int prueth_netdevice_port_link(struct net_device *ndev,
 		if (prueth->br_members & BIT(PRUETH_PORT_MII0) &&
 		    prueth->br_members & BIT(PRUETH_PORT_MII1)) {
 			prueth->is_switch_mode = true;
-			prueth->default_vlan = 1;
+			prueth->default_vlan = PRUETH_DFLT_VLAN_SW;
 			emac->port_vlan = prueth->default_vlan;
 			icssg_change_mode(prueth);
 		}
@@ -1173,13 +1710,18 @@ static void prueth_netdevice_port_unlink(struct net_device *ndev)
 {
 	struct prueth_emac *emac = netdev_priv(ndev);
 	struct prueth *prueth = emac->prueth;
+	int ret;
 
 	prueth->br_members &= ~BIT(emac->port_id);
 
 	if (prueth->is_switch_mode) {
 		prueth->is_switch_mode = false;
 		emac->port_vlan = 0;
-		prueth_emac_restart(prueth);
+		ret = prueth_emac_restart(prueth);
+		if (ret) {
+			dev_err(prueth->dev, "Failed to restart the firmwares, aborting the process");
+			return;
+		}
 	}
 
 	prueth_offload_fwd_mark_update(prueth);
@@ -1211,7 +1753,7 @@ static int prueth_hsr_port_link(struct net_device *ndev)
 			      NETIF_PRUETH_HSR_OFFLOAD_FEATURES))
 				return -EOPNOTSUPP;
 			prueth->is_hsr_offload_mode = true;
-			prueth->default_vlan = 1;
+			prueth->default_vlan = PRUETH_DFLT_VLAN_HSR;
 			emac0->port_vlan = prueth->default_vlan;
 			emac1->port_vlan = prueth->default_vlan;
 			icssg_change_mode(prueth);
@@ -1228,6 +1770,7 @@ static void prueth_hsr_port_unlink(struct net_device *ndev)
 	struct prueth *prueth = emac->prueth;
 	struct prueth_emac *emac0;
 	struct prueth_emac *emac1;
+	int ret;
 
 	emac0 = prueth->emac[PRUETH_MAC0];
 	emac1 = prueth->emac[PRUETH_MAC1];
@@ -1238,7 +1781,11 @@ static void prueth_hsr_port_unlink(struct net_device *ndev)
 		emac0->port_vlan = 0;
 		emac1->port_vlan = 0;
 		prueth->hsr_dev = NULL;
-		prueth_emac_restart(prueth);
+		ret = prueth_emac_restart(prueth);
+		if (ret) {
+			dev_err(prueth->dev, "Failed to restart the firmwares, aborting the process");
+			return;
+		}
 		netdev_dbg(ndev, "Disabling HSR Offload mode\n");
 	}
 }
@@ -1252,6 +1799,7 @@ static int prueth_netdevice_event(struct notifier_block *unused,
 	struct netdev_notifier_changeupper_info *info;
 	struct prueth_emac *emac = netdev_priv(ndev);
 	struct prueth *prueth = emac->prueth;
+	enum hsr_version hsr_ndev_version;
 	int ret = NOTIFY_DONE;
 
 	if (ndev->netdev_ops != &emac_netdev_ops)
@@ -1263,6 +1811,11 @@ static int prueth_netdevice_event(struct notifier_block *unused,
 
 		if ((ndev->features & NETIF_PRUETH_HSR_OFFLOAD_FEATURES) &&
 		    is_hsr_master(info->upper_dev)) {
+			hsr_get_version(info->upper_dev, &hsr_ndev_version);
+			if (hsr_ndev_version != HSR_V1 && hsr_ndev_version != PRP_V1)
+				return -EOPNOTSUPP;
+			prueth->hsr_prp_version = hsr_ndev_version;
+
 			if (info->linking) {
 				if (!prueth->hsr_dev) {
 					prueth->hsr_dev = info->upper_dev;
@@ -1318,6 +1871,87 @@ static void prueth_unregister_notifiers(struct prueth *prueth)
 	unregister_netdevice_notifier(&prueth->prueth_netdevice_nb);
 }
 
+static void icssg_read_firmware_names(struct device_node *np,
+				      struct icssg_firmwares *fw)
+{
+	int i;
+
+	for (i = 0; i < PRUETH_NUM_MACS; i++) {
+		of_property_read_string_index(np, "firmware-name", i * 3 + 0,
+					      &fw[i].pru);
+		of_property_read_string_index(np, "firmware-name", i * 3 + 1,
+					      &fw[i].rtu);
+		of_property_read_string_index(np, "firmware-name", i * 3 + 2,
+					      &fw[i].txpru);
+	}
+}
+
+/* icssg_firmware_name_replace - Replace a substring in firmware name
+ * @dev: device pointer for memory allocation
+ * @src: source firmware name string
+ * @from: substring to replace
+ * @to: replacement substring
+ *
+ * Return: a newly allocated string with the replacement, or the original
+ * string if replacement is not possible.
+ */
+static const char *icssg_firmware_name_replace(struct device *dev,
+					       const char *src,
+					       const char *from,
+					       const char *to)
+{
+	size_t prefix, from_len, to_len, total;
+	const char *p = strstr(src, from);
+	char *buf;
+
+	if (!p)
+		return src; /* fallback: no replacement, use original */
+
+	prefix = p - src;
+	from_len = strlen(from);
+	to_len = strlen(to);
+	total = strlen(src) - from_len + to_len + 1;
+
+	buf = devm_kzalloc(dev, total, GFP_KERNEL);
+	if (!buf)
+		return src; /* fallback: allocation failed, use original */
+
+	strscpy(buf, src, prefix + 1);
+	strscpy(buf + prefix, to, to_len + 1);
+	strscpy(buf + prefix + to_len, p + from_len, total - prefix - to_len);
+
+	return buf;
+}
+
+/**
+ * icssg_mode_firmware_names - Generate firmware names for a specific mode
+ * @dev: device pointer for logging and context
+ * @src: source array of firmware name structures
+ * @dst: destination array to store updated firmware name structures
+ * @from: substring in firmware names to be replaced
+ * @to: substring to replace @from in firmware names
+ *
+ * Iterates over all MACs and replaces occurrences of the @from substring
+ * with @to in the firmware names (pru, rtu, txpru) for each MAC. The
+ * updated firmware names are stored in the @dst array.
+ */
+static void icssg_mode_firmware_names(struct device *dev,
+				      struct icssg_firmwares *src,
+				      struct icssg_firmwares *dst,
+				      const char *from, const char *to)
+{
+	int i;
+
+	for (i = 0; i < PRUETH_NUM_MACS; i++) {
+		dst[i].pru = icssg_firmware_name_replace(dev, src[i].pru,
+							 from, to);
+		dst[i].rtu = icssg_firmware_name_replace(dev, src[i].rtu,
+							 from, to);
+		dst[i].txpru = icssg_firmware_name_replace(dev, src[i].txpru,
+							   from, to);
+	}
+}
+
 static int prueth_probe(struct platform_device *pdev)
 {
 	struct device_node *eth_node, *eth_ports_node;
@@ -1334,6 +1968,9 @@ static int prueth_probe(struct platform_device *pdev)
 	int i, ret;
 
 	np = dev->of_node;
+
+	BUILD_BUG_ON_MSG((sizeof(struct prueth_swdata) > PRUETH_NAV_SW_DATA_SIZE),
+			 "insufficient SW_DATA size");
 
 	prueth = devm_kzalloc(dev, sizeof(*prueth), GFP_KERNEL);
 	if (!prueth)
@@ -1413,13 +2050,10 @@ static int prueth_probe(struct platform_device *pdev)
 		prueth->pa_stats = NULL;
 	}
 
-	if (eth0_node) {
+	if (eth0_node || eth1_node) {
 		ret = prueth_get_cores(prueth, ICSS_SLICE0, false);
 		if (ret)
 			goto put_cores;
-	}
-
-	if (eth1_node) {
 		ret = prueth_get_cores(prueth, ICSS_SLICE1, false);
 		if (ret)
 			goto put_cores;
@@ -1450,10 +2084,15 @@ static int prueth_probe(struct platform_device *pdev)
 		goto put_mem;
 	}
 
-	msmc_ram_size = MSMC_RAM_SIZE;
 	prueth->is_switchmode_supported = prueth->pdata.switch_mode;
-	if (prueth->is_switchmode_supported)
-		msmc_ram_size = MSMC_RAM_SIZE_SWITCH_MODE;
+	if (prueth->pdata.banked_ms_ram) {
+		/* Reserve 2 MSMC RAM banks for buffers to avoid arbitration */
+		msmc_ram_size = (2 * MSMC_RAM_BANK_SIZE);
+	} else {
+		msmc_ram_size = PRUETH_EMAC_TOTAL_BUF_SIZE;
+		if (prueth->is_switchmode_supported)
+			msmc_ram_size = PRUETH_SW_TOTAL_BUF_SIZE;
+	}
 
 	/* NOTE: FW bug needs buffer base to be 64KB aligned */
 	prueth->msmcram.va =
@@ -1494,7 +2133,19 @@ static int prueth_probe(struct platform_device *pdev)
 		icss_iep_init_fw(prueth->iep1);
 	}
 
+	/* Read EMAC firmware names from device tree */
+	icssg_read_firmware_names(np, prueth->icssg_emac_firmwares);
+
+	/* Generate other mode firmware names based on EMAC firmware names */
+	icssg_mode_firmware_names(dev, prueth->icssg_emac_firmwares,
+				  prueth->icssg_switch_firmwares, "eth", "sw");
+	icssg_mode_firmware_names(dev, prueth->icssg_emac_firmwares,
+				  prueth->icssg_hsr_firmwares, "eth", "hsr");
+	icssg_mode_firmware_names(dev, prueth->icssg_emac_firmwares,
+				  prueth->icssg_prp_firmwares, "eth", "prp");
+
 	spin_lock_init(&prueth->vtbl_lock);
+	spin_lock_init(&prueth->stats_lock);
 	/* setup netdev interfaces */
 	if (eth0_node) {
 		ret = prueth_netdev_init(prueth, eth0_node);
@@ -1586,6 +2237,7 @@ netdev_unregister:
 			prueth->emac[i]->ndev->phydev = NULL;
 		}
 		unregister_netdev(prueth->registered_netdevs[i]);
+		disable_work_sync(&prueth->emac[i]->rx_mode_work);
 	}
 
 netdev_exit:
@@ -1609,7 +2261,8 @@ put_iep0:
 
 free_pool:
 	gen_pool_free(prueth->sram_pool,
-		      (unsigned long)prueth->msmcram.va, msmc_ram_size);
+		      (unsigned long)prueth->msmcram.va,
+		      prueth->msmcram.size);
 
 put_mem:
 	pruss_release_mem_region(prueth->pruss, &prueth->shram);
@@ -1618,14 +2271,12 @@ put_pruss:
 	pruss_put(prueth->pruss);
 
 put_cores:
-	if (eth1_node) {
-		prueth_put_cores(prueth, ICSS_SLICE1);
-		of_node_put(eth1_node);
-	}
-
-	if (eth0_node) {
+	if (eth0_node || eth1_node) {
 		prueth_put_cores(prueth, ICSS_SLICE0);
 		of_node_put(eth0_node);
+
+		prueth_put_cores(prueth, ICSS_SLICE1);
+		of_node_put(eth1_node);
 	}
 
 	return ret;
@@ -1646,6 +2297,7 @@ static void prueth_remove(struct platform_device *pdev)
 		phy_disconnect(prueth->emac[i]->ndev->phydev);
 		prueth->emac[i]->ndev->phydev = NULL;
 		unregister_netdev(prueth->registered_netdevs[i]);
+		disable_work_sync(&prueth->emac[i]->rx_mode_work);
 	}
 
 	for (i = 0; i < PRUETH_NUM_MACS; i++) {
@@ -1663,8 +2315,8 @@ static void prueth_remove(struct platform_device *pdev)
 	icss_iep_put(prueth->iep0);
 
 	gen_pool_free(prueth->sram_pool,
-		      (unsigned long)prueth->msmcram.va,
-		      MSMC_RAM_SIZE);
+		(unsigned long)prueth->msmcram.va,
+		prueth->msmcram.size);
 
 	pruss_release_mem_region(prueth->pruss, &prueth->shram);
 
@@ -1681,12 +2333,14 @@ static const struct prueth_pdata am654_icssg_pdata = {
 	.fdqring_mode = K3_RINGACC_RING_MODE_MESSAGE,
 	.quirk_10m_link_issue = 1,
 	.switch_mode = 1,
+	.banked_ms_ram = 0,
 };
 
 static const struct prueth_pdata am64x_icssg_pdata = {
 	.fdqring_mode = K3_RINGACC_RING_MODE_RING,
 	.quirk_10m_link_issue = 1,
 	.switch_mode = 1,
+	.banked_ms_ram = 1,
 };
 
 static const struct of_device_id prueth_dt_match[] = {

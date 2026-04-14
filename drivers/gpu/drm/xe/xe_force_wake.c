@@ -49,9 +49,6 @@ void xe_force_wake_init_gt(struct xe_gt *gt, struct xe_force_wake *fw)
 	fw->gt = gt;
 	spin_lock_init(&fw->lock);
 
-	/* Assuming gen11+ so assert this assumption is correct */
-	xe_gt_assert(gt, GRAPHICS_VER(gt_to_xe(gt)) >= 11);
-
 	if (xe->info.graphics_verx100 >= 1270) {
 		init_domain(fw, XE_FW_DOMAIN_ID_GT,
 			    FORCEWAKE_GT,
@@ -67,10 +64,7 @@ void xe_force_wake_init_engines(struct xe_gt *gt, struct xe_force_wake *fw)
 {
 	int i, j;
 
-	/* Assuming gen11+ so assert this assumption is correct */
-	xe_gt_assert(gt, GRAPHICS_VER(gt_to_xe(gt)) >= 11);
-
-	if (!xe_gt_is_media_type(gt))
+	if (xe_gt_is_main_type(gt))
 		init_domain(fw, XE_FW_DOMAIN_ID_RENDER,
 			    FORCEWAKE_RENDER,
 			    FORCEWAKE_ACK_RENDER);
@@ -171,6 +165,13 @@ static int domain_sleep_wait(struct xe_gt *gt,
  * to check returned ref if it includes any specific domain by using
  * xe_force_wake_ref_has_domain() function. Caller must call
  * xe_force_wake_put() function to decrease incremented refcounts.
+ *
+ * When possible, scope-based forcewake (through CLASS(xe_force_wake, ...) or
+ * xe_with_force_wake()) should be used instead of direct calls to this
+ * function.  Direct usage of get/put should only be used when the function
+ * has goto-based flows that can interfere with scope-based cleanup, or when
+ * the lifetime of the forcewake reference does not match a specific scope
+ * (e.g., forcewake obtained in one function and released in a different one).
  *
  * Return: opaque reference to woken domains or zero if none of requested
  * domains were awake.

@@ -41,7 +41,7 @@
 #ifdef CONFIG_PM_SLEEP
 /* store MBOX context across system-wide suspend/resume transitions */
 struct th1520_mbox_context {
-	u32 intr_mask[TH_1520_MBOX_CHANS - 1];
+	u32 intr_mask[TH_1520_MBOX_CHANS];
 };
 #endif
 
@@ -387,8 +387,10 @@ static void __iomem *th1520_map_mmio(struct platform_device *pdev,
 
 	mapped = devm_ioremap(&pdev->dev, res->start + offset,
 			      resource_size(res) - offset);
-	if (IS_ERR(mapped))
+	if (!mapped) {
 		dev_err(&pdev->dev, "Failed to map resource: %s\n", res_name);
+		return ERR_PTR(-ENOMEM);
+	}
 
 	return mapped;
 }
@@ -433,10 +435,8 @@ static int th1520_mbox_probe(struct platform_device *pdev)
 	}
 
 	ret = devm_add_action_or_reset(dev, th1520_disable_clk, priv);
-	if (ret) {
-		clk_bulk_disable_unprepare(ARRAY_SIZE(priv->clocks), priv->clocks);
+	if (ret)
 		return ret;
-	}
 
 	/*
 	 * The address mappings in the device tree align precisely with those

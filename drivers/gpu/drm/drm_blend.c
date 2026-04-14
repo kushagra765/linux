@@ -75,6 +75,12 @@
  * 	the currently visible vertical area of the &drm_crtc.
  * FB_ID:
  * 	Mode object ID of the &drm_framebuffer this plane should scan out.
+ *
+ *	When a KMS client is performing front-buffer rendering, it should set
+ *	FB_ID to the same front-buffer FB on each atomic commit. This implies
+ *	to the driver that it needs to re-read the same FB again. Otherwise
+ *	drivers which do not employ continuously repeated scanout cycles might
+ *	not update the screen.
  * CRTC_ID:
  * 	Mode object ID of the &drm_crtc this plane should be connected to.
  *
@@ -453,7 +459,7 @@ static int drm_atomic_helper_crtc_normalize_zpos(struct drm_crtc *crtc,
 	drm_dbg_atomic(dev, "[CRTC:%d:%s] calculating normalized zpos values\n",
 		       crtc->base.id, crtc->name);
 
-	states = kmalloc_array(total_planes, sizeof(*states), GFP_KERNEL);
+	states = kmalloc_objs(*states, total_planes);
 	if (!states)
 		return -ENOMEM;
 

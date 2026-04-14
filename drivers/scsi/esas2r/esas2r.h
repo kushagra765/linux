@@ -968,7 +968,8 @@ int esas2r_ioctl_handler(void *hostdata, unsigned int cmd, void __user *arg);
 int esas2r_ioctl(struct scsi_device *dev, unsigned int cmd, void __user *arg);
 u8 handle_hba_ioctl(struct esas2r_adapter *a,
 		    struct atto_ioctl *ioctl_hba);
-int esas2r_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *cmd);
+enum scsi_qc_status esas2r_queuecommand(struct Scsi_Host *host,
+					struct scsi_cmnd *cmd);
 int esas2r_show_info(struct seq_file *m, struct Scsi_Host *sh);
 long esas2r_proc_ioctl(struct file *fp, unsigned int cmd, unsigned long arg);
 
@@ -1411,11 +1412,11 @@ static inline void esas2r_comp_list_drain(struct esas2r_adapter *a,
 }
 
 /* sysfs handlers */
-extern struct bin_attribute bin_attr_fw;
-extern struct bin_attribute bin_attr_fs;
-extern struct bin_attribute bin_attr_vda;
-extern struct bin_attribute bin_attr_hw;
-extern struct bin_attribute bin_attr_live_nvram;
-extern struct bin_attribute bin_attr_default_nvram;
+extern const struct bin_attribute bin_attr_fw;
+extern const struct bin_attribute bin_attr_fs;
+extern const struct bin_attribute bin_attr_vda;
+extern const struct bin_attribute bin_attr_hw;
+extern const struct bin_attribute bin_attr_live_nvram;
+extern const struct bin_attribute bin_attr_default_nvram;
 
 #endif /* ESAS2R_H */

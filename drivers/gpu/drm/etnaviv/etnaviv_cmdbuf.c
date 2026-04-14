@@ -9,7 +9,6 @@
 #include "etnaviv_gem.h"
 #include "etnaviv_gpu.h"
 #include "etnaviv_mmu.h"
-#include "etnaviv_perfmon.h"
 
 #define SUBALLOC_SIZE		SZ_512K
 #define SUBALLOC_GRANULE	SZ_4K
@@ -34,7 +33,7 @@ etnaviv_cmdbuf_suballoc_new(struct device *dev)
 	struct etnaviv_cmdbuf_suballoc *suballoc;
 	int ret;
 
-	suballoc = kzalloc(sizeof(*suballoc), GFP_KERNEL);
+	suballoc = kzalloc_obj(*suballoc);
 	if (!suballoc)
 		return ERR_PTR(-ENOMEM);
 
@@ -100,7 +99,7 @@ retry:
 		mutex_unlock(&suballoc->lock);
 		ret = wait_event_interruptible_timeout(suballoc->free_event,
 						       suballoc->free_space,
-						       msecs_to_jiffies(10 * 1000));
+						       secs_to_jiffies(10));
 		if (!ret) {
 			dev_err(suballoc->dev,
 				"Timeout waiting for cmdbuf space\n");

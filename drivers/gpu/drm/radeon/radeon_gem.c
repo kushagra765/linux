@@ -86,7 +86,7 @@ static void radeon_gem_object_free(struct drm_gem_object *gobj)
 
 	if (robj) {
 		radeon_mn_unregister(robj);
-		ttm_bo_put(&robj->tbo);
+		ttm_bo_fini(&robj->tbo);
 	}
 }
 
@@ -110,7 +110,7 @@ int radeon_gem_object_create(struct radeon_device *rdev, unsigned long size,
 	 */
 	max_size = rdev->mc.gtt_size - rdev->gart_pin_size;
 	if (size > max_size) {
-		DRM_DEBUG("Allocation size %ldMb bigger than %ldMb limit\n",
+		DRM_DEBUG("Allocation size %luMb bigger than %luMb limit\n",
 			  size >> 20, max_size >> 20);
 		return -ENOMEM;
 	}
@@ -560,7 +560,7 @@ int radeon_gem_set_tiling_ioctl(struct drm_device *dev, void *data,
 	struct radeon_bo *robj;
 	int r = 0;
 
-	DRM_DEBUG("%d \n", args->handle);
+	DRM_DEBUG("%u \n", args->handle);
 	gobj = drm_gem_object_lookup(filp, args->handle);
 	if (gobj == NULL)
 		return -ENOENT;
@@ -605,33 +605,40 @@ out:
 static void radeon_gem_va_update_vm(struct radeon_device *rdev,
 				    struct radeon_bo_va *bo_va)
 {
-	struct ttm_validate_buffer tv, *entry;
-	struct radeon_bo_list *vm_bos;
-	struct ww_acquire_ctx ticket;
+	struct radeon_bo_list *vm_bos, *entry;
 	struct list_head list;
+	struct drm_exec exec;
 	unsigned domain;
 	int r;
 
 	INIT_LIST_HEAD(&list);
 
-	tv.bo = &bo_va->bo->tbo;
-	tv.num_shared = 1;
-	list_add(&tv.head, &list);
-
 	vm_bos = radeon_vm_get_bos(rdev, bo_va->vm, &list);
 	if (!vm_bos)
 		return;
 
-	r = ttm_eu_reserve_buffers(&ticket, &list, true, NULL);
-	if (r)
-		goto error_free;
+	drm_exec_init(&exec, DRM_EXEC_INTERRUPTIBLE_WAIT, 0);
+	drm_exec_until_all_locked(&exec) {
+		list_for_each_entry(entry, &list, list) {
+			r = drm_exec_prepare_obj(&exec, &entry->robj->tbo.base,
+						 1);
+			drm_exec_retry_on_contention(&exec);
+			if (unlikely(r))
+				goto error_cleanup;
+		}
 
-	list_for_each_entry(entry, &list, head) {
-		domain = radeon_mem_type_to_domain(entry->bo->resource->mem_type);
+		r = drm_exec_prepare_obj(&exec, &bo_va->bo->tbo.base, 1);
+		drm_exec_retry_on_contention(&exec);
+		if (unlikely(r))
+			goto error_cleanup;
+	}
+
+	list_for_each_entry(entry, &list, list) {
+		domain = radeon_mem_type_to_domain(entry->robj->tbo.resource->mem_type);
 		/* if anything is swapped out don't swap it in here,
 		   just abort and wait for the next CS */
 		if (domain == RADEON_GEM_DOMAIN_CPU)
-			goto error_unreserve;
+			goto error_cleanup;
 	}
 
 	mutex_lock(&bo_va->vm->mutex);
@@ -645,10 +652,8 @@ static void radeon_gem_va_update_vm(struct radeon_device *rdev,
 error_unlock:
 	mutex_unlock(&bo_va->vm->mutex);
 
-error_unreserve:
-	ttm_eu_backoff_reservation(&ticket, &list);
-
-error_free:
+error_cleanup:
+	drm_exec_fini(&exec);
 	kvfree(vm_bos);
 
 	if (r && r != -ERESTARTSYS)
@@ -881,7 +886,7 @@ static int radeon_debugfs_gem_info_show(struct seq_file *m, void *unused)
 			placement = " CPU";
 			break;
 		}
-		seq_printf(m, "bo[0x%08x] %8ldkB %8ldMB %s pid %8ld\n",
+		seq_printf(m, "bo[0x%08x] %8lukB %8luMB %s pid %8lu\n",
 			   i, radeon_bo_size(rbo) >> 10, radeon_bo_size(rbo) >> 20,
 			   placement, (unsigned long)rbo->pid);
 		i++;

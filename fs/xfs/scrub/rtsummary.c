@@ -3,7 +3,7 @@
  * Copyright (C) 2017-2023 Oracle.  All Rights Reserved.
  * Author: Darrick J. Wong <djwong@kernel.org>
  */
-#include "xfs.h"
+#include "xfs_platform.h"
 #include "xfs_fs.h"
 #include "xfs_shared.h"
 #include "xfs_format.h"
@@ -43,15 +43,13 @@ xchk_setup_rtsummary(
 	struct xfs_scrub	*sc)
 {
 	struct xfs_mount	*mp = sc->mp;
-	char			*descr;
 	struct xchk_rtsummary	*rts;
 	int			error;
 
 	if (xchk_need_intent_drain(sc))
 		xchk_fsgates_enable(sc, XCHK_FSGATES_DRAIN);
 
-	rts = kvzalloc(struct_size(rts, words, mp->m_blockwsize),
-			XCHK_GFP_FLAGS);
+	rts = kvzalloc_flex(*rts, words, mp->m_blockwsize, XCHK_GFP_FLAGS);
 	if (!rts)
 		return -ENOMEM;
 	sc->buf = rts;
@@ -70,10 +68,8 @@ xchk_setup_rtsummary(
 	 * Create an xfile to construct a new rtsummary file.  The xfile allows
 	 * us to avoid pinning kernel memory for this purpose.
 	 */
-	descr = xchk_xfile_descr(sc, "realtime summary file");
-	error = xfile_create(descr, XFS_FSB_TO_B(mp, mp->m_rsumblocks),
-			&sc->xfile);
-	kfree(descr);
+	error = xfile_create("realtime summary file",
+			XFS_FSB_TO_B(mp, mp->m_rsumblocks), &sc->xfile);
 	if (error)
 		return error;
 
@@ -81,12 +77,15 @@ xchk_setup_rtsummary(
 	if (error)
 		return error;
 
-	error = xchk_install_live_inode(sc,
-			sc->sr.rtg->rtg_inodes[XFS_RTGI_SUMMARY]);
+	error = xchk_install_live_inode(sc, rtg_summary(sc->sr.rtg));
 	if (error)
 		return error;
 
 	error = xchk_ino_dqattach(sc);
+	if (error)
+		return error;
+
+	error = xchk_rtgroup_lock(sc, &sc->sr, XFS_RTGLOCK_BITMAP);
 	if (error)
 		return error;
 
@@ -100,7 +99,6 @@ xchk_setup_rtsummary(
 	 * exclusively here.  If we ever start caring about running concurrent
 	 * fsmap with scrub this could be changed.
 	 */
-	xchk_rtgroup_lock(&sc->sr, XFS_RTGLOCK_BITMAP);
 	if (mp->m_sb.sb_rblocks) {
 		rts->rextents = xfs_blen_to_rtbxlen(mp, mp->m_sb.sb_rblocks);
 		rts->rbmblocks = xfs_rtbitmap_blockcount(mp);
@@ -191,8 +189,7 @@ xchk_rtsum_record_free(
 	rtlen = xfs_rtxlen_to_extlen(mp, rec->ar_extcount);
 
 	if (!xfs_verify_rtbext(mp, rtbno, rtlen)) {
-		xchk_ino_xref_set_corrupt(sc,
-				rtg->rtg_inodes[XFS_RTGI_BITMAP]->i_ino);
+		xchk_ino_xref_set_corrupt(sc, rtg_bitmap(rtg)->i_ino);
 		return -EFSCORRUPTED;
 	}
 
@@ -218,7 +215,7 @@ xchk_rtsum_compute(
 
 	/* If the bitmap size doesn't match the computed size, bail. */
 	if (XFS_FSB_TO_B(mp, xfs_rtbitmap_blockcount(mp)) !=
-	    rtg->rtg_inodes[XFS_RTGI_BITMAP]->i_disk_size)
+	    rtg_bitmap(rtg)->i_disk_size)
 		return -EFSCORRUPTED;
 
 	return xfs_rtalloc_query_all(rtg, sc->tp, xchk_rtsum_record_free, sc);
@@ -310,8 +307,8 @@ xchk_rtsummary(
 {
 	struct xfs_mount	*mp = sc->mp;
 	struct xfs_rtgroup	*rtg = sc->sr.rtg;
-	struct xfs_inode	*rbmip = rtg->rtg_inodes[XFS_RTGI_BITMAP];
-	struct xfs_inode	*rsumip = rtg->rtg_inodes[XFS_RTGI_SUMMARY];
+	struct xfs_inode	*rbmip = rtg_bitmap(rtg);
+	struct xfs_inode	*rsumip = rtg_summary(rtg);
 	struct xchk_rtsummary	*rts = sc->buf;
 	int			error;
 

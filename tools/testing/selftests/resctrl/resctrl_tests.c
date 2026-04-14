@@ -23,15 +23,23 @@ static struct resctrl_test *resctrl_tests[] = {
 	&l2_noncont_cat_test,
 };
 
-static int detect_vendor(void)
+static unsigned int detect_vendor(void)
 {
-	FILE *inf = fopen("/proc/cpuinfo", "r");
-	int vendor_id = 0;
+	static unsigned int vendor_id;
+	static bool initialized;
 	char *s = NULL;
+	FILE *inf;
 	char *res;
 
-	if (!inf)
+	if (initialized)
 		return vendor_id;
+
+	inf = fopen("/proc/cpuinfo", "r");
+	if (!inf) {
+		vendor_id = 0;
+		initialized = true;
+		return vendor_id;
+	}
 
 	res = fgrep(inf, "vendor_id");
 
@@ -42,18 +50,22 @@ static int detect_vendor(void)
 		vendor_id = ARCH_INTEL;
 	else if (s && !strcmp(s, ": AuthenticAMD\n"))
 		vendor_id = ARCH_AMD;
+	else if (s && !strcmp(s, ": HygonGenuine\n"))
+		vendor_id = ARCH_HYGON;
 
 	fclose(inf);
 	free(res);
+
+	initialized = true;
 	return vendor_id;
 }
 
-int get_vendor(void)
+unsigned int get_vendor(void)
 {
-	static int vendor = -1;
+	unsigned int vendor;
 
-	if (vendor == -1)
-		vendor = detect_vendor();
+	vendor = detect_vendor();
+
 	if (vendor == 0)
 		ksft_print_msg("Can not get vendor info...\n");
 
@@ -118,7 +130,7 @@ static bool test_vendor_specific_check(const struct resctrl_test *test)
 
 static void run_single_test(const struct resctrl_test *test, const struct user_params *uparams)
 {
-	int ret;
+	int ret, snc_mode;
 
 	if (test->disabled)
 		return;
@@ -128,7 +140,14 @@ static void run_single_test(const struct resctrl_test *test, const struct user_p
 		return;
 	}
 
+	snc_mode = snc_nodes_per_l3_cache();
+
 	ksft_print_msg("Starting %s test ...\n", test->name);
+
+	if (snc_mode == 1 && snc_unreliable && get_vendor() == ARCH_INTEL) {
+		ksft_test_result_skip("SNC detection unreliable due to offline CPUs. Test results may not be accurate if SNC enabled.\n");
+		return;
+	}
 
 	if (test_prepare(test)) {
 		ksft_exit_fail_msg("Abnormal failure when preparing for the test\n");

@@ -45,7 +45,7 @@ extern unsigned long __atags_pointer;
  * empty_zero_page is a special page that is used for
  * zero-initialized data and COW.
  */
-struct page *empty_zero_page;
+unsigned long empty_zero_page[PAGE_SIZE / sizeof(unsigned long)] __page_aligned_bss;
 EXPORT_SYMBOL(empty_zero_page);
 
 /*
@@ -726,13 +726,8 @@ EXPORT_SYMBOL(phys_mem_access_prot);
 
 static void __init *early_alloc(unsigned long sz)
 {
-	void *ptr = memblock_alloc(sz, sz);
+	return memblock_alloc_or_panic(sz, sz);
 
-	if (!ptr)
-		panic("%s: Failed to allocate %lu bytes align=0x%lx\n",
-		      __func__, sz, sz);
-
-	return ptr;
 }
 
 static void *__init late_alloc(unsigned long sz)
@@ -740,9 +735,9 @@ static void *__init late_alloc(unsigned long sz)
 	void *ptdesc = pagetable_alloc(GFP_PGTABLE_KERNEL & ~__GFP_HIGHMEM,
 			get_order(sz));
 
-	if (!ptdesc || !pagetable_pte_ctor(ptdesc))
+	if (!ptdesc || !pagetable_pte_ctor(NULL, ptdesc))
 		BUG();
-	return ptdesc_to_virt(ptdesc);
+	return ptdesc_address(ptdesc);
 }
 
 static pte_t * __init arm_pte_alloc(pmd_t *pmd, unsigned long addr,
@@ -1027,10 +1022,7 @@ void __init iotable_init(struct map_desc *io_desc, int nr)
 	if (!nr)
 		return;
 
-	svm = memblock_alloc(sizeof(*svm) * nr, __alignof__(*svm));
-	if (!svm)
-		panic("%s: Failed to allocate %zu bytes align=0x%zx\n",
-		      __func__, sizeof(*svm) * nr, __alignof__(*svm));
+	svm = memblock_alloc_or_panic(sizeof(*svm) * nr, __alignof__(*svm));
 
 	for (md = io_desc; nr; md++, nr--) {
 		create_mapping(md);
@@ -1052,10 +1044,7 @@ void __init vm_reserve_area_early(unsigned long addr, unsigned long size,
 	struct vm_struct *vm;
 	struct static_vm *svm;
 
-	svm = memblock_alloc(sizeof(*svm), __alignof__(*svm));
-	if (!svm)
-		panic("%s: Failed to allocate %zu bytes align=0x%zx\n",
-		      __func__, sizeof(*svm), __alignof__(*svm));
+	svm = memblock_alloc_or_panic(sizeof(*svm), __alignof__(*svm));
 
 	vm = &svm->vm;
 	vm->addr = (void *)addr;
@@ -1765,8 +1754,6 @@ static void __init early_fixmap_shutdown(void)
  */
 void __init paging_init(const struct machine_desc *mdesc)
 {
-	void *zero_page;
-
 #ifdef CONFIG_XIP_KERNEL
 	/* Store the kernel RW RAM region start/end in these variables */
 	kernel_sec_start = CONFIG_PHYS_OFFSET & SECTION_MASK;
@@ -1792,13 +1779,7 @@ void __init paging_init(const struct machine_desc *mdesc)
 
 	top_pmd = pmd_off_k(0xffff0000);
 
-	/* allocate the zero page. */
-	zero_page = early_alloc(PAGE_SIZE);
-
 	bootmem_init();
-
-	empty_zero_page = virt_to_page(zero_page);
-	__flush_dcache_folio(NULL, page_folio(empty_zero_page));
 }
 
 void __init early_mm_init(const struct machine_desc *mdesc)

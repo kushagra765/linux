@@ -104,7 +104,7 @@ qed_mcp_cmd_add_elem(struct qed_hwfn *p_hwfn,
 {
 	struct qed_mcp_cmd_elem *p_cmd_elem = NULL;
 
-	p_cmd_elem = kzalloc(sizeof(*p_cmd_elem), GFP_ATOMIC);
+	p_cmd_elem = kzalloc_obj(*p_cmd_elem, GFP_ATOMIC);
 	if (!p_cmd_elem)
 		goto out;
 
@@ -241,7 +241,7 @@ int qed_mcp_cmd_init(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
 	u32 size;
 
 	/* Allocate mcp_info structure */
-	p_hwfn->mcp_info = kzalloc(sizeof(*p_hwfn->mcp_info), GFP_KERNEL);
+	p_hwfn->mcp_info = kzalloc_obj(*p_hwfn->mcp_info);
 	if (!p_hwfn->mcp_info)
 		goto err;
 	p_info = p_hwfn->mcp_info;
@@ -3358,15 +3358,15 @@ int qed_mcp_nvm_info_populate(struct qed_hwfn *p_hwfn)
 					     p_ptt, &nvm_info.num_images);
 	if (rc == -EOPNOTSUPP) {
 		DP_INFO(p_hwfn, "DRV_MSG_CODE_BIST_TEST is not supported\n");
+		nvm_info.num_images = 0;
 		goto out;
 	} else if (rc || !nvm_info.num_images) {
 		DP_ERR(p_hwfn, "Failed getting number of images\n");
 		goto err0;
 	}
 
-	nvm_info.image_att = kmalloc_array(nvm_info.num_images,
-					   sizeof(struct bist_nvm_image_att),
-					   GFP_KERNEL);
+	nvm_info.image_att = kmalloc_objs(struct bist_nvm_image_att,
+					  nvm_info.num_images);
 	if (!nvm_info.image_att) {
 		rc = -ENOMEM;
 		goto err0;

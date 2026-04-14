@@ -14,7 +14,6 @@
 #include "dce_v8_0.h"
 #endif
 #include "dce_v10_0.h"
-#include "dce_v11_0.h"
 #include "ivsrcid/ivsrcid_vislands30.h"
 #include "amdgpu_vkms.h"
 #include "amdgpu_display.h"
@@ -54,7 +53,9 @@ static enum hrtimer_restart amdgpu_vkms_vblank_simulate(struct hrtimer *timer)
 	ret_overrun = hrtimer_forward_now(&amdgpu_crtc->vblank_timer,
 					  output->period_ns);
 	if (ret_overrun != 1)
-		DRM_WARN("%s: vblank timer overrun\n", __func__);
+		drm_warn(amdgpu_crtc->base.dev,
+			 "%s: vblank timer overrun count: %llu\n",
+			 __func__, ret_overrun);
 
 	ret = drm_crtc_handle_vblank(crtc);
 	/* Don't queue timer again when vblank is disabled. */
@@ -188,8 +189,8 @@ static int amdgpu_vkms_crtc_init(struct drm_device *dev, struct drm_crtc *crtc,
 	amdgpu_crtc->connector = NULL;
 	amdgpu_crtc->vsync_timer_enabled = AMDGPU_IRQ_STATE_DISABLE;
 
-	hrtimer_init(&amdgpu_crtc->vblank_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	amdgpu_crtc->vblank_timer.function = &amdgpu_vkms_vblank_simulate;
+	hrtimer_setup(&amdgpu_crtc->vblank_timer, &amdgpu_vkms_vblank_simulate, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_REL);
 
 	return ret;
 }
@@ -410,7 +411,7 @@ static struct drm_plane *amdgpu_vkms_plane_init(struct drm_device *dev,
 	struct drm_plane *plane;
 	int ret;
 
-	plane = kzalloc(sizeof(*plane), GFP_KERNEL);
+	plane = kzalloc_obj(*plane);
 	if (!plane)
 		return ERR_PTR(-ENOMEM);
 
@@ -498,8 +499,8 @@ static int amdgpu_vkms_sw_init(struct amdgpu_ip_block *ip_block)
 	int r, i;
 	struct amdgpu_device *adev = ip_block->adev;
 
-	adev->amdgpu_vkms_output = kcalloc(adev->mode_info.num_crtc,
-		sizeof(struct amdgpu_vkms_output), GFP_KERNEL);
+	adev->amdgpu_vkms_output = kzalloc_objs(struct amdgpu_vkms_output,
+						adev->mode_info.num_crtc);
 	if (!adev->amdgpu_vkms_output)
 		return -ENOMEM;
 
@@ -581,13 +582,6 @@ static int amdgpu_vkms_hw_init(struct amdgpu_ip_block *ip_block)
 	case CHIP_TONGA:
 		dce_v10_0_disable_dce(adev);
 		break;
-	case CHIP_CARRIZO:
-	case CHIP_STONEY:
-	case CHIP_POLARIS10:
-	case CHIP_POLARIS11:
-	case CHIP_VEGAM:
-		dce_v11_0_disable_dce(adev);
-		break;
 	case CHIP_TOPAZ:
 #ifdef CONFIG_DRM_AMDGPU_SI
 	case CHIP_HAINAN:
@@ -627,18 +621,18 @@ static int amdgpu_vkms_resume(struct amdgpu_ip_block *ip_block)
 	return drm_mode_config_helper_resume(adev_to_drm(ip_block->adev));
 }
 
-static bool amdgpu_vkms_is_idle(void *handle)
+static bool amdgpu_vkms_is_idle(struct amdgpu_ip_block *ip_block)
 {
 	return true;
 }
 
-static int amdgpu_vkms_set_clockgating_state(void *handle,
+static int amdgpu_vkms_set_clockgating_state(struct amdgpu_ip_block *ip_block,
 					  enum amd_clockgating_state state)
 {
 	return 0;
 }
 
-static int amdgpu_vkms_set_powergating_state(void *handle,
+static int amdgpu_vkms_set_powergating_state(struct amdgpu_ip_block *ip_block,
 					  enum amd_powergating_state state)
 {
 	return 0;

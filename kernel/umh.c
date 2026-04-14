@@ -359,7 +359,7 @@ struct subprocess_info *call_usermodehelper_setup(const char *path, char **argv,
 		void *data)
 {
 	struct subprocess_info *sub_info;
-	sub_info = kzalloc(sizeof(struct subprocess_info), gfp_mask);
+	sub_info = kzalloc_obj(struct subprocess_info, gfp_mask);
 	if (!sub_info)
 		goto out;
 
@@ -544,7 +544,7 @@ static int proc_cap_handler(const struct ctl_table *table, int write,
 	return 0;
 }
 
-static struct ctl_table usermodehelper_table[] = {
+static const struct ctl_table usermodehelper_table[] = {
 	{
 		.procname	= "bset",
 		.data		= &usermodehelper_bset,

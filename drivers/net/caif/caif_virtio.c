@@ -493,7 +493,7 @@ static struct buf_info *cfv_alloc_and_copy_to_shm(struct cfv_info *cfv,
 		goto err;
 	}
 
-	buf_info = kmalloc(sizeof(struct buf_info), GFP_ATOMIC);
+	buf_info = kmalloc_obj(struct buf_info, GFP_ATOMIC);
 	if (unlikely(!buf_info))
 		goto err;
 
@@ -745,7 +745,7 @@ err:
 
 	if (cfv->vr_rx)
 		vdev->vringh_config->del_vrhs(cfv->vdev);
-	if (cfv->vdev)
+	if (cfv->vq_tx)
 		vdev->config->del_vqs(cfv->vdev);
 	free_netdev(netdev);
 	return err;

@@ -156,7 +156,7 @@ static bool batadv_frag_insert_packet(struct batadv_orig_node *orig_node,
 	seqno = ntohs(frag_packet->seqno);
 	bucket = seqno % BATADV_FRAG_BUFFER_COUNT;
 
-	frag_entry_new = kmalloc(sizeof(*frag_entry_new), GFP_ATOMIC);
+	frag_entry_new = kmalloc_obj(*frag_entry_new, GFP_ATOMIC);
 	if (!frag_entry_new)
 		goto err;
 
@@ -349,7 +349,7 @@ bool batadv_frag_skb_fwd(struct sk_buff *skb,
 			 struct batadv_hard_iface *recv_if,
 			 struct batadv_orig_node *orig_node_src)
 {
-	struct batadv_priv *bat_priv = netdev_priv(recv_if->soft_iface);
+	struct batadv_priv *bat_priv = netdev_priv(recv_if->mesh_iface);
 	struct batadv_neigh_node *neigh_node = NULL;
 	struct batadv_frag_packet *packet;
 	u16 total_size;

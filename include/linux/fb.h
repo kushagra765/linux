@@ -18,6 +18,7 @@ struct backlight_device;
 struct device;
 struct device_node;
 struct fb_info;
+struct fbcon_par;
 struct file;
 struct i2c_adapter;
 struct inode;
@@ -129,17 +130,11 @@ struct fb_cursor_user {
  * Register/unregister for framebuffer events
  */
 
-/*	The resolution of the passed in fb_info about to change */
-#define FB_EVENT_MODE_CHANGE		0x01
-
 #ifdef CONFIG_GUMSTIX_AM200EPD
 /* only used by mach-pxa/am200epd.c */
 #define FB_EVENT_FB_REGISTERED          0x05
 #define FB_EVENT_FB_UNREGISTERED        0x06
 #endif
-
-/*      A display blank is requested       */
-#define FB_EVENT_BLANK                  0x09
 
 struct fb_event {
 	struct fb_info *info;
@@ -225,6 +220,7 @@ struct fb_deferred_io {
 	int open_count; /* number of opened files; protected by fb_info lock */
 	struct mutex lock; /* mutex that protects the pageref list */
 	struct list_head pagereflist; /* list of pagerefs for touched pages */
+	struct address_space *mapping; /* page cache object for fb device */
 	/* callback */
 	struct page *(*get_page)(struct fb_info *info, unsigned long offset);
 	void (*deferred_io)(struct fb_info *info, struct list_head *pagelist);
@@ -309,10 +305,6 @@ struct fb_ops {
 
 	/* teardown any resources to do with this framebuffer */
 	void (*fb_destroy)(struct fb_info *info);
-
-	/* called at KDB enter and leave time to prepare the console */
-	int (*fb_debug_enter)(struct fb_info *info);
-	int (*fb_debug_leave)(struct fb_info *info);
 };
 
 #ifdef CONFIG_FB_TILEBLITTING
@@ -471,6 +463,8 @@ struct fb_info {
 	struct list_head modelist;      /* mode list */
 	struct fb_videomode *mode;	/* current mode */
 
+	int blank; /* current blanking; see FB_BLANK_ constants */
+
 #if IS_ENABLED(CONFIG_FB_BACKLIGHT)
 	/* assigned backlight device */
 	/* set before framebuffer registration,
@@ -500,7 +494,6 @@ struct fb_info {
 #if defined(CONFIG_FB_DEVICE)
 	struct device *dev;		/* This is this fb device */
 #endif
-	int class_flag;                    /* private sysfs flags */
 #ifdef CONFIG_FB_TILEBLITTING
 	struct fb_tile_ops *tileops;    /* Tile Blitting */
 #endif
@@ -513,7 +506,7 @@ struct fb_info {
 #define FBINFO_STATE_RUNNING	0
 #define FBINFO_STATE_SUSPENDED	1
 	u32 state;			/* Hardware state i.e suspend */
-	void *fbcon_par;                /* fbcon use-only private area */
+	struct fbcon_par *fbcon_par;    /* fbcon use-only private area */
 	/* From here on everything is device dependent */
 	void *par;
 
@@ -629,6 +622,15 @@ static inline void lock_fb_info(struct fb_info *info)
 static inline void unlock_fb_info(struct fb_info *info)
 {
 	mutex_unlock(&info->lock);
+}
+
+static inline struct device *dev_of_fbinfo(const struct fb_info *info)
+{
+#ifdef CONFIG_FB_DEVICE
+	return info->dev;
+#else
+	return NULL;
+#endif
 }
 
 static inline void __fb_pad_aligned_buffer(u8 *dst, u32 d_pitch,
@@ -755,11 +757,15 @@ extern void fb_bl_default_curve(struct fb_info *fb_info, u8 off, u8 min, u8 max)
 
 #if IS_ENABLED(CONFIG_FB_BACKLIGHT)
 struct backlight_device *fb_bl_device(struct fb_info *info);
+void fb_bl_notify_blank(struct fb_info *info, int old_blank);
 #else
 static inline struct backlight_device *fb_bl_device(struct fb_info *info)
 {
 	return NULL;
 }
+
+static inline void fb_bl_notify_blank(struct fb_info *info, int old_blank)
+{ }
 #endif
 
 static inline struct lcd_device *fb_lcd_device(struct fb_info *info)

@@ -55,18 +55,23 @@ struct sdw_slave;
 #define REGMAP_DOWNSHIFT(s)	(s)
 
 /*
- * The supported cache types, the default is no cache.  Any new caches
- * should usually use the maple tree cache unless they specifically
- * require that there are never any allocations at runtime and can't
- * provide defaults in which case they should use the flat cache.  The
- * rbtree cache *may* have some performance advantage for very low end
- * systems that make heavy use of cache syncs but is mainly legacy.
+ * The supported cache types, the default is no cache.  Any new caches should
+ * usually use the maple tree cache unless they specifically require that there
+ * are never any allocations at runtime in which case they should use the sparse
+ * flat cache.  The rbtree cache *may* have some performance advantage for very
+ * low end systems that make heavy use of cache syncs but is mainly legacy.
+ * These caches are sparse and entries will be initialized from hardware if no
+ * default has been provided.
+ * The non-sparse flat cache is provided for compatibility with existing users
+ * and will zero-initialize cache entries for which no defaults are provided.
+ * New users should use the sparse flat cache.
  */
 enum regcache_type {
 	REGCACHE_NONE,
 	REGCACHE_RBTREE,
 	REGCACHE_FLAT,
 	REGCACHE_MAPLE,
+	REGCACHE_FLAT_S,
 };
 
 /**
@@ -354,6 +359,10 @@ typedef void (*regmap_unlock)(void *);
  * @reg_defaults: Power on reset values for registers (for use with
  *                register cache support).
  * @num_reg_defaults: Number of elements in reg_defaults.
+ * @reg_default_cb: Optional callback to return default values for registers
+ *                  not listed in reg_defaults. This is only used for
+ *                  REGCACHE_FLAT population; drivers must ensure the readable_reg/
+ *                  writeable_reg callbacks are defined to handle holes.
  *
  * @read_flag_mask: Mask to be set in the top bytes of the register when doing
  *                  a read.
@@ -444,6 +453,8 @@ struct regmap_config {
 	const struct regmap_access_table *rd_noinc_table;
 	const struct reg_default *reg_defaults;
 	unsigned int num_reg_defaults;
+	int (*reg_default_cb)(struct device *dev, unsigned int reg,
+			      unsigned int *def);
 	enum regcache_type cache_type;
 	const void *reg_defaults_raw;
 	unsigned int num_reg_defaults_raw;
@@ -504,6 +515,32 @@ struct regmap_range_cfg {
 	/* Data window (per each page) */
 	unsigned int window_start;
 	unsigned int window_len;
+};
+
+/**
+ * struct regmap_sdw_mbq_cfg - Configuration for Multi-Byte Quantities
+ *
+ * @mbq_size: Callback returning the actual size of the given register.
+ * @deferrable: Callback returning true if the hardware can defer
+ *              transactions to the given register. Deferral should
+ *              only be used by SDCA parts and typically which controls
+ *              are deferrable will be specified in either as a hard
+ *              coded list or from the DisCo tables in the platform
+ *              firmware.
+ *
+ * @timeout_us: The time in microseconds after which waiting for a deferred
+ *              transaction should time out.
+ * @retry_us: The time in microseconds between polls of the function busy
+ *            status whilst waiting for an opportunity to retry a deferred
+ *            transaction.
+ *
+ * Provides additional configuration required for SoundWire MBQ register maps.
+ */
+struct regmap_sdw_mbq_cfg {
+	int (*mbq_size)(struct device *dev, unsigned int reg);
+	bool (*deferrable)(struct device *dev, unsigned int reg);
+	unsigned long timeout_us;
+	unsigned long retry_us;
 };
 
 struct regmap_async;
@@ -650,8 +687,9 @@ struct regmap *__regmap_init_sdw(struct sdw_slave *sdw,
 				 const struct regmap_config *config,
 				 struct lock_class_key *lock_key,
 				 const char *lock_name);
-struct regmap *__regmap_init_sdw_mbq(struct sdw_slave *sdw,
+struct regmap *__regmap_init_sdw_mbq(struct device *dev, struct sdw_slave *sdw,
 				     const struct regmap_config *config,
+				     const struct regmap_sdw_mbq_cfg *mbq_config,
 				     struct lock_class_key *lock_key,
 				     const char *lock_name);
 struct regmap *__regmap_init_spi_avmm(struct spi_device *spi,
@@ -711,8 +749,9 @@ struct regmap *__devm_regmap_init_sdw(struct sdw_slave *sdw,
 				 const struct regmap_config *config,
 				 struct lock_class_key *lock_key,
 				 const char *lock_name);
-struct regmap *__devm_regmap_init_sdw_mbq(struct sdw_slave *sdw,
+struct regmap *__devm_regmap_init_sdw_mbq(struct device *dev, struct sdw_slave *sdw,
 					  const struct regmap_config *config,
+					  const struct regmap_sdw_mbq_cfg *mbq_config,
 					  struct lock_class_key *lock_key,
 					  const char *lock_name);
 struct regmap *__devm_regmap_init_slimbus(struct slim_device *slimbus,
@@ -885,7 +924,7 @@ int regmap_attach_dev(struct device *dev, struct regmap *map,
  * @config: Configuration for register map
  *
  * The return value will be an ERR_PTR() on error or a valid pointer to
- * a struct regmap.
+ * a struct regmap. Implies 'fast_io'.
  */
 #define regmap_init_mmio_clk(dev, clk_id, regs, config)			\
 	__regmap_lockdep_wrapper(__regmap_init_mmio_clk, #config,	\
@@ -899,7 +938,7 @@ int regmap_attach_dev(struct device *dev, struct regmap *map,
  * @config: Configuration for register map
  *
  * The return value will be an ERR_PTR() on error or a valid pointer to
- * a struct regmap.
+ * a struct regmap. Implies 'fast_io'.
  */
 #define regmap_init_mmio(dev, regs, config)		\
 	regmap_init_mmio_clk(dev, NULL, regs, config)
@@ -942,7 +981,22 @@ bool regmap_ac97_default_volatile(struct device *dev, unsigned int reg);
  */
 #define regmap_init_sdw_mbq(sdw, config)					\
 	__regmap_lockdep_wrapper(__regmap_init_sdw_mbq, #config,		\
-				sdw, config)
+				&sdw->dev, sdw, config, NULL)
+
+/**
+ * regmap_init_sdw_mbq_cfg() - Initialise MBQ SDW register map with config
+ *
+ * @sdw: Device that will be interacted with
+ * @config: Configuration for register map
+ * @mbq_config: Properties for the MBQ registers
+ *
+ * The return value will be an ERR_PTR() on error or a valid pointer
+ * to a struct regmap. The regmap will be automatically freed by the
+ * device management code.
+ */
+#define regmap_init_sdw_mbq_cfg(dev, sdw, config, mbq_config)		\
+	__regmap_lockdep_wrapper(__regmap_init_sdw_mbq, #config,	\
+				dev, sdw, config, mbq_config)
 
 /**
  * regmap_init_spi_avmm() - Initialize register map for Intel SPI Slave
@@ -1095,7 +1149,7 @@ bool regmap_ac97_default_volatile(struct device *dev, unsigned int reg);
  *
  * The return value will be an ERR_PTR() on error or a valid pointer
  * to a struct regmap.  The regmap will be automatically freed by the
- * device management code.
+ * device management code. Implies 'fast_io'.
  */
 #define devm_regmap_init_mmio_clk(dev, clk_id, regs, config)		\
 	__regmap_lockdep_wrapper(__devm_regmap_init_mmio_clk, #config,	\
@@ -1110,7 +1164,7 @@ bool regmap_ac97_default_volatile(struct device *dev, unsigned int reg);
  *
  * The return value will be an ERR_PTR() on error or a valid pointer
  * to a struct regmap.  The regmap will be automatically freed by the
- * device management code.
+ * device management code. Implies 'fast_io'.
  */
 #define devm_regmap_init_mmio(dev, regs, config)		\
 	devm_regmap_init_mmio_clk(dev, NULL, regs, config)
@@ -1155,7 +1209,23 @@ bool regmap_ac97_default_volatile(struct device *dev, unsigned int reg);
  */
 #define devm_regmap_init_sdw_mbq(sdw, config)			\
 	__regmap_lockdep_wrapper(__devm_regmap_init_sdw_mbq, #config,   \
-				sdw, config)
+				&sdw->dev, sdw, config, NULL)
+
+/**
+ * devm_regmap_init_sdw_mbq_cfg() - Initialise managed MBQ SDW register map with config
+ *
+ * @dev: Device that will be interacted with
+ * @sdw: SoundWire Device that will be interacted with
+ * @config: Configuration for register map
+ * @mbq_config: Properties for the MBQ registers
+ *
+ * The return value will be an ERR_PTR() on error or a valid pointer
+ * to a struct regmap. The regmap will be automatically freed by the
+ * device management code.
+ */
+#define devm_regmap_init_sdw_mbq_cfg(dev, sdw, config, mbq_config)	\
+	__regmap_lockdep_wrapper(__devm_regmap_init_sdw_mbq,		\
+				#config, dev, sdw, config, mbq_config)
 
 /**
  * devm_regmap_init_slimbus() - Initialise managed register map
@@ -1244,7 +1314,7 @@ int regmap_noinc_read(struct regmap *map, unsigned int reg,
 		      void *val, size_t val_len);
 int regmap_bulk_read(struct regmap *map, unsigned int reg, void *val,
 		     size_t val_count);
-int regmap_multi_reg_read(struct regmap *map, unsigned int *reg, void *val,
+int regmap_multi_reg_read(struct regmap *map, const unsigned int *reg, void *val,
 			  size_t val_count);
 int regmap_update_bits_base(struct regmap *map, unsigned int reg,
 			    unsigned int mask, unsigned int val,
@@ -1285,6 +1355,14 @@ static inline int regmap_write_bits(struct regmap *map, unsigned int reg,
 	return regmap_update_bits_base(map, reg, mask, val, NULL, false, true);
 }
 
+static inline int regmap_default_zero_cb(struct device *dev,
+					 unsigned int reg,
+					 unsigned int *def)
+{
+	*def = 0;
+	return 0;
+}
+
 int regmap_get_val_bytes(struct regmap *map);
 int regmap_get_max_register(struct regmap *map);
 int regmap_get_reg_stride(struct regmap *map);
@@ -1294,6 +1372,7 @@ bool regmap_can_raw_write(struct regmap *map);
 size_t regmap_get_raw_read_max(struct regmap *map);
 size_t regmap_get_raw_write_max(struct regmap *map);
 
+void regcache_sort_defaults(struct reg_default *defaults, unsigned int ndefaults);
 int regcache_sync(struct regmap *map);
 int regcache_sync_region(struct regmap *map, unsigned int min,
 			 unsigned int max);
@@ -1582,7 +1661,9 @@ struct regmap_irq_chip_data;
  * @ack_invert:  Inverted ack register: cleared bits for ack.
  * @clear_ack:  Use this to set 1 and 0 or vice-versa to clear interrupts.
  * @status_invert: Inverted status register: cleared bits are active interrupts.
- * @wake_invert: Inverted wake register: cleared bits are wake enabled.
+ * @status_is_level: Status register is actuall signal level: Xor status
+ *		     register with previous value to get active interrupts.
+ * @wake_invert: Inverted wake register: cleared bits are wake disabled.
  * @type_in_mask: Use the mask registers for controlling irq type. Use this if
  *		  the hardware provides separate bits for rising/falling edge
  *		  or low/high level interrupts and they should be combined into
@@ -1645,6 +1726,7 @@ struct regmap_irq_chip {
 	unsigned int ack_invert:1;
 	unsigned int clear_ack:1;
 	unsigned int status_invert:1;
+	unsigned int status_is_level:1;
 	unsigned int wake_invert:1;
 	unsigned int type_in_mask:1;
 	unsigned int clear_on_unmask:1;
@@ -1983,6 +2065,12 @@ static inline bool regmap_might_sleep(struct regmap *map)
 {
 	WARN_ONCE(1, "regmap API is disabled");
 	return true;
+}
+
+static inline void regcache_sort_defaults(struct reg_default *defaults,
+					  unsigned int ndefaults)
+{
+	WARN_ONCE(1, "regmap API is disabled");
 }
 
 static inline int regcache_sync(struct regmap *map)

@@ -370,7 +370,7 @@ static void divvy_up_power(struct power_actor *power, int num_actors,
 
 	for (i = 0; i < num_actors; i++) {
 		struct power_actor *pa = &power[i];
-		u64 req_range = (u64)pa->req_power * power_range;
+		u64 req_range = (u64)pa->weighted_req_power * power_range;
 
 		pa->granted_power = DIV_ROUND_CLOSEST_ULL(req_range,
 							  total_req_power);
@@ -622,8 +622,7 @@ static int allocate_actors_buffer(struct power_allocator_params *params,
 		goto clean_state;
 	}
 
-	params->power = kcalloc(num_actors, sizeof(struct power_actor),
-				GFP_KERNEL);
+	params->power = kzalloc_objs(struct power_actor, num_actors);
 	if (!params->power) {
 		ret = -ENOMEM;
 		goto clean_state;
@@ -641,6 +640,22 @@ clean_state:
 	return ret;
 }
 
+static void power_allocator_update_weight(struct power_allocator_params *params)
+{
+	const struct thermal_trip_desc *td;
+	struct thermal_instance *instance;
+
+	if (!params->trip_max)
+		return;
+
+	td = trip_to_trip_desc(params->trip_max);
+
+	params->total_weight = 0;
+	list_for_each_entry(instance, &td->thermal_instances, trip_node)
+		if (power_actor_is_valid(instance))
+			params->total_weight += instance->weight;
+}
+
 static void power_allocator_update_tz(struct thermal_zone_device *tz,
 				      enum thermal_notify_event reason)
 {
@@ -656,16 +671,12 @@ static void power_allocator_update_tz(struct thermal_zone_device *tz,
 			if (power_actor_is_valid(instance))
 				num_actors++;
 
-		if (num_actors == params->num_actors)
-			return;
+		if (num_actors != params->num_actors)
+			allocate_actors_buffer(params, num_actors);
 
-		allocate_actors_buffer(params, num_actors);
-		break;
+		fallthrough;
 	case THERMAL_INSTANCE_WEIGHT_CHANGED:
-		params->total_weight = 0;
-		list_for_each_entry(instance, &td->thermal_instances, trip_node)
-			if (power_actor_is_valid(instance))
-				params->total_weight += instance->weight;
+		power_allocator_update_weight(params);
 		break;
 	default:
 		break;
@@ -687,7 +698,7 @@ static int power_allocator_bind(struct thermal_zone_device *tz)
 	struct power_allocator_params *params;
 	int ret;
 
-	params = kzalloc(sizeof(*params), GFP_KERNEL);
+	params = kzalloc_obj(*params);
 	if (!params)
 		return -ENOMEM;
 
@@ -708,7 +719,7 @@ static int power_allocator_bind(struct thermal_zone_device *tz)
 	}
 
 	if (!tz->tzp) {
-		tz->tzp = kzalloc(sizeof(*tz->tzp), GFP_KERNEL);
+		tz->tzp = kzalloc_obj(*tz->tzp);
 		if (!tz->tzp) {
 			ret = -ENOMEM;
 			goto free_params;
@@ -730,6 +741,8 @@ static int power_allocator_bind(struct thermal_zone_device *tz)
 	reset_pid_controller(params);
 
 	tz->governor_data = params;
+
+	power_allocator_update_weight(params);
 
 	return 0;
 

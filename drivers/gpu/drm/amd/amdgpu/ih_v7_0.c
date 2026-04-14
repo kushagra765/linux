@@ -279,6 +279,16 @@ static int ih_v7_0_enable_ring(struct amdgpu_device *adev,
 	return 0;
 }
 
+static uint32_t ih_v7_0_setup_retry_doorbell(u32 doorbell_index)
+{
+	u32 val = 0;
+
+	val = REG_SET_FIELD(val, IH_DOORBELL_RPTR, OFFSET, doorbell_index);
+	val = REG_SET_FIELD(val, IH_DOORBELL_RPTR, ENABLE, 1);
+
+	return val;
+}
+
 /**
  * ih_v7_0_irq_init - init and enable the interrupt ring
  *
@@ -362,6 +372,21 @@ static int ih_v7_0_irq_init(struct amdgpu_device *adev)
 	}
 
 	pci_set_master(adev->pdev);
+
+	if (amdgpu_ip_version(adev, OSSSYS_HWIP, 0) == IP_VERSION(7, 1, 0)) {
+		/* Allocate the doorbell for IH Retry CAM */
+		adev->irq.retry_cam_doorbell_index = (adev->doorbell_index.ih + 2) << 1;
+		WREG32_SOC15(OSSSYS, 0, regIH_DOORBELL_RETRY_CAM,
+				ih_v7_0_setup_retry_doorbell(adev->irq.retry_cam_doorbell_index));
+
+		/* Enable IH Retry CAM */
+		tmp = RREG32_SOC15(OSSSYS, 0, regIH_RETRY_INT_CAM_CNTL);
+		tmp = REG_SET_FIELD(tmp, IH_RETRY_INT_CAM_CNTL, ENABLE, 1);
+		tmp = REG_SET_FIELD(tmp, IH_RETRY_INT_CAM_CNTL, CAM_SIZE, 0xF);
+		WREG32_SOC15(OSSSYS, 0, regIH_RETRY_INT_CAM_CNTL, tmp);
+
+		adev->irq.retry_cam_enabled = true;
+	}
 
 	/* enable interrupts */
 	ret = ih_v7_0_toggle_interrupts(adev, true);
@@ -542,6 +567,7 @@ static int ih_v7_0_sw_init(struct amdgpu_ip_block *ip_block)
 	int r;
 	struct amdgpu_device *adev = ip_block->adev;
 	bool use_bus_addr;
+	unsigned int sw_ring_size;
 
 	r = amdgpu_irq_add_id(adev, SOC21_IH_CLIENTID_IH, 0,
 			      &adev->irq.self_irq);
@@ -552,8 +578,7 @@ static int ih_v7_0_sw_init(struct amdgpu_ip_block *ip_block)
 	/* use gpu virtual address for ih ring
 	 * until ih_checken is programmed to allow
 	 * use bus address for ih ring by psp bl */
-	use_bus_addr =
-		(adev->firmware.load_type == AMDGPU_FW_LOAD_PSP) ? false : true;
+	use_bus_addr = adev->firmware.load_type != AMDGPU_FW_LOAD_PSP;
 	r = amdgpu_ih_ring_init(adev, &adev->irq.ih, 256 * 1024, use_bus_addr);
 	if (r)
 		return r;
@@ -574,7 +599,9 @@ static int ih_v7_0_sw_init(struct amdgpu_ip_block *ip_block)
 	/* initialize ih control register offset */
 	ih_v7_0_init_register_offset(adev);
 
-	r = amdgpu_ih_ring_init(adev, &adev->irq.ih_soft, PAGE_SIZE, true);
+	sw_ring_size = (amdgpu_ip_version(adev, OSSSYS_HWIP, 0) == IP_VERSION(7, 1, 0)) ?
+			IH_SW_RING_SIZE : PAGE_SIZE;
+	r = amdgpu_ih_ring_init(adev, &adev->irq.ih_soft, sw_ring_size, true);
 	if (r)
 		return r;
 
@@ -621,7 +648,7 @@ static int ih_v7_0_resume(struct amdgpu_ip_block *ip_block)
 	return ih_v7_0_hw_init(ip_block);
 }
 
-static bool ih_v7_0_is_idle(void *handle)
+static bool ih_v7_0_is_idle(struct amdgpu_ip_block *ip_block)
 {
 	/* todo */
 	return true;
@@ -664,10 +691,10 @@ static void ih_v7_0_update_clockgating_state(struct amdgpu_device *adev,
 	return;
 }
 
-static int ih_v7_0_set_clockgating_state(void *handle,
+static int ih_v7_0_set_clockgating_state(struct amdgpu_ip_block *ip_block,
 					   enum amd_clockgating_state state)
 {
-	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+	struct amdgpu_device *adev = ip_block->adev;
 
 	ih_v7_0_update_clockgating_state(adev,
 				state == AMD_CG_STATE_GATE);
@@ -727,10 +754,10 @@ static void ih_v7_0_update_ih_mem_power_gating(struct amdgpu_device *adev,
 	WREG32_SOC15(OSSSYS, 0, regIH_MEM_POWER_CTRL, ih_mem_pwr_cntl);
 }
 
-static int ih_v7_0_set_powergating_state(void *handle,
+static int ih_v7_0_set_powergating_state(struct amdgpu_ip_block *ip_block,
 					 enum amd_powergating_state state)
 {
-	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+	struct amdgpu_device *adev = ip_block->adev;
 	bool enable = (state == AMD_PG_STATE_GATE);
 
 	if (adev->pg_flags & AMD_PG_SUPPORT_IH_SRAM_PG)
@@ -739,9 +766,9 @@ static int ih_v7_0_set_powergating_state(void *handle,
 	return 0;
 }
 
-static void ih_v7_0_get_clockgating_state(void *handle, u64 *flags)
+static void ih_v7_0_get_clockgating_state(struct amdgpu_ip_block *ip_block, u64 *flags)
 {
-	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+	struct amdgpu_device *adev = ip_block->adev;
 
 	if (!RREG32_SOC15(OSSSYS, 0, regIH_CLK_CTRL))
 		*flags |= AMD_CG_SUPPORT_IH_CG;

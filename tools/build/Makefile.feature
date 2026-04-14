@@ -28,32 +28,61 @@ endef
 #   the rule that uses them - an example for that is the 'bionic'
 #   feature check. ]
 #
+# These + the ones in FEATURE_TESTS_EXTRA are included in
+# tools/build/feature/test-all.c and we try to build it all together
+# then setting all those features to '1' meaning they are all enabled.
+#
+# There are things like fortify-source that will be set to 1 because test-all
+# is built with the flags needed to test if its enabled, resulting in
+#
+#   $ rm -rf /tmp/b ; mkdir /tmp/b ; make -C tools/perf O=/tmp/b feature-dump
+#   $ grep fortify-source /tmp/b/FEATURE-DUMP
+#   feature-fortify-source=1
+#   $
+#
+#   All the others should have lines in tools/build/feature/test-all.c like:
+#
+#    #define main main_test_disassembler_init_styled
+#    # include "test-disassembler-init-styled.c"
+#    #undef main
+#
+#    #define main main_test_libzstd
+#    # include "test-libzstd.c"
+#    #undef main
+#
+#    int main(int argc, char *argv[])
+#    {
+#      main_test_disassembler_four_args();
+#      main_test_libzstd();
+#      return 0;
+#    }
+#
+#    If the sample above works, then we end up with these lines in the FEATURE-DUMP
+#    file:
+#
+#    feature-disassembler-four-args=1
+#    feature-libzstd=1
+#
 FEATURE_TESTS_BASIC :=                  \
         backtrace                       \
         libdw                           \
         eventfd                         \
         fortify-source                  \
-        get_current_dir_name            \
         gettid				\
         glibc                           \
         libbfd                          \
-        libbfd-buildid			\
-        libcap                          \
+	libbfd-threadsafe		\
         libelf                          \
         libelf-getphdrnum               \
         libelf-gelf_getnote             \
         libelf-getshdrstrndx            \
+        libelf-zstd                     \
         libnuma                         \
         numa_num_possible_cpus          \
-        libperl                         \
         libpython                       \
         libslang                        \
-        libslang-include-subdir         \
         libtraceevent                   \
-        libtracefs                      \
         libcpupower                     \
-        libcrypto                       \
-        libunwind                       \
         pthread-attr-setaffinity-np     \
         pthread-barrier     		\
         reallocarray                    \
@@ -61,7 +90,6 @@ FEATURE_TESTS_BASIC :=                  \
         timerfd                         \
         zlib                            \
         lzma                            \
-        get_cpuid                       \
         bpf                             \
         scandirat			\
         sched_getcpu			\
@@ -71,7 +99,8 @@ FEATURE_TESTS_BASIC :=                  \
         libzstd				\
         disassembler-four-args		\
         disassembler-init-styled	\
-        file-handle
+        file-handle			\
+        libopenssl
 
 # FEATURE_TESTS_BASIC + FEATURE_TESTS_EXTRA is the complete list
 # of all feature tests
@@ -89,26 +118,15 @@ FEATURE_TESTS_EXTRA :=                  \
          libbfd-liberty                 \
          libbfd-liberty-z               \
          libopencsd                     \
-         libunwind-x86                  \
-         libunwind-x86_64               \
-         libunwind-arm                  \
-         libunwind-aarch64              \
-         libunwind-debug-frame          \
-         libunwind-debug-frame-arm      \
-         libunwind-debug-frame-aarch64  \
+         libperl                        \
          cxx                            \
          llvm                           \
          clang                          \
          libbpf                         \
-         libbpf-btf__load_from_kernel_by_id \
-         libbpf-bpf_prog_load           \
-         libbpf-bpf_object__next_program \
-         libbpf-bpf_object__next_map    \
-         libbpf-bpf_program__set_insns  \
-         libbpf-bpf_create_map		\
          libpfm4                        \
          libdebuginfod			\
-         clang-bpf-co-re
+         clang-bpf-co-re		\
+         bpftool-skeletons
 
 
 FEATURE_TESTS ?= $(FEATURE_TESTS_BASIC)
@@ -120,24 +138,19 @@ endif
 FEATURE_DISPLAY ?=              \
          libdw                  \
          glibc                  \
-         libbfd                 \
-         libbfd-buildid		\
-         libcap                 \
          libelf                 \
          libnuma                \
          numa_num_possible_cpus \
-         libperl                \
          libpython              \
-         libcrypto              \
-         libunwind              \
          libcapstone            \
          llvm-perf              \
          zlib                   \
          lzma                   \
-         get_cpuid              \
          bpf			\
          libaio			\
-         libzstd
+         libzstd		\
+         libopenssl		\
+         rust
 
 #
 # Declare group members of a feature to display the logical OR of the detection
@@ -303,5 +316,7 @@ endef
 
 ifeq ($(FEATURE_DISPLAY_DEFERRED),)
   $(call feature_display_entries)
-  $(info )
+  ifeq ($(feature_display),1)
+    $(info )
+  endif
 endif

@@ -270,7 +270,7 @@ Ordering of commit tags
 To have a uniform view of the commit tags, the tip maintainers use the
 following tag ordering scheme:
 
- - Fixes: 12char-SHA1 ("sub/sys: Original subject line")
+ - Fixes: 12+char-SHA1 ("sub/sys: Original subject line")
 
    A Fixes tag should be added even for changes which do not need to be
    backported to stable kernels, i.e. when addressing a recently introduced
@@ -352,7 +352,7 @@ following tag ordering scheme:
      Changelog text starts here....
 
    so the authorship is preserved. The 'From:' line has to be followed
-   by a empty newline. If that 'From:' line is missing, then the patch
+   by an empty newline. If that 'From:' line is missing, then the patch
    would be attributed to the person who sent (transported, handled) it.
    The 'From:' line is automatically removed when the patch is applied
    and does not show up in the final git changelog. It merely affects

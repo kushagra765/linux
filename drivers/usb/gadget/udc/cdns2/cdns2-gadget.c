@@ -29,6 +29,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/interrupt.h>
 #include <linux/property.h>
+#include <linux/string_choices.h>
 #include <linux/dmapool.h>
 #include <linux/iopoll.h>
 
@@ -1504,7 +1505,7 @@ struct usb_request *cdns2_gadget_ep_alloc_request(struct usb_ep *ep,
 	struct cdns2_endpoint *pep = ep_to_cdns2_ep(ep);
 	struct cdns2_request *preq;
 
-	preq = kzalloc(sizeof(*preq), gfp_flags);
+	preq = kzalloc_obj(*preq, gfp_flags);
 	if (!preq)
 		return NULL;
 
@@ -2233,12 +2234,12 @@ static int cdns2_init_eps(struct cdns2_device *pdev)
 		dev_dbg(pdev->dev, "Init %s, SupType: CTRL: %s, INT: %s, "
 			"BULK: %s, ISOC %s, SupDir IN: %s, OUT: %s\n",
 			pep->name,
-			(pep->endpoint.caps.type_control) ? "yes" : "no",
-			(pep->endpoint.caps.type_int) ? "yes" : "no",
-			(pep->endpoint.caps.type_bulk) ? "yes" : "no",
-			(pep->endpoint.caps.type_iso) ? "yes" : "no",
-			(pep->endpoint.caps.dir_in) ? "yes" : "no",
-			(pep->endpoint.caps.dir_out) ? "yes" : "no");
+			str_yes_no(pep->endpoint.caps.type_control),
+			str_yes_no(pep->endpoint.caps.type_int),
+			str_yes_no(pep->endpoint.caps.type_bulk),
+			str_yes_no(pep->endpoint.caps.type_iso),
+			str_yes_no(pep->endpoint.caps.dir_in),
+			str_yes_no(pep->endpoint.caps.dir_out));
 
 		INIT_LIST_HEAD(&pep->pending_list);
 		INIT_LIST_HEAD(&pep->deferred_list);
@@ -2414,7 +2415,6 @@ int cdns2_gadget_resume(struct cdns2_device *pdev, bool hibernated)
 
 void cdns2_gadget_remove(struct cdns2_device *pdev)
 {
-	pm_runtime_mark_last_busy(pdev->dev);
 	pm_runtime_put_autosuspend(pdev->dev);
 
 	usb_del_gadget(&pdev->gadget);

@@ -22,6 +22,7 @@
 #include <linux/debug_locks.h>
 #include <linux/vmalloc.h>
 #include <asm/asm-extable.h>
+#include <asm/machine.h>
 #include <asm/diag.h>
 #include <asm/ipl.h>
 #include <asm/smp.h>
@@ -185,7 +186,7 @@ static inline int __diag308(unsigned long subcode, unsigned long addr)
 
 	r1.even = addr;
 	r1.odd	= 0;
-	asm volatile(
+	asm_inline volatile(
 		"	diag	%[r1],%[subcode],0x308\n"
 		"0:	nopr	%%r7\n"
 		EX_TABLE(0b,0b)
@@ -261,6 +262,24 @@ static struct kobj_attribute sys_##_prefix##_##_name##_attr =		\
 			sys_##_prefix##_##_name##_show,			\
 			sys_##_prefix##_##_name##_store)
 
+#define DEFINE_IPL_ATTR_BOOTPROG_RW(_prefix, _name, _fmt_out, _fmt_in, _hdr, _value)	\
+	IPL_ATTR_SHOW_FN(_prefix, _name, _fmt_out, (unsigned long long) _value)		\
+static ssize_t sys_##_prefix##_##_name##_store(struct kobject *kobj,			\
+		struct kobj_attribute *attr,						\
+		const char *buf, size_t len)						\
+{											\
+	unsigned long long value;							\
+	if (sscanf(buf, _fmt_in, &value) != 1)						\
+		return -EINVAL;								\
+	(_value) = value;								\
+	(_hdr).flags &= ~IPL_PL_FLAG_SBP;						\
+	return len;									\
+}											\
+static struct kobj_attribute sys_##_prefix##_##_name##_attr =				\
+	__ATTR(_name, 0644,								\
+			sys_##_prefix##_##_name##_show,					\
+			sys_##_prefix##_##_name##_store)
+
 #define DEFINE_IPL_ATTR_STR_RW(_prefix, _name, _fmt_out, _fmt_in, _value)\
 IPL_ATTR_SHOW_FN(_prefix, _name, _fmt_out, _value)			\
 static ssize_t sys_##_prefix##_##_name##_store(struct kobject *kobj,	\
@@ -269,8 +288,8 @@ static ssize_t sys_##_prefix##_##_name##_store(struct kobject *kobj,	\
 {									\
 	if (len >= sizeof(_value))					\
 		return -E2BIG;						\
-	len = strscpy(_value, buf, sizeof(_value));			\
-	if (len < 0)							\
+	len = strscpy(_value, buf);					\
+	if ((ssize_t)len < 0)						\
 		return len;						\
 	strim(_value);							\
 	return len;							\
@@ -280,58 +299,58 @@ static struct kobj_attribute sys_##_prefix##_##_name##_attr =		\
 			sys_##_prefix##_##_name##_show,			\
 			sys_##_prefix##_##_name##_store)
 
-#define IPL_ATTR_SCP_DATA_SHOW_FN(_prefix, _ipl_block)			\
-static ssize_t sys_##_prefix##_scp_data_show(struct file *filp,		\
-					    struct kobject *kobj,	\
-					    struct bin_attribute *attr,	\
-					    char *buf, loff_t off,	\
-					    size_t count)		\
-{									\
-	size_t size = _ipl_block.scp_data_len;				\
-	void *scp_data = _ipl_block.scp_data;				\
-									\
-	return memory_read_from_buffer(buf, count, &off,		\
-				       scp_data, size);			\
+#define IPL_ATTR_SCP_DATA_SHOW_FN(_prefix, _ipl_block)				\
+static ssize_t sys_##_prefix##_scp_data_show(struct file *filp,			\
+					    struct kobject *kobj,		\
+					    const struct bin_attribute *attr,	\
+					    char *buf, loff_t off,		\
+					    size_t count)			\
+{										\
+	size_t size = _ipl_block.scp_data_len;					\
+	void *scp_data = _ipl_block.scp_data;					\
+										\
+	return memory_read_from_buffer(buf, count, &off,			\
+				       scp_data, size);				\
 }
 
 #define IPL_ATTR_SCP_DATA_STORE_FN(_prefix, _ipl_block_hdr, _ipl_block, _ipl_bp_len, _ipl_bp0_len)\
-static ssize_t sys_##_prefix##_scp_data_store(struct file *filp,	\
-					struct kobject *kobj,		\
-					struct bin_attribute *attr,	\
-					char *buf, loff_t off,		\
-					size_t count)			\
-{									\
-	size_t scpdata_len = count;					\
-	size_t padding;							\
-									\
-	if (off)							\
-		return -EINVAL;						\
-									\
-	memcpy(_ipl_block.scp_data, buf, count);			\
-	if (scpdata_len % 8) {						\
-		padding = 8 - (scpdata_len % 8);			\
-		memset(_ipl_block.scp_data + scpdata_len,		\
-		       0, padding);					\
-		scpdata_len += padding;					\
-	}								\
-									\
-	_ipl_block_hdr.len = _ipl_bp_len + scpdata_len;			\
-	_ipl_block.len = _ipl_bp0_len + scpdata_len;			\
-	_ipl_block.scp_data_len = scpdata_len;				\
-									\
-	return count;							\
+static ssize_t sys_##_prefix##_scp_data_store(struct file *filp,		\
+					struct kobject *kobj,			\
+					const struct bin_attribute *attr,	\
+					char *buf, loff_t off,			\
+					size_t count)				\
+{										\
+	size_t scpdata_len = count;						\
+	size_t padding;								\
+										\
+	if (off)								\
+		return -EINVAL;							\
+										\
+	memcpy(_ipl_block.scp_data, buf, count);				\
+	if (scpdata_len % 8) {							\
+		padding = 8 - (scpdata_len % 8);				\
+		memset(_ipl_block.scp_data + scpdata_len,			\
+		       0, padding);						\
+		scpdata_len += padding;						\
+	}									\
+										\
+	_ipl_block_hdr.len = _ipl_bp_len + scpdata_len;				\
+	_ipl_block.len = _ipl_bp0_len + scpdata_len;				\
+	_ipl_block.scp_data_len = scpdata_len;					\
+										\
+	return count;								\
 }
 
 #define DEFINE_IPL_ATTR_SCP_DATA_RO(_prefix, _ipl_block, _size)		\
 IPL_ATTR_SCP_DATA_SHOW_FN(_prefix, _ipl_block)				\
-static struct bin_attribute sys_##_prefix##_scp_data_attr =		\
+static const struct bin_attribute sys_##_prefix##_scp_data_attr =	\
 	__BIN_ATTR(scp_data, 0444, sys_##_prefix##_scp_data_show,	\
 		   NULL, _size)
 
 #define DEFINE_IPL_ATTR_SCP_DATA_RW(_prefix, _ipl_block_hdr, _ipl_block, _ipl_bp_len, _ipl_bp0_len, _size)\
 IPL_ATTR_SCP_DATA_SHOW_FN(_prefix, _ipl_block)					\
 IPL_ATTR_SCP_DATA_STORE_FN(_prefix, _ipl_block_hdr, _ipl_block, _ipl_bp_len, _ipl_bp0_len)\
-static struct bin_attribute sys_##_prefix##_scp_data_attr =			\
+static const struct bin_attribute sys_##_prefix##_scp_data_attr =		\
 	__BIN_ATTR(scp_data, 0644, sys_##_prefix##_scp_data_show,		\
 		   sys_##_prefix##_scp_data_store, _size)
 
@@ -434,19 +453,19 @@ static struct kobj_attribute sys_ipl_device_attr =
 	__ATTR(device, 0444, sys_ipl_device_show, NULL);
 
 static ssize_t sys_ipl_parameter_read(struct file *filp, struct kobject *kobj,
-				      struct bin_attribute *attr, char *buf,
+				      const struct bin_attribute *attr, char *buf,
 				      loff_t off, size_t count)
 {
 	return memory_read_from_buffer(buf, count, &off, &ipl_block,
 				       ipl_block.hdr.len);
 }
-static struct bin_attribute sys_ipl_parameter_attr =
+static const struct bin_attribute sys_ipl_parameter_attr =
 	__BIN_ATTR(binary_parameter, 0444, sys_ipl_parameter_read, NULL,
 		   PAGE_SIZE);
 
 DEFINE_IPL_ATTR_SCP_DATA_RO(ipl_fcp, ipl_block.fcp, PAGE_SIZE);
 
-static struct bin_attribute *ipl_fcp_bin_attrs[] = {
+static const struct bin_attribute *const ipl_fcp_bin_attrs[] = {
 	&sys_ipl_parameter_attr,
 	&sys_ipl_fcp_scp_data_attr,
 	NULL,
@@ -454,7 +473,7 @@ static struct bin_attribute *ipl_fcp_bin_attrs[] = {
 
 DEFINE_IPL_ATTR_SCP_DATA_RO(ipl_nvme, ipl_block.nvme, PAGE_SIZE);
 
-static struct bin_attribute *ipl_nvme_bin_attrs[] = {
+static const struct bin_attribute *const ipl_nvme_bin_attrs[] = {
 	&sys_ipl_parameter_attr,
 	&sys_ipl_nvme_scp_data_attr,
 	NULL,
@@ -462,7 +481,7 @@ static struct bin_attribute *ipl_nvme_bin_attrs[] = {
 
 DEFINE_IPL_ATTR_SCP_DATA_RO(ipl_eckd, ipl_block.eckd, PAGE_SIZE);
 
-static struct bin_attribute *ipl_eckd_bin_attrs[] = {
+static const struct bin_attribute *const ipl_eckd_bin_attrs[] = {
 	&sys_ipl_parameter_attr,
 	&sys_ipl_eckd_scp_data_attr,
 	NULL,
@@ -593,7 +612,7 @@ static struct attribute *ipl_fcp_attrs[] = {
 	NULL,
 };
 
-static struct attribute_group ipl_fcp_attr_group = {
+static const struct attribute_group ipl_fcp_attr_group = {
 	.attrs = ipl_fcp_attrs,
 	.bin_attrs = ipl_fcp_bin_attrs,
 };
@@ -607,7 +626,7 @@ static struct attribute *ipl_nvme_attrs[] = {
 	NULL,
 };
 
-static struct attribute_group ipl_nvme_attr_group = {
+static const struct attribute_group ipl_nvme_attr_group = {
 	.attrs = ipl_nvme_attrs,
 	.bin_attrs = ipl_nvme_bin_attrs,
 };
@@ -620,7 +639,7 @@ static struct attribute *ipl_eckd_attrs[] = {
 	NULL,
 };
 
-static struct attribute_group ipl_eckd_attr_group = {
+static const struct attribute_group ipl_eckd_attr_group = {
 	.attrs = ipl_eckd_attrs,
 	.bin_attrs = ipl_eckd_bin_attrs,
 };
@@ -640,11 +659,11 @@ static struct attribute *ipl_ccw_attrs_lpar[] = {
 	NULL,
 };
 
-static struct attribute_group ipl_ccw_attr_group_vm = {
+static const struct attribute_group ipl_ccw_attr_group_vm = {
 	.attrs = ipl_ccw_attrs_vm,
 };
 
-static struct attribute_group ipl_ccw_attr_group_lpar = {
+static const struct attribute_group ipl_ccw_attr_group_lpar = {
 	.attrs = ipl_ccw_attrs_lpar
 };
 
@@ -655,7 +674,7 @@ static struct attribute *ipl_common_attrs[] = {
 	NULL,
 };
 
-static struct attribute_group ipl_common_attr_group = {
+static const struct attribute_group ipl_common_attr_group = {
 	.attrs = ipl_common_attrs,
 };
 
@@ -685,7 +704,7 @@ static int __init ipl_init(void)
 		goto out;
 	switch (ipl_info.type) {
 	case IPL_TYPE_CCW:
-		if (MACHINE_IS_VM)
+		if (machine_is_vm())
 			rc = sysfs_create_group(&ipl_kset->kobj,
 						&ipl_ccw_attr_group_vm);
 		else
@@ -808,7 +827,7 @@ DEFINE_IPL_ATTR_SCP_DATA_RW(reipl_fcp, reipl_block_fcp->hdr,
 			    IPL_BP_FCP_LEN, IPL_BP0_FCP_LEN,
 			    DIAG308_SCPDATA_SIZE);
 
-static struct bin_attribute *reipl_fcp_bin_attrs[] = {
+static const struct bin_attribute *const reipl_fcp_bin_attrs[] = {
 	&sys_reipl_fcp_scp_data_attr,
 	NULL,
 };
@@ -817,12 +836,13 @@ DEFINE_IPL_ATTR_RW(reipl_fcp, wwpn, "0x%016llx\n", "%llx\n",
 		   reipl_block_fcp->fcp.wwpn);
 DEFINE_IPL_ATTR_RW(reipl_fcp, lun, "0x%016llx\n", "%llx\n",
 		   reipl_block_fcp->fcp.lun);
-DEFINE_IPL_ATTR_RW(reipl_fcp, bootprog, "%lld\n", "%lld\n",
-		   reipl_block_fcp->fcp.bootprog);
 DEFINE_IPL_ATTR_RW(reipl_fcp, br_lba, "%lld\n", "%lld\n",
 		   reipl_block_fcp->fcp.br_lba);
 DEFINE_IPL_ATTR_RW(reipl_fcp, device, "0.0.%04llx\n", "0.0.%llx\n",
 		   reipl_block_fcp->fcp.devno);
+DEFINE_IPL_ATTR_BOOTPROG_RW(reipl_fcp, bootprog, "%lld\n", "%lld\n",
+			    reipl_block_fcp->hdr,
+			    reipl_block_fcp->fcp.bootprog);
 
 static void reipl_get_ascii_loadparm(char *loadparm,
 				     struct ipl_parameter_block *ibp)
@@ -917,7 +937,7 @@ static struct attribute *reipl_fcp_attrs[] = {
 	NULL,
 };
 
-static struct attribute_group reipl_fcp_attr_group = {
+static const struct attribute_group reipl_fcp_attr_group = {
 	.attrs = reipl_fcp_attrs,
 	.bin_attrs = reipl_fcp_bin_attrs,
 };
@@ -932,7 +952,7 @@ DEFINE_IPL_ATTR_SCP_DATA_RW(reipl_nvme, reipl_block_nvme->hdr,
 			    IPL_BP_NVME_LEN, IPL_BP0_NVME_LEN,
 			    DIAG308_SCPDATA_SIZE);
 
-static struct bin_attribute *reipl_nvme_bin_attrs[] = {
+static const struct bin_attribute *const reipl_nvme_bin_attrs[] = {
 	&sys_reipl_nvme_scp_data_attr,
 	NULL,
 };
@@ -941,10 +961,11 @@ DEFINE_IPL_ATTR_RW(reipl_nvme, fid, "0x%08llx\n", "%llx\n",
 		   reipl_block_nvme->nvme.fid);
 DEFINE_IPL_ATTR_RW(reipl_nvme, nsid, "0x%08llx\n", "%llx\n",
 		   reipl_block_nvme->nvme.nsid);
-DEFINE_IPL_ATTR_RW(reipl_nvme, bootprog, "%lld\n", "%lld\n",
-		   reipl_block_nvme->nvme.bootprog);
 DEFINE_IPL_ATTR_RW(reipl_nvme, br_lba, "%lld\n", "%lld\n",
 		   reipl_block_nvme->nvme.br_lba);
+DEFINE_IPL_ATTR_BOOTPROG_RW(reipl_nvme, bootprog, "%lld\n", "%lld\n",
+			    reipl_block_nvme->hdr,
+			    reipl_block_nvme->nvme.bootprog);
 
 static struct attribute *reipl_nvme_attrs[] = {
 	&sys_reipl_nvme_fid_attr.attr,
@@ -955,7 +976,7 @@ static struct attribute *reipl_nvme_attrs[] = {
 	NULL,
 };
 
-static struct attribute_group reipl_nvme_attr_group = {
+static const struct attribute_group reipl_nvme_attr_group = {
 	.attrs = reipl_nvme_attrs,
 	.bin_attrs = reipl_nvme_bin_attrs
 };
@@ -1031,14 +1052,15 @@ DEFINE_IPL_ATTR_SCP_DATA_RW(reipl_eckd, reipl_block_eckd->hdr,
 			    IPL_BP_ECKD_LEN, IPL_BP0_ECKD_LEN,
 			    DIAG308_SCPDATA_SIZE);
 
-static struct bin_attribute *reipl_eckd_bin_attrs[] = {
+static const struct bin_attribute *const reipl_eckd_bin_attrs[] = {
 	&sys_reipl_eckd_scp_data_attr,
 	NULL,
 };
 
 DEFINE_IPL_CCW_ATTR_RW(reipl_eckd, device, reipl_block_eckd->eckd);
-DEFINE_IPL_ATTR_RW(reipl_eckd, bootprog, "%lld\n", "%lld\n",
-		   reipl_block_eckd->eckd.bootprog);
+DEFINE_IPL_ATTR_BOOTPROG_RW(reipl_eckd, bootprog, "%lld\n", "%lld\n",
+			    reipl_block_eckd->hdr,
+			    reipl_block_eckd->eckd.bootprog);
 
 static struct attribute *reipl_eckd_attrs[] = {
 	&sys_reipl_eckd_device_attr.attr,
@@ -1048,7 +1070,7 @@ static struct attribute *reipl_eckd_attrs[] = {
 	NULL,
 };
 
-static struct attribute_group reipl_eckd_attr_group = {
+static const struct attribute_group reipl_eckd_attr_group = {
 	.attrs = reipl_eckd_attrs,
 	.bin_attrs = reipl_eckd_bin_attrs
 };
@@ -1272,7 +1294,7 @@ static void reipl_block_ccw_fill_parms(struct ipl_parameter_block *ipb)
 	ipb->ccw.flags = IPL_PB0_FLAG_LOADPARM;
 
 	/* VM PARM */
-	if (MACHINE_IS_VM && ipl_block_valid &&
+	if (machine_is_vm() && ipl_block_valid &&
 	    (ipl_block.ccw.vm_flags & IPL_PB0_CCW_VM_FLAG_VP)) {
 
 		ipb->ccw.vm_flags |= IPL_PB0_CCW_VM_FLAG_VP;
@@ -1286,7 +1308,7 @@ static int __init reipl_nss_init(void)
 {
 	int rc;
 
-	if (!MACHINE_IS_VM)
+	if (!machine_is_vm())
 		return 0;
 
 	reipl_block_nss = (void *) get_zeroed_page(GFP_KERNEL);
@@ -1311,8 +1333,8 @@ static int __init reipl_ccw_init(void)
 		return -ENOMEM;
 
 	rc = sysfs_create_group(&reipl_kset->kobj,
-				MACHINE_IS_VM ? &reipl_ccw_attr_group_vm
-					      : &reipl_ccw_attr_group_lpar);
+				machine_is_vm() ? &reipl_ccw_attr_group_vm
+						: &reipl_ccw_attr_group_lpar);
 	if (rc)
 		return rc;
 
@@ -1566,12 +1588,13 @@ DEFINE_IPL_ATTR_RW(dump_fcp, wwpn, "0x%016llx\n", "%llx\n",
 		   dump_block_fcp->fcp.wwpn);
 DEFINE_IPL_ATTR_RW(dump_fcp, lun, "0x%016llx\n", "%llx\n",
 		   dump_block_fcp->fcp.lun);
-DEFINE_IPL_ATTR_RW(dump_fcp, bootprog, "%lld\n", "%lld\n",
-		   dump_block_fcp->fcp.bootprog);
 DEFINE_IPL_ATTR_RW(dump_fcp, br_lba, "%lld\n", "%lld\n",
 		   dump_block_fcp->fcp.br_lba);
 DEFINE_IPL_ATTR_RW(dump_fcp, device, "0.0.%04llx\n", "0.0.%llx\n",
 		   dump_block_fcp->fcp.devno);
+DEFINE_IPL_ATTR_BOOTPROG_RW(dump_fcp, bootprog, "%lld\n", "%lld\n",
+			    dump_block_fcp->hdr,
+			    dump_block_fcp->fcp.bootprog);
 
 DEFINE_IPL_ATTR_SCP_DATA_RW(dump_fcp, dump_block_fcp->hdr,
 			    dump_block_fcp->fcp,
@@ -1587,12 +1610,12 @@ static struct attribute *dump_fcp_attrs[] = {
 	NULL,
 };
 
-static struct bin_attribute *dump_fcp_bin_attrs[] = {
+static const struct bin_attribute *const dump_fcp_bin_attrs[] = {
 	&sys_dump_fcp_scp_data_attr,
 	NULL,
 };
 
-static struct attribute_group dump_fcp_attr_group = {
+static const struct attribute_group dump_fcp_attr_group = {
 	.name  = IPL_FCP_STR,
 	.attrs = dump_fcp_attrs,
 	.bin_attrs = dump_fcp_bin_attrs,
@@ -1603,10 +1626,11 @@ DEFINE_IPL_ATTR_RW(dump_nvme, fid, "0x%08llx\n", "%llx\n",
 		   dump_block_nvme->nvme.fid);
 DEFINE_IPL_ATTR_RW(dump_nvme, nsid, "0x%08llx\n", "%llx\n",
 		   dump_block_nvme->nvme.nsid);
-DEFINE_IPL_ATTR_RW(dump_nvme, bootprog, "%lld\n", "%llx\n",
-		   dump_block_nvme->nvme.bootprog);
 DEFINE_IPL_ATTR_RW(dump_nvme, br_lba, "%lld\n", "%llx\n",
 		   dump_block_nvme->nvme.br_lba);
+DEFINE_IPL_ATTR_BOOTPROG_RW(dump_nvme, bootprog, "%lld\n", "%llx\n",
+			    dump_block_nvme->hdr,
+			    dump_block_nvme->nvme.bootprog);
 
 DEFINE_IPL_ATTR_SCP_DATA_RW(dump_nvme, dump_block_nvme->hdr,
 			    dump_block_nvme->nvme,
@@ -1621,12 +1645,12 @@ static struct attribute *dump_nvme_attrs[] = {
 	NULL,
 };
 
-static struct bin_attribute *dump_nvme_bin_attrs[] = {
+static const struct bin_attribute *const dump_nvme_bin_attrs[] = {
 	&sys_dump_nvme_scp_data_attr,
 	NULL,
 };
 
-static struct attribute_group dump_nvme_attr_group = {
+static const struct attribute_group dump_nvme_attr_group = {
 	.name  = IPL_NVME_STR,
 	.attrs = dump_nvme_attrs,
 	.bin_attrs = dump_nvme_bin_attrs,
@@ -1634,8 +1658,9 @@ static struct attribute_group dump_nvme_attr_group = {
 
 /* ECKD dump device attributes */
 DEFINE_IPL_CCW_ATTR_RW(dump_eckd, device, dump_block_eckd->eckd);
-DEFINE_IPL_ATTR_RW(dump_eckd, bootprog, "%lld\n", "%llx\n",
-		   dump_block_eckd->eckd.bootprog);
+DEFINE_IPL_ATTR_BOOTPROG_RW(dump_eckd, bootprog, "%lld\n", "%llx\n",
+			    dump_block_eckd->hdr,
+			    dump_block_eckd->eckd.bootprog);
 
 IPL_ATTR_BR_CHR_SHOW_FN(dump, dump_block_eckd->eckd);
 IPL_ATTR_BR_CHR_STORE_FN(dump, dump_block_eckd->eckd);
@@ -1655,12 +1680,12 @@ static struct attribute *dump_eckd_attrs[] = {
 	NULL,
 };
 
-static struct bin_attribute *dump_eckd_bin_attrs[] = {
+static const struct bin_attribute *const dump_eckd_bin_attrs[] = {
 	&sys_dump_eckd_scp_data_attr,
 	NULL,
 };
 
-static struct attribute_group dump_eckd_attr_group = {
+static const struct attribute_group dump_eckd_attr_group = {
 	.name  = IPL_ECKD_STR,
 	.attrs = dump_eckd_attrs,
 	.bin_attrs = dump_eckd_bin_attrs,
@@ -1987,7 +2012,7 @@ static void vmcmd_run(struct shutdown_trigger *trigger)
 
 static int vmcmd_init(void)
 {
-	if (!MACHINE_IS_VM)
+	if (!machine_is_vm())
 		return -EOPNOTSUPP;
 	vmcmd_kset = kset_create_and_add("vmcmd", NULL, firmware_kobj);
 	if (!vmcmd_kset)
@@ -2248,26 +2273,28 @@ static int __init s390_ipl_init(void)
 
 __initcall(s390_ipl_init);
 
-static void __init strncpy_skip_quote(char *dst, char *src, int n)
+static void __init strscpy_skip_quote(char *dst, char *src, int n)
 {
 	int sx, dx;
 
-	dx = 0;
-	for (sx = 0; src[sx] != 0; sx++) {
+	if (!n)
+		return;
+	for (sx = 0, dx = 0; src[sx]; sx++) {
 		if (src[sx] == '"')
 			continue;
-		dst[dx++] = src[sx];
-		if (dx >= n)
+		dst[dx] = src[sx];
+		if (dx + 1 == n)
 			break;
+		dx++;
 	}
+	dst[dx] = '\0';
 }
 
 static int __init vmcmd_on_reboot_setup(char *str)
 {
-	if (!MACHINE_IS_VM)
+	if (!machine_is_vm())
 		return 1;
-	strncpy_skip_quote(vmcmd_on_reboot, str, VMCMD_MAX_SIZE);
-	vmcmd_on_reboot[VMCMD_MAX_SIZE] = 0;
+	strscpy_skip_quote(vmcmd_on_reboot, str, sizeof(vmcmd_on_reboot));
 	on_reboot_trigger.action = &vmcmd_action;
 	return 1;
 }
@@ -2275,10 +2302,9 @@ __setup("vmreboot=", vmcmd_on_reboot_setup);
 
 static int __init vmcmd_on_panic_setup(char *str)
 {
-	if (!MACHINE_IS_VM)
+	if (!machine_is_vm())
 		return 1;
-	strncpy_skip_quote(vmcmd_on_panic, str, VMCMD_MAX_SIZE);
-	vmcmd_on_panic[VMCMD_MAX_SIZE] = 0;
+	strscpy_skip_quote(vmcmd_on_panic, str, sizeof(vmcmd_on_panic));
 	on_panic_trigger.action = &vmcmd_action;
 	return 1;
 }
@@ -2286,10 +2312,9 @@ __setup("vmpanic=", vmcmd_on_panic_setup);
 
 static int __init vmcmd_on_halt_setup(char *str)
 {
-	if (!MACHINE_IS_VM)
+	if (!machine_is_vm())
 		return 1;
-	strncpy_skip_quote(vmcmd_on_halt, str, VMCMD_MAX_SIZE);
-	vmcmd_on_halt[VMCMD_MAX_SIZE] = 0;
+	strscpy_skip_quote(vmcmd_on_halt, str, sizeof(vmcmd_on_halt));
 	on_halt_trigger.action = &vmcmd_action;
 	return 1;
 }
@@ -2297,10 +2322,9 @@ __setup("vmhalt=", vmcmd_on_halt_setup);
 
 static int __init vmcmd_on_poff_setup(char *str)
 {
-	if (!MACHINE_IS_VM)
+	if (!machine_is_vm())
 		return 1;
-	strncpy_skip_quote(vmcmd_on_poff, str, VMCMD_MAX_SIZE);
-	vmcmd_on_poff[VMCMD_MAX_SIZE] = 0;
+	strscpy_skip_quote(vmcmd_on_poff, str, sizeof(vmcmd_on_poff));
 	on_poff_trigger.action = &vmcmd_action;
 	return 1;
 }
@@ -2353,7 +2377,7 @@ void __init setup_ipl(void)
 	atomic_notifier_chain_register(&panic_notifier_list, &on_panic_nb);
 }
 
-void s390_reset_system(void)
+void __no_stack_protector s390_reset_system(void)
 {
 	/* Disable prefixing */
 	set_prefix(0);

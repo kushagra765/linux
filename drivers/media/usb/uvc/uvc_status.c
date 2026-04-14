@@ -62,7 +62,8 @@ static int uvc_input_init(struct uvc_device *dev)
 	__set_bit(EV_KEY, input->evbit);
 	__set_bit(KEY_CAMERA, input->keybit);
 
-	if ((ret = input_register_device(input)) < 0)
+	ret = input_register_device(input);
+	if (ret < 0)
 		goto error;
 
 	dev->input = input;
@@ -215,7 +216,7 @@ static void uvc_status_complete(struct urb *urb)
 		return;
 
 	default:
-		dev_warn(&dev->udev->dev,
+		dev_warn(&dev->intf->dev,
 			 "Non-zero status (%d) in status completion handler.\n",
 			 urb->status);
 		return;
@@ -247,7 +248,7 @@ static void uvc_status_complete(struct urb *urb)
 	urb->interval = dev->int_ep->desc.bInterval;
 	ret = usb_submit_urb(urb, GFP_ATOMIC);
 	if (ret < 0)
-		dev_err(&dev->udev->dev,
+		dev_err(&dev->intf->dev,
 			"Failed to resubmit status URB (%d).\n", ret);
 }
 
@@ -262,15 +263,14 @@ int uvc_status_init(struct uvc_device *dev)
 	if (ep == NULL)
 		return 0;
 
-	uvc_input_init(dev);
-
-	dev->status = kzalloc(sizeof(*dev->status), GFP_KERNEL);
+	dev->status = kzalloc_obj(*dev->status);
 	if (!dev->status)
 		return -ENOMEM;
 
 	dev->int_urb = usb_alloc_urb(0, GFP_KERNEL);
 	if (!dev->int_urb) {
 		kfree(dev->status);
+		dev->status = NULL;
 		return -ENOMEM;
 	}
 
@@ -289,11 +289,16 @@ int uvc_status_init(struct uvc_device *dev)
 		dev->status, sizeof(*dev->status), uvc_status_complete,
 		dev, interval);
 
+	uvc_input_init(dev);
+
 	return 0;
 }
 
 void uvc_status_unregister(struct uvc_device *dev)
 {
+	if (!dev->status)
+		return;
+
 	uvc_status_suspend(dev);
 	uvc_input_unregister(dev);
 }

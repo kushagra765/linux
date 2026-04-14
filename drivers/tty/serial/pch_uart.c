@@ -909,7 +909,7 @@ static unsigned int dma_handle_tx(struct eg20t_port *priv)
 
 	priv->tx_dma_use = 1;
 
-	priv->sg_tx_p = kmalloc_array(num, sizeof(struct scatterlist), GFP_ATOMIC);
+	priv->sg_tx_p = kmalloc_objs(struct scatterlist, num, GFP_ATOMIC);
 	if (!priv->sg_tx_p) {
 		dev_err(priv->port.dev, "%s:kzalloc Failed\n", __func__);
 		return 0;
@@ -954,7 +954,7 @@ static unsigned int dma_handle_tx(struct eg20t_port *priv)
 			__func__);
 		return 0;
 	}
-	dma_sync_sg_for_device(port->dev, priv->sg_tx_p, nent, DMA_TO_DEVICE);
+	dma_sync_sg_for_device(port->dev, priv->sg_tx_p, num, DMA_TO_DEVICE);
 	priv->desc_tx = desc;
 	desc->callback = pch_dma_tx_complete;
 	desc->callback_param = priv;
@@ -1515,7 +1515,6 @@ static const struct uart_ops pch_uart_ops = {
 	.startup = pch_uart_startup,
 	.shutdown = pch_uart_shutdown,
 	.set_termios = pch_uart_set_termios,
-/*	.pm		= pch_uart_pm,		Not supported yet */
 	.type = pch_uart_type,
 	.release_port = pch_uart_release_port,
 	.request_port = pch_uart_request_port,
@@ -1652,7 +1651,7 @@ static struct eg20t_port *pch_uart_init_port(struct pci_dev *pdev,
 	board = &drv_dat[id->driver_data];
 	port_type = board->port_type;
 
-	priv = kzalloc(sizeof(struct eg20t_port), GFP_KERNEL);
+	priv = kzalloc_obj(struct eg20t_port);
 	if (priv == NULL)
 		goto init_port_alloc_err;
 

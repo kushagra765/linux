@@ -194,8 +194,10 @@ static int iguanair_send(struct iguanair *ir, unsigned size)
 	if (rc)
 		return rc;
 
-	if (wait_for_completion_timeout(&ir->completion, TIMEOUT) == 0)
+	if (wait_for_completion_timeout(&ir->completion, TIMEOUT) == 0) {
+		usb_kill_urb(ir->urb_out);
 		return -ETIMEDOUT;
+	}
 
 	return rc;
 }
@@ -390,7 +392,7 @@ static int iguanair_probe(struct usb_interface *intf,
 	if (idesc->desc.bNumEndpoints < 2)
 		return -ENODEV;
 
-	ir = kzalloc(sizeof(*ir), GFP_KERNEL);
+	ir = kzalloc_obj(*ir);
 	rc = rc_allocate_device(RC_DRIVER_IR_RAW);
 	if (!ir || !rc) {
 		ret = -ENOMEM;

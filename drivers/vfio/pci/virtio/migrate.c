@@ -53,8 +53,7 @@ virtiovf_get_migration_page(struct virtiovf_data_buffer *buf,
 			buf->last_offset_sg = sg;
 			buf->sg_last_entry += i;
 			buf->last_offset = cur_offset;
-			return nth_page(sg_page(sg),
-					(offset - cur_offset) / PAGE_SIZE);
+			return sg_page(sg) + (offset - cur_offset) / PAGE_SIZE;
 		}
 		cur_offset += sg->length;
 	}
@@ -72,13 +71,13 @@ static int virtiovf_add_migration_pages(struct virtiovf_data_buffer *buf,
 	int i;
 
 	to_fill = min_t(unsigned int, npages, PAGE_SIZE / sizeof(*page_list));
-	page_list = kvcalloc(to_fill, sizeof(*page_list), GFP_KERNEL_ACCOUNT);
+	page_list = kvzalloc_objs(*page_list, to_fill, GFP_KERNEL_ACCOUNT);
 	if (!page_list)
 		return -ENOMEM;
 
 	do {
-		filled = alloc_pages_bulk_array(GFP_KERNEL_ACCOUNT, to_fill,
-						page_list);
+		filled = alloc_pages_bulk(GFP_KERNEL_ACCOUNT, to_fill,
+					  page_list);
 		if (!filled) {
 			ret = -ENOMEM;
 			goto err;
@@ -112,7 +111,7 @@ static void virtiovf_free_data_buffer(struct virtiovf_data_buffer *buf)
 {
 	struct sg_page_iter sg_iter;
 
-	/* Undo alloc_pages_bulk_array() */
+	/* Undo alloc_pages_bulk() */
 	for_each_sgtable_page(&buf->table.sgt, &sg_iter, 0)
 		__free_page(sg_page_iter_page(&sg_iter));
 	sg_free_append_table(&buf->table);
@@ -125,7 +124,7 @@ virtiovf_alloc_data_buffer(struct virtiovf_migration_file *migf, size_t length)
 	struct virtiovf_data_buffer *buf;
 	int ret;
 
-	buf = kzalloc(sizeof(*buf), GFP_KERNEL_ACCOUNT);
+	buf = kzalloc_obj(*buf, GFP_KERNEL_ACCOUNT);
 	if (!buf)
 		return ERR_PTR(-ENOMEM);
 
@@ -677,7 +676,7 @@ virtiovf_pci_save_device_data(struct virtiovf_pci_core_device *virtvdev,
 	u32 obj_id;
 	int ret;
 
-	migf = kzalloc(sizeof(*migf), GFP_KERNEL_ACCOUNT);
+	migf = kzalloc_obj(*migf, GFP_KERNEL_ACCOUNT);
 	if (!migf)
 		return ERR_PTR(-ENOMEM);
 
@@ -1067,7 +1066,7 @@ virtiovf_pci_resume_device_data(struct virtiovf_pci_core_device *virtvdev)
 	u32 obj_id;
 	int ret;
 
-	migf = kzalloc(sizeof(*migf), GFP_KERNEL_ACCOUNT);
+	migf = kzalloc_obj(*migf, GFP_KERNEL_ACCOUNT);
 	if (!migf)
 		return ERR_PTR(-ENOMEM);
 

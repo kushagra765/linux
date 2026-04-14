@@ -201,7 +201,7 @@ static int ad7877_read(struct spi_device *spi, u16 reg)
 	struct ser_req *req;
 	int status, ret;
 
-	req = kzalloc(sizeof *req, GFP_KERNEL);
+	req = kzalloc_obj(*req);
 	if (!req)
 		return -ENOMEM;
 
@@ -232,7 +232,7 @@ static int ad7877_write(struct spi_device *spi, u16 reg, u16 val)
 	struct ser_req *req;
 	int status;
 
-	req = kzalloc(sizeof *req, GFP_KERNEL);
+	req = kzalloc_obj(*req);
 	if (!req)
 		return -ENOMEM;
 
@@ -259,7 +259,7 @@ static int ad7877_read_adc(struct spi_device *spi, unsigned command)
 	int sample;
 	int i;
 
-	req = kzalloc(sizeof *req, GFP_KERNEL);
+	req = kzalloc_obj(*req);
 	if (!req)
 		return -ENOMEM;
 
@@ -375,7 +375,7 @@ static inline void ad7877_ts_event_release(struct ad7877 *ts)
 
 static void ad7877_timer(struct timer_list *t)
 {
-	struct ad7877 *ts = from_timer(ts, t, timer);
+	struct ad7877 *ts = timer_container_of(ts, t, timer);
 	unsigned long flags;
 
 	spin_lock_irqsave(&ts->lock, flags);
@@ -415,7 +415,7 @@ static void ad7877_disable(void *data)
 		ts->disabled = true;
 		disable_irq(ts->spi->irq);
 
-		if (del_timer_sync(&ts->timer))
+		if (timer_delete_sync(&ts->timer))
 			ad7877_ts_event_release(ts);
 	}
 

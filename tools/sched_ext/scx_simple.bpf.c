@@ -52,11 +52,6 @@ static void stat_inc(u32 idx)
 		(*cnt_p)++;
 }
 
-static inline bool vtime_before(u64 a, u64 b)
-{
-	return (s64)(a - b) < 0;
-}
-
 s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
 	bool is_idle = false;
@@ -84,7 +79,7 @@ void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags)
 		 * Limit the amount of budget that an idling task can accumulate
 		 * to one slice.
 		 */
-		if (vtime_before(vtime, vtime_now - SCX_SLICE_DFL))
+		if (time_before(vtime, vtime_now - SCX_SLICE_DFL))
 			vtime = vtime_now - SCX_SLICE_DFL;
 
 		scx_bpf_dsq_insert_vtime(p, SHARED_DSQ, SCX_SLICE_DFL, vtime,
@@ -108,7 +103,7 @@ void BPF_STRUCT_OPS(simple_running, struct task_struct *p)
 	 * thus racy. Any error should be contained and temporary. Let's just
 	 * live with it.
 	 */
-	if (vtime_before(vtime_now, p->scx.dsq_vtime))
+	if (time_before(vtime_now, p->scx.dsq_vtime))
 		vtime_now = p->scx.dsq_vtime;
 }
 
@@ -136,7 +131,15 @@ void BPF_STRUCT_OPS(simple_enable, struct task_struct *p)
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(simple_init)
 {
-	return scx_bpf_create_dsq(SHARED_DSQ, -1);
+	int ret;
+
+	ret = scx_bpf_create_dsq(SHARED_DSQ, -1);
+	if (ret) {
+		scx_bpf_error("failed to create DSQ %d (%d)", SHARED_DSQ, ret);
+		return ret;
+	}
+
+	return 0;
 }
 
 void BPF_STRUCT_OPS(simple_exit, struct scx_exit_info *ei)

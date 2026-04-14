@@ -19,6 +19,7 @@
  * @WWAN_PORT_FASTBOOT: Fastboot protocol control
  * @WWAN_PORT_ADB: ADB protocol control
  * @WWAN_PORT_MIPC: MTK MIPC diagnostic interface
+ * @WWAN_PORT_NMEA: embedded GNSS receiver with NMEA output
  *
  * @WWAN_PORT_MAX: Highest supported port types
  * @WWAN_PORT_UNKNOWN: Special value to indicate an unknown port type
@@ -34,6 +35,7 @@ enum wwan_port_type {
 	WWAN_PORT_FASTBOOT,
 	WWAN_PORT_ADB,
 	WWAN_PORT_MIPC,
+	WWAN_PORT_NMEA,
 
 	/* Add new port types above this line */
 
@@ -97,7 +99,7 @@ struct wwan_port_caps {
  *
  * This function must be balanced with a call to wwan_remove_port().
  *
- * Returns a valid pointer to wwan_port on success or PTR_ERR on failure
+ * Returns: a valid pointer to wwan_port on success or PTR_ERR on failure
  */
 struct wwan_port *wwan_create_port(struct device *parent,
 				   enum wwan_port_type type,

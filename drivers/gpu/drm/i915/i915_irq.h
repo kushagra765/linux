@@ -47,4 +47,10 @@ void gen2_irq_reset(struct intel_uncore *uncore, struct i915_irq_regs regs);
 void gen2_irq_init(struct intel_uncore *uncore, struct i915_irq_regs regs,
 		   u32 imr_val, u32 ier_val);
 
+void gen2_error_reset(struct intel_uncore *uncore, struct i915_error_regs regs);
+void gen2_error_init(struct intel_uncore *uncore, struct i915_error_regs regs,
+		     u32 emr_val);
+
+extern const struct intel_display_irq_interface i915_display_irq_interface;
+
 #endif /* __I915_IRQ_H__ */

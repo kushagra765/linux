@@ -13,32 +13,20 @@
 #include <sound/soc.h>
 #include <linux/bitops.h>
 
-#define soc_component_ret(dai, ret) _soc_component_ret(dai, __func__, ret, -1)
-#define soc_component_ret_reg_rw(dai, ret, reg) _soc_component_ret(dai, __func__, ret, reg)
-static inline int _soc_component_ret(struct snd_soc_component *component,
-				     const char *func, int ret, int reg)
+#define soc_component_ret(dai, ret) _soc_component_ret(dai, __func__, ret)
+static inline int _soc_component_ret(struct snd_soc_component *component, const char *func, int ret)
 {
-	/* Positive/Zero values are not errors */
-	if (ret >= 0)
-		return ret;
+	return snd_soc_ret(component->dev, ret,
+			   "at %s() on %s\n", func, component->name);
+}
 
-	/* Negative values might be errors */
-	switch (ret) {
-	case -EPROBE_DEFER:
-	case -ENOTSUPP:
-		break;
-	default:
-		if (reg == -1)
-			dev_err(component->dev,
-				"ASoC: error at %s on %s: %d\n",
-				func, component->name, ret);
-		else
-			dev_err(component->dev,
-				"ASoC: error at %s on %s for register: [0x%08x] %d\n",
-				func, component->name, reg, ret);
-	}
-
-	return ret;
+#define soc_component_ret_reg_rw(dai, ret, reg) _soc_component_ret_reg_rw(dai, __func__, ret, reg)
+static inline int _soc_component_ret_reg_rw(struct snd_soc_component *component,
+					    const char *func, int ret, int reg)
+{
+	return snd_soc_ret(component->dev, ret,
+			   "at %s() on %s for register: [0x%08x]\n",
+			   func, component->name, reg);
 }
 
 static inline int soc_component_field_shift(struct snd_soc_component *component,
@@ -153,88 +141,6 @@ int snd_soc_component_set_bias_level(struct snd_soc_component *component,
 
 	return soc_component_ret(component, ret);
 }
-
-int snd_soc_component_enable_pin(struct snd_soc_component *component,
-				 const char *pin)
-{
-	struct snd_soc_dapm_context *dapm =
-		snd_soc_component_get_dapm(component);
-	return snd_soc_dapm_enable_pin(dapm, pin);
-}
-EXPORT_SYMBOL_GPL(snd_soc_component_enable_pin);
-
-int snd_soc_component_enable_pin_unlocked(struct snd_soc_component *component,
-					  const char *pin)
-{
-	struct snd_soc_dapm_context *dapm =
-		snd_soc_component_get_dapm(component);
-	return snd_soc_dapm_enable_pin_unlocked(dapm, pin);
-}
-EXPORT_SYMBOL_GPL(snd_soc_component_enable_pin_unlocked);
-
-int snd_soc_component_disable_pin(struct snd_soc_component *component,
-				  const char *pin)
-{
-	struct snd_soc_dapm_context *dapm =
-		snd_soc_component_get_dapm(component);
-	return snd_soc_dapm_disable_pin(dapm, pin);
-}
-EXPORT_SYMBOL_GPL(snd_soc_component_disable_pin);
-
-int snd_soc_component_disable_pin_unlocked(struct snd_soc_component *component,
-					   const char *pin)
-{
-	struct snd_soc_dapm_context *dapm = 
-		snd_soc_component_get_dapm(component);
-	return snd_soc_dapm_disable_pin_unlocked(dapm, pin);
-}
-EXPORT_SYMBOL_GPL(snd_soc_component_disable_pin_unlocked);
-
-int snd_soc_component_nc_pin(struct snd_soc_component *component,
-			     const char *pin)
-{
-	struct snd_soc_dapm_context *dapm =
-		snd_soc_component_get_dapm(component);
-	return snd_soc_dapm_nc_pin(dapm, pin);
-}
-EXPORT_SYMBOL_GPL(snd_soc_component_nc_pin);
-
-int snd_soc_component_nc_pin_unlocked(struct snd_soc_component *component,
-				      const char *pin)
-{
-	struct snd_soc_dapm_context *dapm =
-		snd_soc_component_get_dapm(component);
-	return snd_soc_dapm_nc_pin_unlocked(dapm, pin);
-}
-EXPORT_SYMBOL_GPL(snd_soc_component_nc_pin_unlocked);
-
-int snd_soc_component_get_pin_status(struct snd_soc_component *component,
-				     const char *pin)
-{
-	struct snd_soc_dapm_context *dapm =
-		snd_soc_component_get_dapm(component);
-	return snd_soc_dapm_get_pin_status(dapm, pin);
-}
-EXPORT_SYMBOL_GPL(snd_soc_component_get_pin_status);
-
-int snd_soc_component_force_enable_pin(struct snd_soc_component *component,
-				       const char *pin)
-{
-	struct snd_soc_dapm_context *dapm =
-		snd_soc_component_get_dapm(component);
-	return snd_soc_dapm_force_enable_pin(dapm, pin);
-}
-EXPORT_SYMBOL_GPL(snd_soc_component_force_enable_pin);
-
-int snd_soc_component_force_enable_pin_unlocked(
-	struct snd_soc_component *component,
-	const char *pin)
-{
-	struct snd_soc_dapm_context *dapm =
-		snd_soc_component_get_dapm(component);
-	return snd_soc_dapm_force_enable_pin_unlocked(dapm, pin);
-}
-EXPORT_SYMBOL_GPL(snd_soc_component_force_enable_pin_unlocked);
 
 static void soc_get_kcontrol_name(struct snd_soc_component *component,
 				  char *buf, int size, const char * const ctl)
@@ -649,7 +555,7 @@ int snd_soc_component_compr_ack(struct snd_compr_stream *cstream, size_t bytes)
 EXPORT_SYMBOL_GPL(snd_soc_component_compr_ack);
 
 int snd_soc_component_compr_pointer(struct snd_compr_stream *cstream,
-				    struct snd_compr_tstamp *tstamp)
+				    struct snd_compr_tstamp64 *tstamp)
 {
 	struct snd_soc_pcm_runtime *rtd = cstream->private_data;
 	struct snd_soc_component *component;
@@ -1290,7 +1196,6 @@ void snd_soc_pcm_component_pm_runtime_put(struct snd_soc_pcm_runtime *rtd,
 		if (rollback && !soc_component_mark_match(component, stream, pm))
 			continue;
 
-		pm_runtime_mark_last_busy(component->dev);
 		pm_runtime_put_autosuspend(component->dev);
 
 		/* remove marked stream */

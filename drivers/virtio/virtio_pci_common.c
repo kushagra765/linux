@@ -134,14 +134,11 @@ static int vp_request_msix_vectors(struct virtio_device *vdev, int nvectors,
 
 	vp_dev->msix_vectors = nvectors;
 
-	vp_dev->msix_names = kmalloc_array(nvectors,
-					   sizeof(*vp_dev->msix_names),
-					   GFP_KERNEL);
+	vp_dev->msix_names = kmalloc_objs(*vp_dev->msix_names, nvectors);
 	if (!vp_dev->msix_names)
 		goto error;
 	vp_dev->msix_affinity_masks
-		= kcalloc(nvectors, sizeof(*vp_dev->msix_affinity_masks),
-			  GFP_KERNEL);
+		= kzalloc_objs(*vp_dev->msix_affinity_masks, nvectors);
 	if (!vp_dev->msix_affinity_masks)
 		goto error;
 	for (i = 0; i < nvectors; ++i)
@@ -211,7 +208,7 @@ static struct virtqueue *vp_setup_vq(struct virtio_device *vdev, unsigned int in
 				     struct virtio_pci_vq_info **p_info)
 {
 	struct virtio_pci_device *vp_dev = to_vp_device(vdev);
-	struct virtio_pci_vq_info *info = kmalloc(sizeof *info, GFP_KERNEL);
+	struct virtio_pci_vq_info *info = kmalloc_obj(*info);
 	struct virtqueue *vq;
 	unsigned long flags;
 
@@ -387,7 +384,7 @@ static int vp_find_vqs_msix(struct virtio_device *vdev, unsigned int nvqs,
 	bool per_vq_vectors;
 	u16 avq_num = 0;
 
-	vp_dev->vqs = kcalloc(nvqs, sizeof(*vp_dev->vqs), GFP_KERNEL);
+	vp_dev->vqs = kzalloc_objs(*vp_dev->vqs, nvqs);
 	if (!vp_dev->vqs)
 		return -ENOMEM;
 
@@ -464,7 +461,7 @@ static int vp_find_vqs_intx(struct virtio_device *vdev, unsigned int nvqs,
 	struct virtqueue *vq;
 	u16 avq_num = 0;
 
-	vp_dev->vqs = kcalloc(nvqs, sizeof(*vp_dev->vqs), GFP_KERNEL);
+	vp_dev->vqs = kzalloc_objs(*vp_dev->vqs, nvqs);
 	if (!vp_dev->vqs)
 		return -ENOMEM;
 
@@ -686,7 +683,7 @@ static int virtio_pci_probe(struct pci_dev *pci_dev,
 	int rc;
 
 	/* allocate our structure and fill it out */
-	vp_dev = kzalloc(sizeof(struct virtio_pci_device), GFP_KERNEL);
+	vp_dev = kzalloc_obj(struct virtio_pci_device);
 	if (!vp_dev)
 		return -ENOMEM;
 
@@ -794,6 +791,46 @@ static int virtio_pci_sriov_configure(struct pci_dev *pci_dev, int num_vfs)
 	return num_vfs;
 }
 
+static void virtio_pci_reset_prepare(struct pci_dev *pci_dev)
+{
+	struct virtio_pci_device *vp_dev = pci_get_drvdata(pci_dev);
+	int ret = 0;
+
+	ret = virtio_device_reset_prepare(&vp_dev->vdev);
+	if (ret) {
+		if (ret != -EOPNOTSUPP)
+			dev_warn(&pci_dev->dev, "Reset prepare failure: %d",
+				 ret);
+		return;
+	}
+
+	if (pci_is_enabled(pci_dev))
+		pci_disable_device(pci_dev);
+}
+
+static void virtio_pci_reset_done(struct pci_dev *pci_dev)
+{
+	struct virtio_pci_device *vp_dev = pci_get_drvdata(pci_dev);
+	int ret;
+
+	if (pci_is_enabled(pci_dev))
+		return;
+
+	ret = pci_enable_device(pci_dev);
+	if (!ret) {
+		pci_set_master(pci_dev);
+		ret = virtio_device_reset_done(&vp_dev->vdev);
+	}
+
+	if (ret && ret != -EOPNOTSUPP)
+		dev_warn(&pci_dev->dev, "Reset done failure: %d", ret);
+}
+
+static const struct pci_error_handlers virtio_pci_err_handler = {
+	.reset_prepare  = virtio_pci_reset_prepare,
+	.reset_done     = virtio_pci_reset_done,
+};
+
 static struct pci_driver virtio_pci_driver = {
 	.name		= "virtio-pci",
 	.id_table	= virtio_pci_id_table,
@@ -803,6 +840,7 @@ static struct pci_driver virtio_pci_driver = {
 	.driver.pm	= &virtio_pci_pm_ops,
 #endif
 	.sriov_configure = virtio_pci_sriov_configure,
+	.err_handler	= &virtio_pci_err_handler,
 };
 
 struct virtio_device *virtio_pci_vf_get_pf_dev(struct pci_dev *pdev)

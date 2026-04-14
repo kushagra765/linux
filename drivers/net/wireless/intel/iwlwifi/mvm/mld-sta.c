@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 /*
- * Copyright (C) 2022-2024 Intel Corporation
+ * Copyright (C) 2022-2025 Intel Corporation
  */
 #include "mvm.h"
 #include "time-sync.h"
@@ -9,48 +9,26 @@
 u32 iwl_mvm_sta_fw_id_mask(struct iwl_mvm *mvm, struct ieee80211_sta *sta,
 			   int filter_link_id)
 {
-	struct ieee80211_link_sta *link_sta;
 	struct iwl_mvm_sta *mvmsta;
-	struct ieee80211_vif *vif;
-	unsigned int link_id;
-	u32 result = 0;
 
 	if (!sta)
 		return 0;
 
 	mvmsta = iwl_mvm_sta_from_mac80211(sta);
-	vif = mvmsta->vif;
 
-	/* it's easy when the STA is not an MLD */
-	if (!sta->valid_links)
-		return BIT(mvmsta->deflink.sta_id);
-
-	/* but if it is an MLD, get the mask of all the FW STAs it has ... */
-	for_each_sta_active_link(vif, sta, link_sta, link_id) {
-		struct iwl_mvm_link_sta *mvm_link_sta;
-
-		/* unless we have a specific link in mind */
-		if (filter_link_id >= 0 && link_id != filter_link_id)
-			continue;
-
-		mvm_link_sta =
-			rcu_dereference_check(mvmsta->link[link_id],
-					      lockdep_is_held(&mvm->mutex));
-		if (!mvm_link_sta)
-			continue;
-
-		result |= BIT(mvm_link_sta->sta_id);
-	}
-
-	return result;
+	return BIT(mvmsta->deflink.sta_id);
 }
 
 static int iwl_mvm_mld_send_sta_cmd(struct iwl_mvm *mvm,
 				    struct iwl_sta_cfg_cmd *cmd)
 {
+	u32 cmd_id = WIDE_ID(MAC_CONF_GROUP, STA_CONFIG_CMD);
+	int cmd_len = iwl_fw_lookup_cmd_ver(mvm->fw, cmd_id, 0) > 1 ?
+		      sizeof(*cmd) :
+		      sizeof(struct iwl_sta_cfg_cmd_v1);
 	int ret = iwl_mvm_send_cmd_pdu(mvm,
 				       WIDE_ID(MAC_CONF_GROUP, STA_CONFIG_CMD),
-				       0, sizeof(*cmd), cmd);
+				       0, cmd_len, cmd);
 	if (ret)
 		IWL_ERR(mvm, "STA_CONFIG_CMD send failed, ret=0x%x\n", ret);
 	return ret;
@@ -121,7 +99,7 @@ static int iwl_mvm_add_aux_sta_to_fw(struct iwl_mvm *mvm,
 {
 	int ret;
 
-	struct iwl_mvm_aux_sta_cmd cmd = {
+	struct iwl_aux_sta_cmd cmd = {
 		.sta_id = cpu_to_le32(sta->sta_id),
 		.lmac_id = cpu_to_le32(lmac_id),
 	};
@@ -144,7 +122,7 @@ int iwl_mvm_mld_add_int_sta_with_queue(struct iwl_mvm *mvm,
 {
 	int ret, txq;
 	unsigned int wdg_timeout = _wdg_timeout ? *_wdg_timeout :
-		mvm->trans->trans_cfg->base_params->wd_timeout;
+		mvm->trans->mac_cfg->base->wd_timeout;
 
 	if (WARN_ON_ONCE(sta->sta_id == IWL_INVALID_STA))
 		return -ENOSPC;
@@ -518,14 +496,12 @@ static int iwl_mvm_mld_cfg_sta(struct iwl_mvm *mvm, struct ieee80211_sta *sta,
 void iwl_mvm_mld_free_sta_link(struct iwl_mvm *mvm,
 			       struct iwl_mvm_sta *mvm_sta,
 			       struct iwl_mvm_link_sta *mvm_sta_link,
-			       unsigned int link_id,
-			       bool is_in_fw)
+			       unsigned int link_id)
 {
 	lockdep_assert_wiphy(mvm->hw->wiphy);
 	lockdep_assert_held(&mvm->mutex);
 
-	RCU_INIT_POINTER(mvm->fw_id_to_mac_id[mvm_sta_link->sta_id],
-			 is_in_fw ? ERR_PTR(-EINVAL) : NULL);
+	RCU_INIT_POINTER(mvm->fw_id_to_mac_id[mvm_sta_link->sta_id], NULL);
 	RCU_INIT_POINTER(mvm->fw_id_to_link_sta[mvm_sta_link->sta_id], NULL);
 	RCU_INIT_POINTER(mvm_sta->link[link_id], NULL);
 
@@ -546,7 +522,7 @@ static void iwl_mvm_mld_sta_rm_all_sta_links(struct iwl_mvm *mvm,
 		if (!link)
 			continue;
 
-		iwl_mvm_mld_free_sta_link(mvm, mvm_sta, link, link_id, false);
+		iwl_mvm_mld_free_sta_link(mvm, mvm_sta, link, link_id);
 	}
 }
 
@@ -571,7 +547,7 @@ static int iwl_mvm_mld_alloc_sta_link(struct iwl_mvm *mvm,
 	if (rcu_access_pointer(sta->link[link_id]) == &sta->deflink) {
 		link = &mvm_sta->deflink;
 	} else {
-		link = kzalloc(sizeof(*link), GFP_KERNEL);
+		link = kzalloc_obj(*link);
 		if (!link)
 			return -ENOMEM;
 	}
@@ -844,21 +820,12 @@ int iwl_mvm_mld_rm_sta(struct iwl_mvm *mvm, struct ieee80211_vif *vif,
 		struct iwl_mvm_link_sta *mvm_link_sta =
 			rcu_dereference_protected(mvm_sta->link[link_id],
 						  lockdep_is_held(&mvm->mutex));
-		bool stay_in_fw;
+		iwl_mvm_sta_del(mvm, vif, sta, link_sta);
 
-		stay_in_fw = iwl_mvm_sta_del(mvm, vif, sta, link_sta, &ret);
-		if (ret)
-			break;
+		ret = iwl_mvm_mld_rm_sta_from_fw(mvm, mvm_link_sta->sta_id);
 
-		if (!stay_in_fw)
-			ret = iwl_mvm_mld_rm_sta_from_fw(mvm,
-							 mvm_link_sta->sta_id);
-
-		iwl_mvm_mld_free_sta_link(mvm, mvm_sta, mvm_link_sta,
-					  link_id, stay_in_fw);
+		iwl_mvm_mld_free_sta_link(mvm, mvm_sta, mvm_link_sta, link_id);
 	}
-	kfree(mvm_sta->mpdu_counters);
-	mvm_sta->mpdu_counters = NULL;
 
 	return ret;
 }
@@ -1122,8 +1089,7 @@ int iwl_mvm_mld_update_sta_links(struct iwl_mvm *mvm,
 		if (vif->type == NL80211_IFTYPE_STATION)
 			mvm_vif_link->ap_sta_id = IWL_INVALID_STA;
 
-		iwl_mvm_mld_free_sta_link(mvm, mvm_sta, mvm_sta_link, link_id,
-					  false);
+		iwl_mvm_mld_free_sta_link(mvm, mvm_sta, mvm_sta_link, link_id);
 	}
 
 	for_each_set_bit(link_id, &links_to_add, IEEE80211_MLD_MAX_NUM_LINKS) {
@@ -1227,8 +1193,7 @@ err:
 			rcu_dereference_protected(mvm_sta->link[link_id],
 						  lockdep_is_held(&mvm->mutex));
 
-		iwl_mvm_mld_free_sta_link(mvm, mvm_sta, mvm_sta_link, link_id,
-					  false);
+		iwl_mvm_mld_free_sta_link(mvm, mvm_sta, mvm_sta_link, link_id);
 	}
 
 	return ret;

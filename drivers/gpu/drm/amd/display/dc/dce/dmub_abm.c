@@ -28,6 +28,8 @@
 #include "dc.h"
 #include "core_types.h"
 #include "dmub_cmd.h"
+#include "dc_dmub_srv.h"
+#include "dmub/dmub_srv.h"
 
 #define TO_DMUB_ABM(abm)\
 	container_of(abm, struct dce_abm, base)
@@ -220,7 +222,7 @@ struct abm *dmub_abm_create(
 	const struct dce_abm_mask *abm_mask)
 {
 	if (ctx->dc->caps.dmcub_support) {
-		struct dce_abm *abm_dce = kzalloc(sizeof(*abm_dce), GFP_KERNEL);
+		struct dce_abm *abm_dce = kzalloc_obj(*abm_dce);
 
 		if (abm_dce == NULL) {
 			BREAK_TO_DEBUGGER();

@@ -10,6 +10,7 @@
 
 #include <linux/types.h>
 #include <linux/delay.h>
+#include <linux/export.h>
 #include <linux/module.h>
 #include <linux/interrupt.h>
 #include <linux/ioport.h>
@@ -179,8 +180,8 @@ static struct platform_device *i8042_platform_device;
 static struct notifier_block i8042_kbd_bind_notifier_block;
 
 static bool i8042_handle_data(int irq);
-static bool (*i8042_platform_filter)(unsigned char data, unsigned char str,
-				     struct serio *serio);
+static i8042_filter_t i8042_platform_filter;
+static void *i8042_platform_filter_context;
 
 void i8042_lock_chip(void)
 {
@@ -194,8 +195,7 @@ void i8042_unlock_chip(void)
 }
 EXPORT_SYMBOL(i8042_unlock_chip);
 
-int i8042_install_filter(bool (*filter)(unsigned char data, unsigned char str,
-					struct serio *serio))
+int i8042_install_filter(i8042_filter_t filter, void *context)
 {
 	guard(spinlock_irqsave)(&i8042_lock);
 
@@ -203,12 +203,12 @@ int i8042_install_filter(bool (*filter)(unsigned char data, unsigned char str,
 		return -EBUSY;
 
 	i8042_platform_filter = filter;
+	i8042_platform_filter_context = context;
 	return 0;
 }
 EXPORT_SYMBOL(i8042_install_filter);
 
-int i8042_remove_filter(bool (*filter)(unsigned char data, unsigned char str,
-				       struct serio *port))
+int i8042_remove_filter(i8042_filter_t filter)
 {
 	guard(spinlock_irqsave)(&i8042_lock);
 
@@ -216,6 +216,7 @@ int i8042_remove_filter(bool (*filter)(unsigned char data, unsigned char str,
 		return -EINVAL;
 
 	i8042_platform_filter = NULL;
+	i8042_platform_filter_context = NULL;
 	return 0;
 }
 EXPORT_SYMBOL(i8042_remove_filter);
@@ -480,7 +481,10 @@ static bool i8042_filter(unsigned char data, unsigned char str,
 		}
 	}
 
-	if (i8042_platform_filter && i8042_platform_filter(data, str, serio)) {
+	if (!i8042_platform_filter)
+		return false;
+
+	if (i8042_platform_filter(data, str, serio, i8042_platform_filter_context)) {
 		dbg("Filtered out by platform filter\n");
 		return true;
 	}
@@ -1320,7 +1324,7 @@ static int i8042_create_kbd_port(void)
 	struct serio *serio;
 	struct i8042_port *port = &i8042_ports[I8042_KBD_PORT_NO];
 
-	serio = kzalloc(sizeof(*serio), GFP_KERNEL);
+	serio = kzalloc_obj(*serio);
 	if (!serio)
 		return -ENOMEM;
 
@@ -1350,7 +1354,7 @@ static int i8042_create_aux_port(int idx)
 	int port_no = idx < 0 ? I8042_AUX_PORT_NO : I8042_MUX_PORT_NO + idx;
 	struct i8042_port *port = &i8042_ports[port_no];
 
-	serio = kzalloc(sizeof(*serio), GFP_KERNEL);
+	serio = kzalloc_obj(*serio);
 	if (!serio)
 		return -ENOMEM;
 

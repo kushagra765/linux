@@ -7,6 +7,7 @@
 
 #include <linux/kernel.h>
 #include <linux/device.h>
+#include <linux/hex.h>
 #include <linux/if.h>
 #include <linux/if_ether.h>
 #include <linux/interrupt.h>
@@ -625,7 +626,6 @@ static ssize_t ieee80211_if_fmt_aqm(
 	txqi = to_txq_info(sdata->vif.txq);
 
 	spin_lock_bh(&local->fq.lock);
-	rcu_read_lock();
 
 	len = scnprintf(buf,
 			buflen,
@@ -642,7 +642,6 @@ static ssize_t ieee80211_if_fmt_aqm(
 			txqi->tin.tx_bytes,
 			txqi->tin.tx_packets);
 
-	rcu_read_unlock();
 	spin_unlock_bh(&local->fq.lock);
 
 	return len;
@@ -704,7 +703,7 @@ static ssize_t ieee80211_if_parse_tsf(
 		}
 	}
 
-	ieee80211_recalc_dtim(local, sdata);
+	ieee80211_recalc_dtim(sdata, drv_get_tsf(local, sdata));
 	return buflen;
 }
 IEEE80211_IF_FILE_RW(tsf);
@@ -727,7 +726,7 @@ static ssize_t ieee80211_if_parse_active_links(struct ieee80211_sub_if_data *sda
 {
 	u16 active_links;
 
-	if (kstrtou16(buf, 0, &active_links))
+	if (kstrtou16(buf, 0, &active_links) || !active_links)
 		return -EINVAL;
 
 	return ieee80211_set_active_links(&sdata->vif, active_links) ?: buflen;
@@ -1025,16 +1024,7 @@ void ieee80211_debugfs_remove_netdev(struct ieee80211_sub_if_data *sdata)
 
 void ieee80211_debugfs_rename_netdev(struct ieee80211_sub_if_data *sdata)
 {
-	struct dentry *dir;
-	char buf[10 + IFNAMSIZ];
-
-	dir = sdata->vif.debugfs_dir;
-
-	if (IS_ERR_OR_NULL(dir))
-		return;
-
-	sprintf(buf, "netdev:%s", sdata->name);
-	debugfs_rename(dir->d_parent, dir, dir->d_parent, buf);
+	debugfs_change_name(sdata->vif.debugfs_dir, "netdev:%s", sdata->name);
 }
 
 void ieee80211_debugfs_recreate_netdev(struct ieee80211_sub_if_data *sdata,

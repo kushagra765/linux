@@ -18,11 +18,9 @@ feature
 urandom_read
 test_sockmap
 test_lirc_mode2_user
-test_flow_dissector
 flow_dissector_load
 test_tcpnotify_user
 test_libbpf
-test_sysctl
 xdping
 test_cpp
 *.d
@@ -34,7 +32,6 @@ test_cpp
 /cpuv4
 /host-tools
 /tools
-/runqslower
 /bench
 /veristat
 /sign-file
@@ -46,3 +43,7 @@ xdp_redirect_multi
 xdp_synproxy
 xdp_hw_metadata
 xdp_features
+verification_cert.h
+*.BTF
+*.BTF_ids
+*.BTF.base

@@ -22,7 +22,6 @@
 #include <linux/platform_data/cros_ec_commands.h>
 #include <linux/platform_data/cros_ec_proto.h>
 #include <linux/platform_device.h>
-#include <linux/pm_wakeup.h>
 #include <linux/unaligned.h>
 
 #include "hid-ids.h"
@@ -60,8 +59,7 @@ static int cbas_ec_query_base(struct cros_ec_device *ec_dev, bool get_state,
 	struct cros_ec_command *msg;
 	int ret;
 
-	msg = kzalloc(struct_size(msg, data, max(sizeof(u32), sizeof(*params))),
-		      GFP_KERNEL);
+	msg = kzalloc_flex(*msg, data, max(sizeof(u32), sizeof(*params)));
 	if (!msg)
 		return -ENOMEM;
 
@@ -268,11 +266,13 @@ static void cbas_ec_remove(struct platform_device *pdev)
 	mutex_unlock(&cbas_ec_reglock);
 }
 
+#ifdef CONFIG_ACPI
 static const struct acpi_device_id cbas_ec_acpi_ids[] = {
 	{ "GOOG000B", 0 },
 	{ }
 };
 MODULE_DEVICE_TABLE(acpi, cbas_ec_acpi_ids);
+#endif
 
 #ifdef CONFIG_OF
 static const struct of_device_id cbas_ec_of_match[] = {

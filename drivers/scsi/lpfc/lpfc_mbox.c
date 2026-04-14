@@ -64,7 +64,7 @@ lpfc_mbox_rsrc_prep(struct lpfc_hba *phba, LPFC_MBOXQ_t *mbox)
 {
 	struct lpfc_dmabuf *mp;
 
-	mp = kmalloc(sizeof(*mp), GFP_KERNEL);
+	mp = kmalloc_obj(*mp);
 	if (!mp)
 		return -ENOMEM;
 
@@ -1869,8 +1869,7 @@ lpfc_sli4_config(struct lpfc_hba *phba, struct lpfcMboxq *mbox,
 	pcount = (pcount > LPFC_SLI4_MBX_SGE_MAX_PAGES) ?
 				LPFC_SLI4_MBX_SGE_MAX_PAGES : pcount;
 	/* Allocate record for keeping SGE virtual addresses */
-	mbox->sge_array = kzalloc(sizeof(struct lpfc_mbx_nembed_sge_virt),
-				  GFP_KERNEL);
+	mbox->sge_array = kzalloc_obj(struct lpfc_mbx_nembed_sge_virt);
 	if (!mbox->sge_array) {
 		lpfc_printf_log(phba, KERN_ERR, LOG_MBOX,
 				"2527 Failed to allocate non-embedded SGE "
@@ -2524,8 +2523,10 @@ lpfc_reg_fcfi(struct lpfc_hba *phba, struct lpfcMboxq *mbox)
 		bf_set(lpfc_reg_fcfi_rq_id1, reg_fcfi, REG_FCF_INVALID_QID);
 
 		/* addr mode is bit wise inverted value of fcf addr_mode */
-		bf_set(lpfc_reg_fcfi_mam, reg_fcfi,
-		       (~phba->fcf.addr_mode) & 0x3);
+		if (test_bit(HBA_FCOE_MODE, &phba->hba_flag)) {
+			bf_set(lpfc_reg_fcfi_mam, reg_fcfi,
+			       (~phba->fcf.addr_mode) & 0x3);
+		}
 	} else {
 		/* This is ONLY for NVMET MRQ == 1 */
 		if (phba->cfg_nvmet_mrq != 1)

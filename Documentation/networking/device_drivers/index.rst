@@ -9,7 +9,6 @@ Contents:
    :maxdepth: 2
 
    atm/index
-   cable/index
    can/index
    cellular/index
    ethernet/index
@@ -17,10 +16,3 @@ Contents:
    hamradio/index
    wifi/index
    wwan/index
-
-.. only::  subproject and html
-
-   Indices
-   =======
-
-   * :ref:`genindex`

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: BSD-3-Clause-Clear */
 /* Copyright (C) 2020 MediaTek Inc. */
 
 #ifndef __MT76_CONNAC_MCU_H
@@ -869,6 +869,7 @@ enum {
 #define NETWORK_WDS			BIT(21)
 
 #define SCAN_FUNC_RANDOM_MAC		BIT(0)
+#define SCAN_FUNC_RNR_SCAN		BIT(3)
 #define SCAN_FUNC_SPLIT_SCAN		BIT(5)
 
 #define CONNECTION_INFRA_STA		(STA_TYPE_STA | NETWORK_INFRA)
@@ -1043,12 +1044,14 @@ enum {
 	MCU_EXT_EVENT_CSA_NOTIFY = 0x4f,
 	MCU_EXT_EVENT_WA_TX_STAT = 0x74,
 	MCU_EXT_EVENT_BCC_NOTIFY = 0x75,
+	MCU_EXT_EVENT_WF_RF_PIN_CTRL = 0x9a,
 	MCU_EXT_EVENT_MURU_CTRL = 0x9f,
 };
 
 /* unified event table */
 enum {
 	MCU_UNI_EVENT_RESULT = 0x01,
+	MCU_UNI_EVENT_HIF_CTRL = 0x03,
 	MCU_UNI_EVENT_FW_LOG_2_HOST = 0x04,
 	MCU_UNI_EVENT_ACCESS_REG = 0x6,
 	MCU_UNI_EVENT_IE_COUNTDOWN = 0x09,
@@ -1059,10 +1062,12 @@ enum {
 	MCU_UNI_EVENT_ROC = 0x27,
 	MCU_UNI_EVENT_TX_DONE = 0x2d,
 	MCU_UNI_EVENT_THERMAL = 0x35,
+	MCU_UNI_EVENT_RSSI_MONITOR = 0x41,
 	MCU_UNI_EVENT_NIC_CAPAB = 0x43,
 	MCU_UNI_EVENT_WED_RRO = 0x57,
 	MCU_UNI_EVENT_PER_STA_INFO = 0x6d,
 	MCU_UNI_EVENT_ALL_STA_INFO = 0x6e,
+	MCU_UNI_EVENT_SDO = 0x83,
 };
 
 #define MCU_UNI_CMD_EVENT			BIT(1)
@@ -1180,6 +1185,11 @@ enum {
 #define MCU_UNI_CMD(_t)				(__MCU_CMD_FIELD_UNI |			\
 						 FIELD_PREP(__MCU_CMD_FIELD_ID,		\
 							    MCU_UNI_CMD_##_t))
+
+#define MCU_UNI_QUERY(_t)			(__MCU_CMD_FIELD_UNI | __MCU_CMD_FIELD_QUERY | \
+						 FIELD_PREP(__MCU_CMD_FIELD_ID,		\
+							    MCU_UNI_CMD_##_t))
+
 #define MCU_CE_CMD(_t)				(__MCU_CMD_FIELD_CE |			\
 						 FIELD_PREP(__MCU_CMD_FIELD_ID,		\
 							   MCU_CE_CMD_##_t))
@@ -1251,6 +1261,7 @@ enum {
 	MCU_EXT_CMD_GROUP_PRE_CAL_INFO = 0xab,
 	MCU_EXT_CMD_DPD_PRE_CAL_INFO = 0xac,
 	MCU_EXT_CMD_PHY_STAT_INFO = 0xad,
+	MCU_EXT_CMD_WF_RF_PIN_CTRL = 0xbd,
 };
 
 enum {
@@ -1284,16 +1295,21 @@ enum {
 	MCU_UNI_CMD_EFUSE_CTRL = 0x2d,
 	MCU_UNI_CMD_RA = 0x2f,
 	MCU_UNI_CMD_MURU = 0x31,
+	MCU_UNI_CMD_TESTMODE_RX_STAT = 0x32,
 	MCU_UNI_CMD_BF = 0x33,
 	MCU_UNI_CMD_CHANNEL_SWITCH = 0x34,
 	MCU_UNI_CMD_THERMAL = 0x35,
 	MCU_UNI_CMD_VOW = 0x37,
 	MCU_UNI_CMD_FIXED_RATE_TABLE = 0x40,
+	MCU_UNI_CMD_RSSI_MONITOR = 0x41,
+	MCU_UNI_CMD_TESTMODE_CTRL = 0x46,
 	MCU_UNI_CMD_RRO = 0x57,
 	MCU_UNI_CMD_OFFCH_SCAN_CTRL = 0x58,
 	MCU_UNI_CMD_PER_STA_INFO = 0x6d,
 	MCU_UNI_CMD_ALL_STA_INFO = 0x6e,
 	MCU_UNI_CMD_ASSERT_DUMP = 0x6f,
+	MCU_UNI_CMD_RADIO_STATUS = 0x80,
+	MCU_UNI_CMD_SDO = 0x88,
 };
 
 enum {
@@ -1366,6 +1382,7 @@ enum {
 	UNI_BSS_INFO_OFFLOAD = 25,
 	UNI_BSS_INFO_MLD = 26,
 	UNI_BSS_INFO_PM_DISABLE = 27,
+	UNI_BSS_INFO_EHT = 30,
 };
 
 enum {
@@ -1756,6 +1773,7 @@ struct mt76_sta_cmd_info {
 	struct mt76_wcid *wcid;
 
 	struct ieee80211_vif *vif;
+	struct ieee80211_bss_conf *link_conf;
 
 	bool offload_fw;
 	bool enable;
@@ -1876,10 +1894,10 @@ mt76_connac_mcu_get_wlan_idx(struct mt76_dev *dev, struct mt76_wcid *wcid,
 }
 
 struct sk_buff *
-__mt76_connac_mcu_alloc_sta_req(struct mt76_dev *dev, struct mt76_vif *mvif,
+__mt76_connac_mcu_alloc_sta_req(struct mt76_dev *dev, struct mt76_vif_link *mvif,
 				struct mt76_wcid *wcid, int len);
 static inline struct sk_buff *
-mt76_connac_mcu_alloc_sta_req(struct mt76_dev *dev, struct mt76_vif *mvif,
+mt76_connac_mcu_alloc_sta_req(struct mt76_dev *dev, struct mt76_vif_link *mvif,
 			      struct mt76_wcid *wcid)
 {
 	return __mt76_connac_mcu_alloc_sta_req(dev, mvif, wcid,
@@ -1901,7 +1919,7 @@ mt76_connac_mcu_add_tlv(struct sk_buff *skb, int tag, int len)
 int mt76_connac_mcu_set_channel_domain(struct mt76_phy *phy);
 int mt76_connac_mcu_set_vif_ps(struct mt76_dev *dev, struct ieee80211_vif *vif);
 void mt76_connac_mcu_sta_basic_tlv(struct mt76_dev *dev, struct sk_buff *skb,
-				   struct ieee80211_vif *vif,
+				   struct ieee80211_bss_conf *link_conf,
 				   struct ieee80211_link_sta *link_sta,
 				   int state, bool newly);
 void mt76_connac_mcu_wtbl_generic_tlv(struct mt76_dev *dev, struct sk_buff *skb,
@@ -1938,13 +1956,14 @@ void mt76_connac_mcu_sta_ba_tlv(struct sk_buff *skb,
 				bool enable, bool tx);
 int mt76_connac_mcu_uni_add_dev(struct mt76_phy *phy,
 				struct ieee80211_bss_conf *bss_conf,
+				struct mt76_vif_link *mvif,
 				struct mt76_wcid *wcid,
 				bool enable);
-int mt76_connac_mcu_sta_ba(struct mt76_dev *dev, struct mt76_vif *mvif,
+int mt76_connac_mcu_sta_ba(struct mt76_dev *dev, struct mt76_vif_link *mvif,
 			   struct ieee80211_ampdu_params *params,
 			   int cmd, bool enable, bool tx);
 int mt76_connac_mcu_uni_set_chctx(struct mt76_phy *phy,
-				  struct mt76_vif *vif,
+				  struct mt76_vif_link *vif,
 				  struct ieee80211_chanctx_conf *ctx);
 int mt76_connac_mcu_uni_add_bss(struct mt76_phy *phy,
 				struct ieee80211_vif *vif,
@@ -1964,6 +1983,8 @@ int mt76_connac_mcu_start_patch(struct mt76_dev *dev);
 int mt76_connac_mcu_patch_sem_ctrl(struct mt76_dev *dev, bool get);
 int mt76_connac_mcu_start_firmware(struct mt76_dev *dev, u32 addr, u32 option);
 
+void mt76_connac_mcu_build_rnr_scan_param(struct mt76_dev *mdev,
+					  struct cfg80211_scan_request *sreq);
 int mt76_connac_mcu_hw_scan(struct mt76_phy *phy, struct ieee80211_vif *vif,
 			    struct ieee80211_scan_request *scan_req);
 int mt76_connac_mcu_cancel_hw_scan(struct mt76_phy *phy,
@@ -1975,7 +1996,7 @@ int mt76_connac_mcu_sched_scan_enable(struct mt76_phy *phy,
 				      struct ieee80211_vif *vif,
 				      bool enable);
 int mt76_connac_mcu_update_arp_filter(struct mt76_dev *dev,
-				      struct mt76_vif *vif,
+				      struct mt76_vif_link *vif,
 				      struct ieee80211_bss_conf *info);
 int mt76_connac_mcu_set_gtk_rekey(struct mt76_dev *dev, struct ieee80211_vif *vif,
 				  bool suspend);
@@ -1988,7 +2009,7 @@ int mt76_connac_mcu_set_suspend_mode(struct mt76_dev *dev,
 				     struct ieee80211_vif *vif,
 				     bool enable, u8 mdtim,
 				     bool wow_suspend);
-int mt76_connac_mcu_set_hif_suspend(struct mt76_dev *dev, bool suspend);
+int mt76_connac_mcu_set_hif_suspend(struct mt76_dev *dev, bool suspend, bool wait_resp);
 void mt76_connac_mcu_set_suspend_iter(void *priv, u8 *mac,
 				      struct ieee80211_vif *vif);
 int mt76_connac_sta_state_dp(struct mt76_dev *dev,
@@ -2014,7 +2035,7 @@ mt76_connac_get_eht_phy_cap(struct mt76_phy *phy, struct ieee80211_vif *vif);
 u8 mt76_connac_get_phy_mode(struct mt76_phy *phy, struct ieee80211_vif *vif,
 			    enum nl80211_band band,
 			    struct ieee80211_link_sta *sta);
-u8 mt76_connac_get_phy_mode_ext(struct mt76_phy *phy, struct ieee80211_vif *vif,
+u8 mt76_connac_get_phy_mode_ext(struct mt76_phy *phy, struct ieee80211_bss_conf *conf,
 				enum nl80211_band band);
 
 int mt76_connac_mcu_add_key(struct mt76_dev *dev, struct ieee80211_vif *vif,
@@ -2022,7 +2043,7 @@ int mt76_connac_mcu_add_key(struct mt76_dev *dev, struct ieee80211_vif *vif,
 			    struct ieee80211_key_conf *key, int mcu_cmd,
 			    struct mt76_wcid *wcid, enum set_key_cmd cmd);
 
-void mt76_connac_mcu_bss_ext_tlv(struct sk_buff *skb, struct mt76_vif *mvif);
+void mt76_connac_mcu_bss_ext_tlv(struct sk_buff *skb, struct mt76_vif_link *mvif);
 void mt76_connac_mcu_bss_omac_tlv(struct sk_buff *skb,
 				  struct ieee80211_vif *vif);
 int mt76_connac_mcu_bss_basic_tlv(struct sk_buff *skb,

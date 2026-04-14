@@ -59,8 +59,8 @@ struct rt_mutex_waiter {
 };
 
 /**
- * rt_wake_q_head - Wrapper around regular wake_q_head to support
- *		    "sleeping" spinlocks on RT
+ * struct rt_wake_q_head - Wrapper around regular wake_q_head to support
+ *			   "sleeping" spinlocks on RT
  * @head:		The regular wake_q_head for sleeping lock variants
  * @rtlock_task:	Task pointer for RT lock (spin/rwlock) wakeups
  */
@@ -151,15 +151,6 @@ static inline struct rt_mutex_waiter *task_top_pi_waiter(struct task_struct *p)
 
 	return rb_entry(p->pi_waiters.rb_leftmost, struct rt_mutex_waiter,
 			pi_tree.entry);
-}
-
-#define RT_MUTEX_HAS_WAITERS	1UL
-
-static inline struct task_struct *rt_mutex_owner(struct rt_mutex_base *lock)
-{
-	unsigned long owner = (unsigned long) READ_ONCE(lock->owner);
-
-	return (struct task_struct *) (owner & ~RT_MUTEX_HAS_WAITERS);
 }
 
 /*

@@ -96,25 +96,17 @@ static void update_cu_mask(struct mqd_manager *mm, void *mqd,
 static void set_priority(struct v11_compute_mqd *m, struct queue_properties *q)
 {
 	m->cp_hqd_pipe_priority = pipe_priority_map[q->priority];
-	m->cp_hqd_queue_priority = q->priority;
+	/* m->cp_hqd_queue_priority = q->priority; */
 }
 
-static struct kfd_mem_obj *allocate_mqd(struct kfd_node *node,
+static struct kfd_mem_obj *allocate_mqd(struct mqd_manager *mm,
 		struct queue_properties *q)
 {
+	u32 mqd_size = AMDGPU_MQD_SIZE_ALIGN(mm->mqd_size);
+	struct kfd_node *node = mm->dev;
 	struct kfd_mem_obj *mqd_mem_obj;
-	int size;
 
-	/*
-	 * MES write to areas beyond MQD size. So allocate
-	 * 1 PAGE_SIZE memory for MQD is MES is enabled.
-	 */
-	if (node->kfd->shared_resources.enable_mes)
-		size = PAGE_SIZE;
-	else
-		size = sizeof(struct v11_compute_mqd);
-
-	if (kfd_gtt_sa_allocate(node, size, &mqd_mem_obj))
+	if (kfd_gtt_sa_allocate(node, mqd_size, &mqd_mem_obj))
 		return NULL;
 
 	return mqd_mem_obj;
@@ -126,18 +118,13 @@ static void init_mqd(struct mqd_manager *mm, void **mqd,
 {
 	uint64_t addr;
 	struct v11_compute_mqd *m;
-	int size;
+	u32 mqd_size = AMDGPU_MQD_SIZE_ALIGN(mm->mqd_size);
 	uint32_t wa_mask = q->is_dbg_wa ? 0xffff : 0xffffffff;
 
 	m = (struct v11_compute_mqd *) mqd_mem_obj->cpu_ptr;
 	addr = mqd_mem_obj->gpu_addr;
 
-	if (mm->dev->kfd->shared_resources.enable_mes)
-		size = PAGE_SIZE;
-	else
-		size = sizeof(struct v11_compute_mqd);
-
-	memset(m, 0, size);
+	memset(m, 0, mqd_size);
 
 	m->header = 0xC0310800;
 	m->compute_pipelinestat_enable = 1;
@@ -154,6 +141,8 @@ static void init_mqd(struct mqd_manager *mm, void **mqd,
 	m->cp_hqd_persistent_state = CP_HQD_PERSISTENT_STATE__PRELOAD_REQ_MASK |
 			0x55 << CP_HQD_PERSISTENT_STATE__PRELOAD_SIZE__SHIFT;
 
+	m->cp_hqd_pq_control = 5 << CP_HQD_PQ_CONTROL__RPTR_BLOCK_SIZE__SHIFT;
+	m->cp_hqd_pq_control |= CP_HQD_PQ_CONTROL__UNORD_DISPATCH_MASK;
 	m->cp_mqd_control = 1 << CP_MQD_CONTROL__PRIV_STATE__SHIFT;
 
 	m->cp_mqd_base_addr_lo        = lower_32_bits(addr);
@@ -221,10 +210,9 @@ static void update_mqd(struct mqd_manager *mm, void *mqd,
 
 	m = get_mqd(mqd);
 
-	m->cp_hqd_pq_control = 5 << CP_HQD_PQ_CONTROL__RPTR_BLOCK_SIZE__SHIFT;
+	m->cp_hqd_pq_control &= ~CP_HQD_PQ_CONTROL__QUEUE_SIZE_MASK;
 	m->cp_hqd_pq_control |=
 			ffs(q->queue_size / sizeof(unsigned int)) - 1 - 1;
-	m->cp_hqd_pq_control |= CP_HQD_PQ_CONTROL__UNORD_DISPATCH_MASK;
 	pr_debug("cp_hqd_pq_control 0x%x\n", m->cp_hqd_pq_control);
 
 	m->cp_hqd_pq_base_lo = lower_32_bits((uint64_t)q->queue_address >> 8);
@@ -477,7 +465,7 @@ struct mqd_manager *mqd_manager_init_v11(enum KFD_MQD_TYPE type,
 	if (WARN_ON(type >= KFD_MQD_TYPE_MAX))
 		return NULL;
 
-	mqd = kzalloc(sizeof(*mqd), GFP_KERNEL);
+	mqd = kzalloc_obj(*mqd);
 	if (!mqd)
 		return NULL;
 

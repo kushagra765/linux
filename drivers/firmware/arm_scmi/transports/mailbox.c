@@ -127,8 +127,8 @@ static int mailbox_chan_validate(struct device *cdev, int *a2p_rx_chan,
 	    (num_mb == 1 && num_sh != 1) || (num_mb == 3 && num_sh != 2) ||
 	    (num_mb == 4 && num_sh != 2)) {
 		dev_warn(cdev,
-			 "Invalid channel descriptor for '%s' - mbs:%d  shm:%d\n",
-			 of_node_full_name(np), num_mb, num_sh);
+			 "Invalid channel descriptor for '%pOF' - mbs:%d  shm:%d\n",
+			 np, num_mb, num_sh);
 		return -EINVAL;
 	}
 
@@ -140,8 +140,7 @@ static int mailbox_chan_validate(struct device *cdev, int *a2p_rx_chan,
 					of_parse_phandle(np, "shmem", 1);
 
 		if (!np_tx || !np_rx || np_tx == np_rx) {
-			dev_warn(cdev, "Invalid shmem descriptor for '%s'\n",
-				 of_node_full_name(np));
+			dev_warn(cdev, "Invalid shmem descriptor for '%pOF'\n", np);
 			ret = -EINVAL;
 		}
 	}
@@ -378,6 +377,7 @@ static const struct of_device_id scmi_of_match[] = {
 	{ .compatible = "arm,scmi" },
 	{ /* Sentinel */ },
 };
+MODULE_DEVICE_TABLE(of, scmi_of_match);
 
 DEFINE_SCMI_TRANSPORT_DRIVER(scmi_mailbox, scmi_mailbox_driver,
 			     scmi_mailbox_desc, scmi_of_match, core);

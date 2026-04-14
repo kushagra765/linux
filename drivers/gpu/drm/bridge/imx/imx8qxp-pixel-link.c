@@ -128,6 +128,7 @@ static void imx8qxp_pixel_link_set_mst_addr(struct imx8qxp_pixel_link *pl)
 }
 
 static int imx8qxp_pixel_link_bridge_attach(struct drm_bridge *bridge,
+					    struct drm_encoder *encoder,
 					    enum drm_bridge_attach_flags flags)
 {
 	struct imx8qxp_pixel_link *pl = bridge->driver_private;
@@ -138,7 +139,7 @@ static int imx8qxp_pixel_link_bridge_attach(struct drm_bridge *bridge,
 		return -EINVAL;
 	}
 
-	return drm_bridge_attach(bridge->encoder,
+	return drm_bridge_attach(encoder,
 				 pl->next_bridge, bridge,
 				 DRM_BRIDGE_ATTACH_NO_CONNECTOR);
 }
@@ -153,9 +154,8 @@ imx8qxp_pixel_link_bridge_mode_set(struct drm_bridge *bridge,
 	imx8qxp_pixel_link_set_mst_addr(pl);
 }
 
-static void
-imx8qxp_pixel_link_bridge_atomic_enable(struct drm_bridge *bridge,
-					struct drm_bridge_state *old_bridge_state)
+static void imx8qxp_pixel_link_bridge_atomic_enable(struct drm_bridge *bridge,
+						    struct drm_atomic_state *state)
 {
 	struct imx8qxp_pixel_link *pl = bridge->driver_private;
 
@@ -164,9 +164,8 @@ imx8qxp_pixel_link_bridge_atomic_enable(struct drm_bridge *bridge,
 	imx8qxp_pixel_link_enable_sync(pl);
 }
 
-static void
-imx8qxp_pixel_link_bridge_atomic_disable(struct drm_bridge *bridge,
-					 struct drm_bridge_state *old_bridge_state)
+static void imx8qxp_pixel_link_bridge_atomic_disable(struct drm_bridge *bridge,
+						     struct drm_atomic_state *state)
 {
 	struct imx8qxp_pixel_link *pl = bridge->driver_private;
 
@@ -207,7 +206,7 @@ imx8qxp_pixel_link_bridge_atomic_get_input_bus_fmts(struct drm_bridge *bridge,
 
 	*num_input_fmts = 1;
 
-	input_fmts = kmalloc(sizeof(*input_fmts), GFP_KERNEL);
+	input_fmts = kmalloc_obj(*input_fmts);
 	if (!input_fmts)
 		return NULL;
 
@@ -328,9 +327,10 @@ static int imx8qxp_pixel_link_bridge_probe(struct platform_device *pdev)
 	struct device_node *np = dev->of_node;
 	int ret;
 
-	pl = devm_kzalloc(dev, sizeof(*pl), GFP_KERNEL);
-	if (!pl)
-		return -ENOMEM;
+	pl = devm_drm_bridge_alloc(dev, struct imx8qxp_pixel_link, bridge,
+				   &imx8qxp_pixel_link_bridge_funcs);
+	if (IS_ERR(pl))
+		return PTR_ERR(pl);
 
 	ret = imx_scu_get_handle(&pl->ipc_handle);
 	if (ret) {
@@ -374,18 +374,12 @@ static int imx8qxp_pixel_link_bridge_probe(struct platform_device *pdev)
 		return ret;
 
 	pl->next_bridge = imx8qxp_pixel_link_find_next_bridge(pl);
-	if (IS_ERR(pl->next_bridge)) {
-		ret = PTR_ERR(pl->next_bridge);
-		if (ret != -EPROBE_DEFER)
-			DRM_DEV_ERROR(dev, "failed to find next bridge: %d\n",
-				      ret);
-		return ret;
-	}
+	if (IS_ERR(pl->next_bridge))
+		return PTR_ERR(pl->next_bridge);
 
 	platform_set_drvdata(pdev, pl);
 
 	pl->bridge.driver_private = pl;
-	pl->bridge.funcs = &imx8qxp_pixel_link_bridge_funcs;
 	pl->bridge.of_node = np;
 
 	drm_bridge_add(&pl->bridge);

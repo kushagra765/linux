@@ -9,7 +9,9 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_buf.h>
 #include <linux/seq_file.h>
+#include <linux/string_choices.h>
 #include <linux/vmalloc.h>
+#include <linux/kmemleak.h>
 
 #define ALLOCINFO_FILE_NAME		"allocinfo"
 #define MODULE_ALLOC_TAG_VMAP_SIZE	(100000UL * sizeof(struct alloc_tag))
@@ -24,11 +26,15 @@ static bool mem_profiling_support;
 
 static struct codetag_type *alloc_tag_cttype;
 
+#ifdef CONFIG_ARCH_MODULE_NEEDS_WEAK_PER_CPU
 DEFINE_PER_CPU(struct alloc_tag_counters, _shared_alloc_tag);
 EXPORT_SYMBOL(_shared_alloc_tag);
+#endif
 
 DEFINE_STATIC_KEY_MAYBE(CONFIG_MEM_ALLOC_PROFILING_ENABLED_BY_DEFAULT,
 			mem_alloc_profiling_key);
+EXPORT_SYMBOL(mem_alloc_profiling_key);
+
 DEFINE_STATIC_KEY_FALSE(mem_profiling_compressed);
 
 struct alloc_tag_kernel_section kernel_tags = { NULL, 0 };
@@ -43,21 +49,16 @@ struct allocinfo_private {
 static void *allocinfo_start(struct seq_file *m, loff_t *pos)
 {
 	struct allocinfo_private *priv;
-	struct codetag *ct;
 	loff_t node = *pos;
 
-	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
-	m->private = priv;
-	if (!priv)
-		return NULL;
-
-	priv->print_header = (node == 0);
+	priv = (struct allocinfo_private *)m->private;
 	codetag_lock_module_list(alloc_tag_cttype, true);
-	priv->iter = codetag_get_ct_iter(alloc_tag_cttype);
-	while ((ct = codetag_next_ct(&priv->iter)) != NULL && node)
-		node--;
-
-	return ct ? priv : NULL;
+	if (node == 0) {
+		priv->print_header = true;
+		priv->iter = codetag_get_ct_iter(alloc_tag_cttype);
+		codetag_next_ct(&priv->iter);
+	}
+	return priv->iter.ct ? priv : NULL;
 }
 
 static void *allocinfo_next(struct seq_file *m, void *arg, loff_t *pos)
@@ -74,18 +75,13 @@ static void *allocinfo_next(struct seq_file *m, void *arg, loff_t *pos)
 
 static void allocinfo_stop(struct seq_file *m, void *arg)
 {
-	struct allocinfo_private *priv = (struct allocinfo_private *)m->private;
-
-	if (priv) {
-		codetag_lock_module_list(alloc_tag_cttype, false);
-		kfree(priv);
-	}
+	codetag_lock_module_list(alloc_tag_cttype, false);
 }
 
 static void print_allocinfo_header(struct seq_buf *buf)
 {
 	/* Output format version, so we can change it. */
-	seq_buf_printf(buf, "allocinfo - version: 1.0\n");
+	seq_buf_printf(buf, "allocinfo - version: 2.0\n");
 	seq_buf_printf(buf, "#     <size>  <calls> <tag info>\n");
 }
 
@@ -97,6 +93,8 @@ static void alloc_tag_to_text(struct seq_buf *out, struct codetag *ct)
 
 	seq_buf_printf(out, "%12lli %8llu ", bytes, counter.calls);
 	codetag_to_text(out, ct);
+	if (unlikely(alloc_tag_is_inaccurate(tag)))
+		seq_buf_printf(out, " accurate:no");
 	seq_buf_putc(out, ' ');
 	seq_buf_putc(out, '\n');
 }
@@ -131,6 +129,9 @@ size_t alloc_tag_top_users(struct codetag_bytes *tags, size_t count, bool can_sl
 	struct codetag *ct;
 	struct codetag_bytes n;
 	unsigned int i, nr = 0;
+
+	if (IS_ERR_OR_NULL(alloc_tag_cttype))
+		return 0;
 
 	if (can_sleep)
 		codetag_lock_module_list(alloc_tag_cttype, true);
@@ -172,7 +173,7 @@ void pgalloc_tag_split(struct folio *folio, int old_order, int new_order)
 	if (!mem_alloc_profiling_enabled())
 		return;
 
-	tag = pgalloc_tag_get(&folio->page);
+	tag = __pgalloc_tag_get(&folio->page);
 	if (!tag)
 		return;
 
@@ -195,10 +196,13 @@ void pgalloc_tag_swap(struct folio *new, struct folio *old)
 	union codetag_ref ref_old, ref_new;
 	struct alloc_tag *tag_old, *tag_new;
 
-	tag_old = pgalloc_tag_get(&old->page);
+	if (!mem_alloc_profiling_enabled())
+		return;
+
+	tag_old = __pgalloc_tag_get(&old->page);
 	if (!tag_old)
 		return;
-	tag_new = pgalloc_tag_get(&new->page);
+	tag_new = __pgalloc_tag_get(&new->page);
 	if (!tag_new)
 		return;
 
@@ -208,6 +212,13 @@ void pgalloc_tag_swap(struct folio *new, struct folio *old)
 		put_page_tag_ref(handle_old);
 		return;
 	}
+
+	/*
+	 * Clear tag references to avoid debug warning when using
+	 * __alloc_tag_ref_set() with non-empty reference.
+	 */
+	set_codetag_empty(&ref_old);
+	set_codetag_empty(&ref_new);
 
 	/* swap tags */
 	__alloc_tag_ref_set(&ref_old, tag_new);
@@ -230,17 +241,6 @@ static void shutdown_mem_profiling(bool remove_file)
 	if (remove_file)
 		remove_proc_entry(ALLOCINFO_FILE_NAME, NULL);
 	mem_profiling_support = false;
-}
-
-static void __init procfs_init(void)
-{
-	if (!mem_profiling_support)
-		return;
-
-	if (!proc_create_seq(ALLOCINFO_FILE_NAME, 0400, NULL, &allocinfo_seq_op)) {
-		pr_err("Failed to create %s file\n", ALLOCINFO_FILE_NAME);
-		shutdown_mem_profiling(false);
-	}
 }
 
 void __init alloc_tag_sec_init(void)
@@ -338,18 +338,28 @@ static bool needs_section_mem(struct module *mod, unsigned long size)
 	return size >= sizeof(struct alloc_tag);
 }
 
-static struct alloc_tag *find_used_tag(struct alloc_tag *from, struct alloc_tag *to)
+static bool clean_unused_counters(struct alloc_tag *start_tag,
+				  struct alloc_tag *end_tag)
 {
-	while (from <= to) {
+	struct alloc_tag *tag;
+	bool ret = true;
+
+	for (tag = start_tag; tag <= end_tag; tag++) {
 		struct alloc_tag_counters counter;
 
-		counter = alloc_tag_read(from);
-		if (counter.bytes)
-			return from;
-		from++;
+		if (!tag->counters)
+			continue;
+
+		counter = alloc_tag_read(tag);
+		if (!counter.bytes) {
+			free_percpu(tag->counters);
+			tag->counters = NULL;
+		} else {
+			ret = false;
+		}
 	}
 
-	return NULL;
+	return ret;
 }
 
 /* Called with mod_area_mt locked */
@@ -359,12 +369,16 @@ static void clean_unused_module_areas_locked(void)
 	struct module *val;
 
 	mas_for_each(&mas, val, module_tags.size) {
+		struct alloc_tag *start_tag;
+		struct alloc_tag *end_tag;
+
 		if (val != &unloaded_mod)
 			continue;
 
 		/* Release area if all tags are unused */
-		if (!find_used_tag((struct alloc_tag *)(module_tags.start_addr + mas.index),
-				   (struct alloc_tag *)(module_tags.start_addr + mas.last)))
+		start_tag = (struct alloc_tag *)(module_tags.start_addr + mas.index);
+		end_tag = (struct alloc_tag *)(module_tags.start_addr + mas.last);
+		if (clean_unused_counters(start_tag, end_tag))
 			mas_erase(&mas);
 	}
 }
@@ -401,27 +415,61 @@ repeat:
 
 static int vm_module_tags_populate(void)
 {
-	unsigned long phys_size = vm_module_tags->nr_pages << PAGE_SHIFT;
+	unsigned long phys_end = ALIGN_DOWN(module_tags.start_addr, PAGE_SIZE) +
+				 (vm_module_tags->nr_pages << PAGE_SHIFT);
+	unsigned long new_end = module_tags.start_addr + module_tags.size;
 
-	if (phys_size < module_tags.size) {
+	if (phys_end < new_end) {
 		struct page **next_page = vm_module_tags->pages + vm_module_tags->nr_pages;
-		unsigned long addr = module_tags.start_addr + phys_size;
+		unsigned long old_shadow_end = ALIGN(phys_end, MODULE_ALIGN);
+		unsigned long new_shadow_end = ALIGN(new_end, MODULE_ALIGN);
 		unsigned long more_pages;
-		unsigned long nr;
+		unsigned long nr = 0;
 
-		more_pages = ALIGN(module_tags.size - phys_size, PAGE_SIZE) >> PAGE_SHIFT;
-		nr = alloc_pages_bulk_array_node(GFP_KERNEL | __GFP_NOWARN,
-						 NUMA_NO_NODE, more_pages, next_page);
+		more_pages = ALIGN(new_end - phys_end, PAGE_SIZE) >> PAGE_SHIFT;
+		while (nr < more_pages) {
+			unsigned long allocated;
+
+			allocated = alloc_pages_bulk_node(GFP_KERNEL | __GFP_NOWARN,
+				NUMA_NO_NODE, more_pages - nr, next_page + nr);
+
+			if (!allocated)
+				break;
+			nr += allocated;
+		}
+
 		if (nr < more_pages ||
-		    vmap_pages_range(addr, addr + (nr << PAGE_SHIFT), PAGE_KERNEL,
+		    vmap_pages_range(phys_end, phys_end + (nr << PAGE_SHIFT), PAGE_KERNEL,
 				     next_page, PAGE_SHIFT) < 0) {
+			release_pages_arg arg = { .pages = next_page };
+
 			/* Clean up and error out */
-			for (int i = 0; i < nr; i++)
-				__free_page(next_page[i]);
+			release_pages(arg, nr);
 			return -ENOMEM;
 		}
+
 		vm_module_tags->nr_pages += nr;
+
+		/*
+		 * Kasan allocates 1 byte of shadow for every 8 bytes of data.
+		 * When kasan_alloc_module_shadow allocates shadow memory,
+		 * its unit of allocation is a page.
+		 * Therefore, here we need to align to MODULE_ALIGN.
+		 */
+		if (old_shadow_end < new_shadow_end)
+			kasan_alloc_module_shadow((void *)old_shadow_end,
+						  new_shadow_end - old_shadow_end,
+						  GFP_KERNEL);
 	}
+
+	/*
+	 * Mark the pages as accessible, now that they are mapped.
+	 * With hardware tag-based KASAN, marking is skipped for
+	 * non-VM_ALLOC mappings, see __kasan_unpoison_vmalloc().
+	 */
+	kasan_unpoison_vmalloc((void *)module_tags.start_addr,
+				new_end - module_tags.start_addr,
+				KASAN_VMALLOC_PROT_NORMAL);
 
 	return 0;
 }
@@ -516,7 +564,8 @@ unlock:
 static void release_module_tags(struct module *mod, bool used)
 {
 	MA_STATE(mas, &mod_area_mt, module_tags.size, module_tags.size);
-	struct alloc_tag *tag;
+	struct alloc_tag *start_tag;
+	struct alloc_tag *end_tag;
 	struct module *val;
 
 	mas_lock(&mas);
@@ -530,15 +579,22 @@ static void release_module_tags(struct module *mod, bool used)
 	if (!used)
 		goto release_area;
 
-	/* Find out if the area is used */
-	tag = find_used_tag((struct alloc_tag *)(module_tags.start_addr + mas.index),
-			    (struct alloc_tag *)(module_tags.start_addr + mas.last));
-	if (tag) {
-		struct alloc_tag_counters counter = alloc_tag_read(tag);
+	start_tag = (struct alloc_tag *)(module_tags.start_addr + mas.index);
+	end_tag = (struct alloc_tag *)(module_tags.start_addr + mas.last);
+	if (!clean_unused_counters(start_tag, end_tag)) {
+		struct alloc_tag *tag;
 
-		pr_info("%s:%u module %s func:%s has %llu allocated at module unload\n",
-			tag->ct.filename, tag->ct.lineno, tag->ct.modname,
-			tag->ct.function, counter.bytes);
+		for (tag = start_tag; tag <= end_tag; tag++) {
+			struct alloc_tag_counters counter;
+
+			if (!tag->counters)
+				continue;
+
+			counter = alloc_tag_read(tag);
+			pr_info("%s:%u module %s func:%s has %llu allocated at module unload\n",
+				tag->ct.filename, tag->ct.lineno, tag->ct.modname,
+				tag->ct.function, counter.bytes);
+		}
 	} else {
 		used = false;
 	}
@@ -549,6 +605,41 @@ release_area:
 		mas_store(&mas, NULL);
 out:
 	mas_unlock(&mas);
+}
+
+static int load_module(struct module *mod, struct codetag *start, struct codetag *stop)
+{
+	/* Allocate module alloc_tag percpu counters */
+	struct alloc_tag *start_tag;
+	struct alloc_tag *stop_tag;
+	struct alloc_tag *tag;
+
+	/* percpu counters for core allocations are already statically allocated */
+	if (!mod)
+		return 0;
+
+	start_tag = ct_to_alloc_tag(start);
+	stop_tag = ct_to_alloc_tag(stop);
+	for (tag = start_tag; tag < stop_tag; tag++) {
+		WARN_ON(tag->counters);
+		tag->counters = alloc_percpu(struct alloc_tag_counters);
+		if (!tag->counters) {
+			while (--tag >= start_tag) {
+				free_percpu(tag->counters);
+				tag->counters = NULL;
+			}
+			pr_err("Failed to allocate memory for allocation tag percpu counters in the module %s\n",
+			       mod->name);
+			return -ENOMEM;
+		}
+
+		/*
+		 * Avoid a kmemleak false positive. The pointer to the counters is stored
+		 * in the alloc_tag section of the module and cannot be directly accessed.
+		 */
+		kmemleak_ignore_percpu(tag->counters);
+	}
+	return 0;
 }
 
 static void replace_module(struct module *mod, struct module *new_mod)
@@ -578,8 +669,9 @@ static int __init alloc_mod_tags_mem(void)
 		return -ENOMEM;
 	}
 
-	vm_module_tags->pages = kmalloc_array(get_vm_area_size(vm_module_tags) >> PAGE_SHIFT,
-					sizeof(struct page *), GFP_KERNEL | __GFP_ZERO);
+	vm_module_tags->pages = kmalloc_objs(struct page *,
+					     get_vm_area_size(vm_module_tags) >> PAGE_SHIFT,
+					     GFP_KERNEL | __GFP_ZERO);
 	if (!vm_module_tags->pages) {
 		free_vm_area(vm_module_tags);
 		return -ENOMEM;
@@ -595,11 +687,10 @@ static int __init alloc_mod_tags_mem(void)
 
 static void __init free_mod_tags_mem(void)
 {
-	int i;
+	release_pages_arg arg = { .pages = vm_module_tags->pages };
 
 	module_tags.start_addr = 0;
-	for (i = 0; i < vm_module_tags->nr_pages; i++)
-		__free_page(vm_module_tags->pages[i]);
+	release_pages(arg, vm_module_tags->nr_pages);
 	kfree(vm_module_tags->pages);
 	free_vm_area(vm_module_tags);
 }
@@ -639,7 +730,7 @@ static int __init setup_early_mem_profiling(char *str)
 		}
 		mem_profiling_support = true;
 		pr_info("Memory allocation profiling is enabled %s compression and is turned %s!\n",
-			compressed ? "with" : "without", enable ? "on" : "off");
+			compressed ? "with" : "without", str_on_off(enable));
 	}
 
 	if (enable != mem_alloc_profiling_enabled()) {
@@ -679,24 +770,45 @@ struct page_ext_operations page_alloc_tagging_ops = {
 EXPORT_SYMBOL(page_alloc_tagging_ops);
 
 #ifdef CONFIG_SYSCTL
-static struct ctl_table memory_allocation_profiling_sysctls[] = {
+/*
+ * Not using proc_do_static_key() directly to prevent enabling profiling
+ * after it was shut down.
+ */
+static int proc_mem_profiling_handler(const struct ctl_table *table, int write,
+				      void *buffer, size_t *lenp, loff_t *ppos)
+{
+	if (write) {
+		/*
+		 * Call from do_sysctl_args() which is a no-op since the same
+		 * value was already set by setup_early_mem_profiling.
+		 * Return success to avoid warnings from do_sysctl_args().
+		 */
+		if (!current->mm)
+			return 0;
+
+#ifdef CONFIG_MEM_ALLOC_PROFILING_DEBUG
+		/* User can't toggle profiling while debugging */
+		return -EACCES;
+#endif
+		if (!mem_profiling_support)
+			return -EINVAL;
+	}
+
+	return proc_do_static_key(table, write, buffer, lenp, ppos);
+}
+
+
+static const struct ctl_table memory_allocation_profiling_sysctls[] = {
 	{
 		.procname	= "mem_profiling",
 		.data		= &mem_alloc_profiling_key,
-#ifdef CONFIG_MEM_ALLOC_PROFILING_DEBUG
-		.mode		= 0444,
-#else
 		.mode		= 0644,
-#endif
-		.proc_handler	= proc_do_static_key,
+		.proc_handler	= proc_mem_profiling_handler,
 	},
 };
 
 static void __init sysctl_init(void)
 {
-	if (!mem_profiling_support)
-		memory_allocation_profiling_sysctls[0].mode = 0444;
-
 	register_sysctl_init("vm", memory_allocation_profiling_sysctls);
 }
 #else /* CONFIG_SYSCTL */
@@ -712,23 +824,40 @@ static int __init alloc_tag_init(void)
 		.needs_section_mem	= needs_section_mem,
 		.alloc_section_mem	= reserve_module_tags,
 		.free_section_mem	= release_module_tags,
+		.module_load		= load_module,
 		.module_replaced	= replace_module,
 #endif
 	};
 	int res;
 
+	sysctl_init();
+
+	if (!mem_profiling_support) {
+		pr_info("Memory allocation profiling is not supported!\n");
+		return 0;
+	}
+
+	if (!proc_create_seq_private(ALLOCINFO_FILE_NAME, 0400, NULL, &allocinfo_seq_op,
+				     sizeof(struct allocinfo_private), NULL)) {
+		pr_err("Failed to create %s file\n", ALLOCINFO_FILE_NAME);
+		shutdown_mem_profiling(false);
+		return -ENOMEM;
+	}
+
 	res = alloc_mod_tags_mem();
-	if (res)
+	if (res) {
+		pr_err("Failed to reserve address space for module tags, errno = %d\n", res);
+		shutdown_mem_profiling(true);
 		return res;
+	}
 
 	alloc_tag_cttype = codetag_register_type(&desc);
 	if (IS_ERR(alloc_tag_cttype)) {
+		pr_err("Allocation tags registration failed, errno = %pe\n", alloc_tag_cttype);
 		free_mod_tags_mem();
+		shutdown_mem_profiling(true);
 		return PTR_ERR(alloc_tag_cttype);
 	}
-
-	sysctl_init();
-	procfs_init();
 
 	return 0;
 }

@@ -150,8 +150,12 @@ static int mlx4_ib_get_cq_umem(struct mlx4_ib_dev *dev,
 		return PTR_ERR(*umem);
 
 	shift = mlx4_ib_umem_calc_optimal_mtt_size(*umem, 0, &n);
-	err = mlx4_mtt_init(dev->dev, n, shift, &buf->mtt);
+	if (shift < 0) {
+		err = shift;
+		goto err_buf;
+	}
 
+	err = mlx4_mtt_init(dev->dev, n, shift, &buf->mtt);
 	if (err)
 		goto err_buf;
 
@@ -296,7 +300,7 @@ static int mlx4_alloc_resize_buf(struct mlx4_ib_dev *dev, struct mlx4_ib_cq *cq,
 	if (cq->resize_buf)
 		return -EBUSY;
 
-	cq->resize_buf = kmalloc(sizeof *cq->resize_buf, GFP_KERNEL);
+	cq->resize_buf = kmalloc_obj(*cq->resize_buf);
 	if (!cq->resize_buf)
 		return -ENOMEM;
 
@@ -324,7 +328,7 @@ static int mlx4_alloc_resize_umem(struct mlx4_ib_dev *dev, struct mlx4_ib_cq *cq
 	if (ib_copy_from_udata(&ucmd, udata, sizeof ucmd))
 		return -EFAULT;
 
-	cq->resize_buf = kmalloc(sizeof *cq->resize_buf, GFP_KERNEL);
+	cq->resize_buf = kmalloc_obj(*cq->resize_buf);
 	if (!cq->resize_buf)
 		return -ENOMEM;
 

@@ -18,6 +18,7 @@
 #define _LINUX_TASKSTATS_H
 
 #include <linux/types.h>
+#include <linux/time_types.h>
 
 /* Format for per-task data returned to userland when
  *	- a task exits
@@ -34,7 +35,7 @@
  */
 
 
-#define TASKSTATS_VERSION	14
+#define TASKSTATS_VERSION	17
 #define TS_COMM_LEN		32	/* should be >= TASK_COMM_LEN
 					 * in linux/sched.h */
 
@@ -167,6 +168,7 @@ struct taskstats {
 	__u64	freepages_count;
 	__u64	freepages_delay_total;
 
+
 	/* Delay waiting for thrashing page */
 	__u64	thrashing_count;
 	__u64	thrashing_delay_total;
@@ -202,6 +204,43 @@ struct taskstats {
 	/* v14: Delay waiting for IRQ/SOFTIRQ */
 	__u64    irq_count;
 	__u64    irq_delay_total;
+
+	/* v15: add Delay max and Delay min */
+
+	/* v16: move Delay max and Delay min to the end of taskstat */
+	__u64	cpu_delay_max;
+	__u64	cpu_delay_min;
+
+	__u64	blkio_delay_max;
+	__u64	blkio_delay_min;
+
+	__u64	swapin_delay_max;
+	__u64	swapin_delay_min;
+
+	__u64	freepages_delay_max;
+	__u64	freepages_delay_min;
+
+	__u64	thrashing_delay_max;
+	__u64	thrashing_delay_min;
+
+	__u64	compact_delay_max;
+	__u64	compact_delay_min;
+
+	__u64	wpcopy_delay_max;
+	__u64	wpcopy_delay_min;
+
+	__u64	irq_delay_max;
+	__u64	irq_delay_min;
+
+	/*v17: delay max timestamp record*/
+	struct __kernel_timespec cpu_delay_max_ts;
+	struct __kernel_timespec blkio_delay_max_ts;
+	struct __kernel_timespec swapin_delay_max_ts;
+	struct __kernel_timespec freepages_delay_max_ts;
+	struct __kernel_timespec thrashing_delay_max_ts;
+	struct __kernel_timespec compact_delay_max_ts;
+	struct __kernel_timespec wpcopy_delay_max_ts;
+	struct __kernel_timespec irq_delay_max_ts;
 };
 
 

@@ -3,7 +3,7 @@
  * Copyright (C) 2022-2023 Oracle.  All Rights Reserved.
  * Author: Darrick J. Wong <djwong@kernel.org>
  */
-#include "xfs.h"
+#include "xfs_platform.h"
 #include "xfs_fs.h"
 #include "xfs_shared.h"
 #include "xfs_format.h"
@@ -19,11 +19,22 @@
 #include "xfs_rmap.h"
 #include "xfs_ag.h"
 #include "xfs_defer.h"
+#include "xfs_metafile.h"
+#include "xfs_quota.h"
 #include "scrub/scrub.h"
 #include "scrub/common.h"
 #include "scrub/trace.h"
 #include "scrub/repair.h"
 #include "scrub/newbt.h"
+
+/*
+ * This is the maximum number of deferred extent freeing item extents (EFIs)
+ * that we'll attach to a transaction without rolling the transaction to avoid
+ * overrunning a tr_itruncate reservation.  The newbt code should reserve
+ * exactly the correct number of blocks to rebuild the btree, so there should
+ * not be any excess blocks to free when committing a new btree.
+ */
+#define XREP_MAX_ITRUNCATE_EFIS	(128)
 
 /*
  * Estimate proper slack values for a btree that's being reloaded.
@@ -60,7 +71,7 @@ xrep_newbt_estimate_slack(
 		free = sc->sa.pag->pagf_freeblks;
 		sz = xfs_ag_block_count(sc->mp, pag_agno(sc->sa.pag));
 	} else {
-		free = percpu_counter_sum(&sc->mp->m_fdblocks);
+		free = xfs_sum_freecounter_raw(sc->mp, XC_FREE_BLOCKS);
 		sz = sc->mp->m_sb.sb_dblocks;
 	}
 
@@ -121,6 +132,43 @@ xrep_newbt_init_inode(
 }
 
 /*
+ * Initialize accounting resources for staging a new metadata inode btree.
+ * If the metadata file has a space reservation, the caller must adjust that
+ * reservation when committing the new ondisk btree.
+ */
+int
+xrep_newbt_init_metadir_inode(
+	struct xrep_newbt		*xnr,
+	struct xfs_scrub		*sc)
+{
+	struct xfs_owner_info		oinfo;
+	struct xfs_ifork		*ifp;
+
+	ASSERT(xfs_is_metadir_inode(sc->ip));
+
+	xfs_rmap_ino_bmbt_owner(&oinfo, sc->ip->i_ino, XFS_DATA_FORK);
+
+	ifp = kmem_cache_zalloc(xfs_ifork_cache, XCHK_GFP_FLAGS);
+	if (!ifp)
+		return -ENOMEM;
+
+	/*
+	 * Allocate new metadir btree blocks with XFS_AG_RESV_NONE because the
+	 * inode metadata space reservations can only account allocated space
+	 * to the i_nblocks.  We do not want to change the inode core fields
+	 * until we're ready to commit the new tree, so we allocate the blocks
+	 * as if they were regular file blocks.  This exposes us to a higher
+	 * risk of the repair being cancelled due to ENOSPC.
+	 */
+	xrep_newbt_init_ag(xnr, sc, &oinfo,
+			XFS_INO_TO_FSB(sc->mp, sc->ip->i_ino),
+			XFS_AG_RESV_NONE);
+	xnr->ifake.if_fork = ifp;
+	xnr->ifake.if_fork_size = xfs_inode_fork_size(sc->ip, XFS_DATA_FORK);
+	return 0;
+}
+
+/*
  * Initialize accounting resources for staging a new btree.  Callers are
  * expected to add their own reservations (and clean them up) manually.
  */
@@ -147,7 +195,7 @@ xrep_newbt_add_blocks(
 	struct xrep_newbt_resv		*resv;
 	int				error;
 
-	resv = kmalloc(sizeof(struct xrep_newbt_resv), XCHK_GFP_FLAGS);
+	resv = kmalloc_obj(struct xrep_newbt_resv, XCHK_GFP_FLAGS);
 	if (!resv)
 		return -ENOMEM;
 
@@ -224,6 +272,7 @@ xrep_newbt_alloc_ag_blocks(
 	int			error = 0;
 
 	ASSERT(sc->sa.pag != NULL);
+	ASSERT(xnr->resv != XFS_AG_RESV_METAFILE);
 
 	while (nr_blocks > 0) {
 		struct xfs_alloc_arg	args = {
@@ -296,6 +345,8 @@ xrep_newbt_alloc_file_blocks(
 	struct xfs_scrub	*sc = xnr->sc;
 	struct xfs_mount	*mp = sc->mp;
 	int			error = 0;
+
+	ASSERT(xnr->resv != XFS_AG_RESV_METAFILE);
 
 	while (nr_blocks > 0) {
 		struct xfs_alloc_arg	args = {

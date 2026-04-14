@@ -78,20 +78,20 @@ void atom_dump(struct snd_sof_dev *sdev, u32 flags)
 	imrd = snd_sof_dsp_read64(sdev, DSP_BAR, SHIM_IMRD);
 	dev_err(sdev->dev,
 		"error: ipc host -> DSP: pending %s complete %s raw 0x%llx\n",
-		(panic & SHIM_IPCX_BUSY) ? "yes" : "no",
-		(panic & SHIM_IPCX_DONE) ? "yes" : "no", panic);
+		str_yes_no(panic & SHIM_IPCX_BUSY),
+		str_yes_no(panic & SHIM_IPCX_DONE), panic);
 	dev_err(sdev->dev,
 		"error: mask host: pending %s complete %s raw 0x%llx\n",
-		(imrx & SHIM_IMRX_BUSY) ? "yes" : "no",
-		(imrx & SHIM_IMRX_DONE) ? "yes" : "no", imrx);
+		str_yes_no(imrx & SHIM_IMRX_BUSY),
+		str_yes_no(imrx & SHIM_IMRX_DONE), imrx);
 	dev_err(sdev->dev,
 		"error: ipc DSP -> host: pending %s complete %s raw 0x%llx\n",
-		(status & SHIM_IPCD_BUSY) ? "yes" : "no",
-		(status & SHIM_IPCD_DONE) ? "yes" : "no", status);
+		str_yes_no(status & SHIM_IPCD_BUSY),
+		str_yes_no(status & SHIM_IPCD_DONE), status);
 	dev_err(sdev->dev,
 		"error: mask DSP: pending %s complete %s raw 0x%llx\n",
-		(imrd & SHIM_IMRD_BUSY) ? "yes" : "no",
-		(imrd & SHIM_IMRD_DONE) ? "yes" : "no", imrd);
+		str_yes_no(imrd & SHIM_IMRD_BUSY),
+		str_yes_no(imrd & SHIM_IMRD_DONE), imrd);
 
 }
 EXPORT_SYMBOL_NS(atom_dump, "SND_SOC_SOF_INTEL_ATOM_HIFI_EP");
@@ -143,9 +143,6 @@ irqreturn_t atom_irq_thread(int irq, void *context)
 
 	/* reply message from DSP */
 	if (ipcx & SHIM_BYT_IPCX_DONE) {
-
-		spin_lock_irq(&sdev->ipc_lock);
-
 		/*
 		 * handle immediate reply from DSP core. If the msg is
 		 * found, set done bit in cmd_done which is called at the
@@ -153,11 +150,9 @@ irqreturn_t atom_irq_thread(int irq, void *context)
 		 * because the done bit can't be set in cmd_done function
 		 * which is triggered by msg
 		 */
+		guard(spinlock_irq)(&sdev->ipc_lock);
 		snd_sof_ipc_process_reply(sdev, ipcx);
-
 		atom_dsp_done(sdev);
-
-		spin_unlock_irq(&sdev->ipc_lock);
 	}
 
 	/* new message from DSP */

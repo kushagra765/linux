@@ -672,7 +672,7 @@ static int sur40_probe(struct usb_interface *interface,
 		return -ENODEV;
 
 	/* Allocate memory for our device state and initialize it. */
-	sur40 = kzalloc(sizeof(*sur40), GFP_KERNEL);
+	sur40 = kzalloc_obj(*sur40);
 	if (!sur40)
 		return -ENOMEM;
 
@@ -1108,8 +1108,6 @@ static const struct vb2_ops sur40_queue_ops = {
 	.buf_queue		= sur40_buffer_queue,
 	.start_streaming	= sur40_start_streaming,
 	.stop_streaming		= sur40_stop_streaming,
-	.wait_prepare		= vb2_ops_wait_prepare,
-	.wait_finish		= vb2_ops_wait_finish,
 };
 
 static const struct vb2_queue sur40_queue = {

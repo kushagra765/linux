@@ -3,7 +3,7 @@
  * Copyright (C) 2017-2023 Oracle.  All Rights Reserved.
  * Author: Darrick J. Wong <djwong@kernel.org>
  */
-#include "xfs.h"
+#include "xfs_platform.h"
 #include "xfs_fs.h"
 #include "xfs_shared.h"
 #include "xfs_format.h"
@@ -149,6 +149,18 @@ xchk_probe(
 	if (xchk_should_terminate(sc, &error))
 		return error;
 
+	/*
+	 * If the caller is probing to see if repair works but repair isn't
+	 * built into the kernel, return EOPNOTSUPP because that's the signal
+	 * that userspace expects.  If online repair is built in, set the
+	 * CORRUPT flag (without any of the usual tracing/logging) to force us
+	 * into xrep_probe.
+	 */
+	if (xchk_could_repair(sc)) {
+		if (!IS_ENABLED(CONFIG_XFS_ONLINE_REPAIR))
+			return -EOPNOTSUPP;
+		sc->sm->sm_flags |= XFS_SCRUB_OFLAG_CORRUPT;
+	}
 	return 0;
 }
 
@@ -164,7 +176,7 @@ xchk_fsgates_disable(
 	trace_xchk_fsgates_disable(sc, sc->flags & XCHK_FSGATES_ALL);
 
 	if (sc->flags & XCHK_FSGATES_DRAIN)
-		xfs_drain_wait_disable();
+		xfs_defer_drain_wait_disable();
 
 	if (sc->flags & XCHK_FSGATES_QUOTA)
 		xfs_dqtrx_hook_disable();
@@ -218,6 +230,8 @@ xchk_teardown(
 	int			error)
 {
 	xchk_ag_free(sc, &sc->sa);
+	xchk_rtgroup_btcur_free(&sc->sr);
+
 	if (sc->tp) {
 		if (error == 0 && (sc->sm->sm_flags & XFS_SCRUB_IFLAG_REPAIR))
 			error = xfs_trans_commit(sc->tp);
@@ -385,12 +399,14 @@ static const struct xchk_meta_ops meta_scrub_ops[] = {
 	},
 	[XFS_SCRUB_TYPE_RTBITMAP] = {	/* realtime bitmap */
 		.type	= ST_RTGROUP,
+		.has	= xfs_has_nonzoned,
 		.setup	= xchk_setup_rtbitmap,
 		.scrub	= xchk_rtbitmap,
 		.repair	= xrep_rtbitmap,
 	},
 	[XFS_SCRUB_TYPE_RTSUM] = {	/* realtime summary */
 		.type	= ST_RTGROUP,
+		.has	= xfs_has_nonzoned,
 		.setup	= xchk_setup_rtsummary,
 		.scrub	= xchk_rtsummary,
 		.repair	= xrep_rtsummary,
@@ -457,6 +473,20 @@ static const struct xchk_meta_ops meta_scrub_ops[] = {
 		.scrub	= xchk_rgsuperblock,
 		.has	= xfs_has_rtsb,
 		.repair = xrep_rgsuperblock,
+	},
+	[XFS_SCRUB_TYPE_RTRMAPBT] = {	/* realtime group rmapbt */
+		.type	= ST_RTGROUP,
+		.setup	= xchk_setup_rtrmapbt,
+		.scrub	= xchk_rtrmapbt,
+		.has	= xfs_has_rtrmapbt,
+		.repair	= xrep_rtrmapbt,
+	},
+	[XFS_SCRUB_TYPE_RTREFCBT] = {	/* realtime refcountbt */
+		.type	= ST_RTGROUP,
+		.setup	= xchk_setup_rtrefcountbt,
+		.scrub	= xchk_rtrefcountbt,
+		.has	= xfs_has_rtreflink,
+		.repair	= xrep_rtrefcountbt,
 	},
 };
 
@@ -602,9 +632,9 @@ xchk_scrub_create_subord(
 {
 	struct xfs_scrub_subord	*sub;
 
-	sub = kzalloc(sizeof(*sub), XCHK_GFP_FLAGS);
+	sub = kzalloc_obj(*sub, XCHK_GFP_FLAGS);
 	if (!sub)
-		return ERR_PTR(-ENOMEM);
+		return NULL;
 
 	sub->old_smtype = sc->sm->sm_type;
 	sub->old_smflags = sc->sm->sm_flags;
@@ -650,9 +680,7 @@ xfs_scrub_metadata(
 	if (error)
 		goto out;
 
-	xfs_warn_experimental(mp, XFS_EXPERIMENTAL_SCRUB);
-
-	sc = kzalloc(sizeof(struct xfs_scrub), XCHK_GFP_FLAGS);
+	sc = kzalloc_obj(struct xfs_scrub, XCHK_GFP_FLAGS);
 	if (!sc) {
 		error = -ENOMEM;
 		goto out;
@@ -848,10 +876,7 @@ xchk_scrubv_open_by_handle(
 	struct xfs_inode		*ip;
 	int				error;
 
-	error = xfs_trans_alloc_empty(mp, &tp);
-	if (error)
-		return NULL;
-
+	tp = xfs_trans_alloc_empty(mp);
 	error = xfs_iget(mp, tp, head->svh_ino, XCHK_IGET_FLAGS, 0, &ip);
 	xfs_trans_cancel(tp);
 	if (error)

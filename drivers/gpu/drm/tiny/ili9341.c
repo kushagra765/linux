@@ -15,8 +15,8 @@
 #include <linux/property.h>
 #include <linux/spi/spi.h>
 
+#include <drm/clients/drm_client_setup.h>
 #include <drm/drm_atomic_helper.h>
-#include <drm/drm_client_setup.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_fbdev_dma.h>
 #include <drm/drm_gem_atomic_helper.h>
@@ -24,6 +24,7 @@
 #include <drm/drm_managed.h>
 #include <drm/drm_mipi_dbi.h>
 #include <drm/drm_modeset_helper.h>
+#include <drm/drm_print.h>
 #include <video/mipi_display.h>
 
 #define ILI9341_FRMCTR1		0xb1
@@ -155,7 +156,6 @@ static const struct drm_driver ili9341_driver = {
 	.debugfs_init		= mipi_dbi_debugfs_init,
 	.name			= "ili9341",
 	.desc			= "Ilitek ILI9341",
-	.date			= "20180514",
 	.major			= 1,
 	.minor			= 0,
 };

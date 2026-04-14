@@ -32,12 +32,10 @@
 
 #include <uapi/drm/i915_drm.h>
 
+#include <linux/pci.h>
 #include <linux/pm_qos.h>
 
 #include <drm/ttm/ttm_device.h>
-
-#include "display/intel_display_limits.h"
-#include "display/intel_display_core.h"
 
 #include "gem/i915_gem_context_types.h"
 #include "gem/i915_gem_shrinker.h"
@@ -48,8 +46,6 @@
 #include "gt/intel_region_lmem.h"
 #include "gt/intel_workarounds.h"
 #include "gt/uc/intel_uc.h"
-
-#include "soc/intel_pch.h"
 
 #include "i915_drm_client.h"
 #include "i915_gem.h"
@@ -65,10 +61,9 @@
 #include "intel_uncore.h"
 
 struct drm_i915_clock_gating_funcs;
-struct vlv_s0ix_state;
+struct intel_display;
 struct intel_pxp;
-
-#define GEM_QUIRK_PIN_SWIZZLED_PAGES	BIT(0)
+struct vlv_s0ix_state;
 
 /* Data Stolen Memory (DSM) aka "i915 stolen memory" */
 struct i915_dsm {
@@ -101,14 +96,6 @@ struct i915_dsm {
 	resource_size_t usable_size;
 };
 
-struct i915_suspend_saved_registers {
-	u32 saveDSPARB;
-	u32 saveSWF0[16];
-	u32 saveSWF1[16];
-	u32 saveSWF3[3];
-	u16 saveGCDGMBUS;
-};
-
 #define MAX_L3_SLICES 2
 struct intel_l3_parity {
 	u32 *remap_info[MAX_L3_SLICES];
@@ -126,8 +113,7 @@ struct i915_gem_mm {
 	struct intel_memory_region *stolen_region;
 	/** Memory allocator for GTT stolen memory */
 	struct drm_mm stolen;
-	/** Protects the usage of the GTT stolen memory allocator. This is
-	 * always the inner lock when overlapping with struct_mutex. */
+	/** Protects the usage of the GTT stolen memory allocator */
 	struct mutex stolen_lock;
 
 	/* Protects bound_list/unbound_list and #drm_i915_gem_object.mm.link */
@@ -153,11 +139,6 @@ struct i915_gem_mm {
 	 * waiting on an RCU barrier if no objects are waiting to be freed.
 	 */
 	atomic_t free_count;
-
-	/**
-	 * tmpfs instance used for shmem backed objects
-	 */
-	struct vfsmount *gemfs;
 
 	struct intel_memory_region *regions[INTEL_REGION_UNKNOWN];
 
@@ -187,7 +168,8 @@ struct i915_selftest_stash {
 struct drm_i915_private {
 	struct drm_device drm;
 
-	struct intel_display display;
+	/* display device data, must be placed after drm device member */
+	struct intel_display *display;
 
 	/* FIXME: Device release actions should all be moved to drmm_ */
 	bool do_release;
@@ -232,23 +214,25 @@ struct drm_i915_private {
 	};
 	unsigned int engine_uabi_class_count[I915_LAST_UABI_ENGINE_CLASS + 1];
 
-	/* protects the irq masks */
-	spinlock_t irq_lock;
 	bool irqs_enabled;
+
+	/* LPT/WPT IOSF sideband protection */
+	struct mutex sbi_lock;
+
+	/* VLV/CHV IOSF sideband */
+	struct {
+		struct mutex lock; /* protect sideband access */
+		unsigned long locked_unit_mask;
+		struct pm_qos_request qos;
+	} vlv_iosf_sb;
 
 	/* Sideband mailbox protection */
 	struct mutex sb_lock;
-	struct pm_qos_request sb_qos;
 
-	/** Cached value of IMR to avoid reads in updating the bitfield */
-	u32 irq_mask;
+	/* Cached value of gen 2-4 IMR to avoid reads in updating the bitfield */
+	u32 gen2_imr_mask;
 
 	bool preserve_bios_swizzle;
-
-	unsigned int fsb_freq, mem_freq, is_ddr3;
-
-	unsigned int hpll_freq;
-	unsigned int czclk_freq;
 
 	/**
 	 * wq - Driver workqueue for GEM.
@@ -272,10 +256,6 @@ struct drm_i915_private {
 	/* pm private clock gating functions */
 	const struct drm_i915_clock_gating_funcs *clock_gating_funcs;
 
-	/* PCH chipset type */
-	enum intel_pch pch_type;
-	unsigned short pch_id;
-
 	unsigned long gem_quirks;
 
 	struct i915_gem_mm mm;
@@ -291,26 +271,7 @@ struct drm_i915_private {
 	struct i915_gpu_error gpu_error;
 
 	u32 suspend_count;
-	struct i915_suspend_saved_registers regfile;
 	struct vlv_s0ix_state *vlv_s0ix_state;
-
-	struct dram_info {
-		bool wm_lv_0_adjust_needed;
-		u8 num_channels;
-		bool symmetric_memory;
-		enum intel_dram_type {
-			INTEL_DRAM_UNKNOWN,
-			INTEL_DRAM_DDR3,
-			INTEL_DRAM_DDR4,
-			INTEL_DRAM_LPDDR3,
-			INTEL_DRAM_LPDDR4,
-			INTEL_DRAM_DDR5,
-			INTEL_DRAM_LPDDR5,
-			INTEL_DRAM_GDDR,
-		} type;
-		u8 num_qgv_points;
-		u8 num_psf_gv_points;
-	} dram_info;
 
 	struct intel_runtime_pm runtime_pm;
 
@@ -341,6 +302,8 @@ struct drm_i915_private {
 		 */
 		struct file *mmap_singleton;
 	} gem;
+
+	spinlock_t frontbuffer_lock; /* protects obj->frontbuffer (write-side) */
 
 	struct intel_pxp *pxp;
 
@@ -380,14 +343,6 @@ static inline struct intel_gt *to_gt(const struct drm_i915_private *i915)
 {
 	return i915->gt[0];
 }
-
-#define rb_to_uabi_engine(rb) \
-	rb_entry_safe(rb, struct intel_engine_cs, uabi_node)
-
-#define for_each_uabi_engine(engine__, i915__) \
-	for ((engine__) = rb_to_uabi_engine(rb_first(&(i915__)->uabi_engines));\
-	     (engine__); \
-	     (engine__) = rb_to_uabi_engine(rb_next(&(engine__)->uabi_node)))
 
 #define INTEL_INFO(i915)	((i915)->__info)
 #define RUNTIME_INFO(i915)	(&(i915)->__runtime)
@@ -527,16 +482,6 @@ IS_SUBPLATFORM(const struct drm_i915_private *i915,
 #define IS_ALDERLAKE_P(i915) IS_PLATFORM(i915, INTEL_ALDERLAKE_P)
 #define IS_DG2(i915)	IS_PLATFORM(i915, INTEL_DG2)
 #define IS_METEORLAKE(i915) IS_PLATFORM(i915, INTEL_METEORLAKE)
-/*
- * Display code shared by i915 and Xe relies on macros like IS_LUNARLAKE,
- * so we need to define these even on platforms that the i915 base driver
- * doesn't support.  Ensure the parameter is used in the definition to
- * avoid 'unused variable' warnings when compiling the shared display code
- * for i915.
- */
-#define IS_LUNARLAKE(i915) (0 && i915)
-#define IS_BATTLEMAGE(i915)  (0 && i915)
-#define IS_PANTHERLAKE(i915) (0 && i915)
 
 #define IS_ARROWLAKE_H(i915) \
 	IS_SUBPLATFORM(i915, INTEL_METEORLAKE, INTEL_SUBPLATFORM_ARL_H)
@@ -550,6 +495,8 @@ IS_SUBPLATFORM(const struct drm_i915_private *i915,
 	IS_SUBPLATFORM(i915, INTEL_DG2, INTEL_SUBPLATFORM_G11)
 #define IS_DG2_G12(i915) \
 	IS_SUBPLATFORM(i915, INTEL_DG2, INTEL_SUBPLATFORM_G12)
+#define IS_DG2_D(i915) \
+	IS_SUBPLATFORM(i915, INTEL_DG2, INTEL_SUBPLATFORM_D)
 #define IS_RAPTORLAKE_S(i915) \
 	IS_SUBPLATFORM(i915, INTEL_ALDERLAKE_S, INTEL_SUBPLATFORM_RPL)
 #define IS_ALDERLAKE_P_N(i915) \
@@ -595,29 +542,6 @@ IS_SUBPLATFORM(const struct drm_i915_private *i915,
 #define IS_GEN9_LP(i915)	(IS_BROXTON(i915) || IS_GEMINILAKE(i915))
 #define IS_GEN9_BC(i915)	(GRAPHICS_VER(i915) == 9 && !IS_GEN9_LP(i915))
 
-#define __HAS_ENGINE(engine_mask, id) ((engine_mask) & BIT(id))
-#define HAS_ENGINE(gt, id) __HAS_ENGINE((gt)->info.engine_mask, id)
-
-#define __ENGINE_INSTANCES_MASK(mask, first, count) ({			\
-	unsigned int first__ = (first);					\
-	unsigned int count__ = (count);					\
-	((mask) & GENMASK(first__ + count__ - 1, first__)) >> first__;	\
-})
-
-#define ENGINE_INSTANCES_MASK(gt, first, count) \
-	__ENGINE_INSTANCES_MASK((gt)->info.engine_mask, first, count)
-
-#define RCS_MASK(gt) \
-	ENGINE_INSTANCES_MASK(gt, RCS0, I915_MAX_RCS)
-#define BCS_MASK(gt) \
-	ENGINE_INSTANCES_MASK(gt, BCS0, I915_MAX_BCS)
-#define VDBOX_MASK(gt) \
-	ENGINE_INSTANCES_MASK(gt, VCS0, I915_MAX_VCS)
-#define VEBOX_MASK(gt) \
-	ENGINE_INSTANCES_MASK(gt, VECS0, I915_MAX_VECS)
-#define CCS_MASK(gt) \
-	ENGINE_INSTANCES_MASK(gt, CCS0, I915_MAX_CCS)
-
 #define HAS_MEDIA_RATIO_MODE(i915) (INTEL_INFO(i915)->has_media_ratio_mode)
 
 /*
@@ -662,8 +586,7 @@ IS_SUBPLATFORM(const struct drm_i915_private *i915,
 /* With the 945 and later, Y tiling got adjusted so that it was 32 128-byte
  * rows, which changed the alignment requirements and fence programming.
  */
-#define HAS_128_BYTE_Y_TILING(i915) (GRAPHICS_VER(i915) != 2 && \
-					 !(IS_I915G(i915) || IS_I915GM(i915)))
+#define HAS_128_BYTE_Y_TILING(i915) (!IS_I915G(i915) && !IS_I915GM(i915))
 
 #define HAS_RC6(i915)		 (INTEL_INFO(i915)->has_rc6)
 #define HAS_RC6p(i915)		 (INTEL_INFO(i915)->has_rc6p)

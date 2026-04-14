@@ -31,10 +31,9 @@ static inline void exfat_d_version_set(struct dentry *dentry,
  * If it happened, the negative dentry isn't actually negative anymore.  So,
  * drop it.
  */
-static int exfat_d_revalidate(struct dentry *dentry, unsigned int flags)
+static int exfat_d_revalidate(struct inode *dir, const struct qstr *name,
+			      struct dentry *dentry, unsigned int flags)
 {
-	int ret;
-
 	if (flags & LOOKUP_RCU)
 		return -ECHILD;
 
@@ -58,11 +57,7 @@ static int exfat_d_revalidate(struct dentry *dentry, unsigned int flags)
 	if (flags & (LOOKUP_CREATE | LOOKUP_RENAME_TARGET))
 		return 0;
 
-	spin_lock(&dentry->d_lock);
-	ret = inode_eq_iversion(d_inode(dentry->d_parent),
-			exfat_d_version(dentry));
-	spin_unlock(&dentry->d_lock);
-	return ret;
+	return inode_eq_iversion(dir, exfat_d_version(dentry));
 }
 
 /* returns the length of a struct qstr, ignoring trailing dots if necessary */
@@ -237,7 +232,7 @@ static int exfat_search_empty_slot(struct super_block *sb,
 		dentry = 0;
 	}
 
-	while (dentry + num_entries < total_entries &&
+	while (dentry + num_entries <= total_entries &&
 	       clu.dir != EXFAT_EOF_CLUSTER) {
 		i = dentry & (dentries_per_clu - 1);
 
@@ -251,15 +246,8 @@ static int exfat_search_empty_slot(struct super_block *sb,
 		i += ret;
 
 		while (i >= dentries_per_clu) {
-			if (clu.flags == ALLOC_NO_FAT_CHAIN) {
-				if (--clu.size > 0)
-					clu.dir++;
-				else
-					clu.dir = EXFAT_EOF_CLUSTER;
-			} else {
-				if (exfat_get_next_cluster(sb, &clu.dir))
-					return -EIO;
-			}
+			if (exfat_chain_advance(sb, &clu, 1))
+				return -EIO;
 
 			i -= dentries_per_clu;
 		}
@@ -305,12 +293,12 @@ static int exfat_check_max_dentries(struct inode *inode)
  *   the directory entry index in p_dir is returned on succeeds
  *   -error code is returned on failure
  */
-static int exfat_find_empty_entry(struct inode *inode,
+int exfat_find_empty_entry(struct inode *inode,
 		struct exfat_chain *p_dir, int num_entries,
 		struct exfat_entry_set_cache *es)
 {
-	int dentry;
-	unsigned int ret, last_clu;
+	int dentry, ret;
+	unsigned int last_clu;
 	loff_t size = 0;
 	struct exfat_chain clu;
 	struct super_block *sb = inode->i_sb;
@@ -330,8 +318,8 @@ static int exfat_find_empty_entry(struct inode *inode,
 
 	while ((dentry = exfat_search_empty_slot(sb, &hint_femp, p_dir,
 					num_entries, es)) < 0) {
-		if (dentry == -EIO)
-			break;
+		if (dentry != -ENOSPC)
+			return dentry;
 
 		if (exfat_check_max_dentries(inode))
 			return -ENOSPC;
@@ -370,7 +358,8 @@ static int exfat_find_empty_entry(struct inode *inode,
 			/* no-fat-chain bit is disabled,
 			 * so fat-chain should be synced with alloc-bitmap
 			 */
-			exfat_chain_cont_cluster(sb, p_dir->dir, p_dir->size);
+			if (exfat_chain_cont_cluster(sb, p_dir->dir, p_dir->size))
+				return -EIO;
 			p_dir->flags = ALLOC_FAT_CHAIN;
 			hint_femp.cur.flags = ALLOC_FAT_CHAIN;
 		}
@@ -447,7 +436,7 @@ static int __exfat_resolve_path(struct inode *inode, const unsigned char *path,
 		return namelen; /* return error value */
 
 	if ((lossy && !lookup) || !namelen)
-		return (lossy & NLS_NAME_OVERLEN) ? -ENAMETOOLONG : -EINVAL;
+		return -EINVAL;
 
 	return 0;
 }
@@ -592,7 +581,7 @@ unlock:
 }
 
 /* lookup a file */
-static int exfat_find(struct inode *dir, struct qstr *qname,
+static int exfat_find(struct inode *dir, const struct qstr *qname,
 		struct exfat_dir_entry *info)
 {
 	int ret, dentry, count;
@@ -647,7 +636,6 @@ static int exfat_find(struct inode *dir, struct qstr *qname,
 
 	info->type = exfat_get_entry_type(ep);
 	info->attr = le16_to_cpu(ep->dentry.file.attr);
-	info->size = le64_to_cpu(ep2->dentry.stream.valid_size);
 	info->valid_size = le64_to_cpu(ep2->dentry.stream.valid_size);
 	info->size = le64_to_cpu(ep2->dentry.stream.size);
 
@@ -687,6 +675,16 @@ static int exfat_find(struct inode *dir, struct qstr *qname,
 			     ep->dentry.file.access_date,
 			     0);
 	exfat_put_dentry_set(&es, false);
+
+	if (info->valid_size < 0) {
+		exfat_fs_error(sb, "data valid size is invalid(%lld)", info->valid_size);
+		return -EIO;
+	}
+
+	if (unlikely(EXFAT_B_TO_CLU_ROUND_UP(info->size, sbi) > sbi->used_clusters)) {
+		exfat_fs_error(sb, "data size is invalid(%lld)", info->size);
+		return -EIO;
+	}
 
 	if (ei->start_clu == EXFAT_FREE_CLUSTER) {
 		exfat_fs_error(sb,
@@ -840,8 +838,8 @@ unlock:
 	return err;
 }
 
-static int exfat_mkdir(struct mnt_idmap *idmap, struct inode *dir,
-		       struct dentry *dentry, umode_t mode)
+static struct dentry *exfat_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+				  struct dentry *dentry, umode_t mode)
 {
 	struct super_block *sb = dir->i_sb;
 	struct inode *inode;
@@ -851,7 +849,7 @@ static int exfat_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	loff_t size = i_size_read(dir);
 
 	if (unlikely(exfat_forced_shutdown(sb)))
-		return -EIO;
+		return ERR_PTR(-EIO);
 
 	mutex_lock(&EXFAT_SB(sb)->s_lock);
 	exfat_set_volume_dirty(sb);
@@ -869,9 +867,10 @@ static int exfat_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 
 	i_pos = exfat_make_i_pos(&info);
 	inode = exfat_build_inode(sb, &info, i_pos);
-	err = PTR_ERR_OR_ZERO(inode);
-	if (err)
+	if (IS_ERR(inode)) {
+		err = PTR_ERR(inode);
 		goto unlock;
+	}
 
 	inode_inc_iversion(inode);
 	EXFAT_I(inode)->i_crtime = simple_inode_init_ts(inode);
@@ -882,7 +881,7 @@ static int exfat_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 
 unlock:
 	mutex_unlock(&EXFAT_SB(sb)->s_lock);
-	return err;
+	return err ? ERR_PTR(err) : NULL;
 }
 
 static int exfat_check_dir_empty(struct super_block *sb,
@@ -890,6 +889,7 @@ static int exfat_check_dir_empty(struct super_block *sb,
 {
 	int i, dentries_per_clu;
 	unsigned int type;
+	unsigned int clu_count = 0;
 	struct exfat_chain clu;
 	struct exfat_dentry *ep;
 	struct exfat_sb_info *sbi = EXFAT_SB(sb);
@@ -918,15 +918,12 @@ static int exfat_check_dir_empty(struct super_block *sb,
 			return -ENOTEMPTY;
 		}
 
-		if (clu.flags == ALLOC_NO_FAT_CHAIN) {
-			if (--clu.size > 0)
-				clu.dir++;
-			else
-				clu.dir = EXFAT_EOF_CLUSTER;
-		} else {
-			if (exfat_get_next_cluster(sb, &(clu.dir)))
-				return -EIO;
-		}
+		if (exfat_chain_advance(sb, &clu, 1))
+			return -EIO;
+
+		/* break if the cluster chain includes a loop */
+		if (unlikely(++clu_count > EXFAT_DATA_CLUSTER_COUNT(sbi)))
+			break;
 	}
 
 	return 0;

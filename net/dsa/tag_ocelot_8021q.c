@@ -43,7 +43,7 @@ static struct sk_buff *ocelot_defer_xmit(struct dsa_port *dp,
 	if (skb->ip_summed == CHECKSUM_PARTIAL && skb_checksum_help(skb))
 		return NULL;
 
-	xmit_work = kzalloc(sizeof(*xmit_work), GFP_ATOMIC);
+	xmit_work = kzalloc_obj(*xmit_work, GFP_ATOMIC);
 	if (!xmit_work)
 		return NULL;
 
@@ -106,11 +106,11 @@ static int ocelot_connect(struct dsa_switch *ds)
 	struct ocelot_8021q_tagger_private *priv;
 	int err;
 
-	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+	priv = kzalloc_obj(*priv);
 	if (!priv)
 		return -ENOMEM;
 
-	priv->xmit_worker = kthread_create_worker(0, "felix_xmit");
+	priv->xmit_worker = kthread_run_worker(0, "felix_xmit");
 	if (IS_ERR(priv->xmit_worker)) {
 		err = PTR_ERR(priv->xmit_worker);
 		kfree(priv);

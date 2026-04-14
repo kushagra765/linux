@@ -454,42 +454,30 @@ static int
 osf_ufs_mount(const char __user *dirname,
 	      struct ufs_args __user *args, int flags)
 {
-	int retval;
-	struct cdfs_args tmp;
-	struct filename *devname;
+	struct ufs_args tmp;
+	char *devname __free(kfree) = NULL;
 
-	retval = -EFAULT;
 	if (copy_from_user(&tmp, args, sizeof(tmp)))
-		goto out;
-	devname = getname(tmp.devname);
-	retval = PTR_ERR(devname);
+		return -EFAULT;
+	devname = strndup_user(tmp.devname, PATH_MAX);
 	if (IS_ERR(devname))
-		goto out;
-	retval = do_mount(devname->name, dirname, "ext2", flags, NULL);
-	putname(devname);
- out:
-	return retval;
+		return PTR_ERR(devname);
+	return do_mount(devname, dirname, "ext2", flags, NULL);
 }
 
 static int
 osf_cdfs_mount(const char __user *dirname,
 	       struct cdfs_args __user *args, int flags)
 {
-	int retval;
 	struct cdfs_args tmp;
-	struct filename *devname;
+	char *devname __free(kfree) = NULL;
 
-	retval = -EFAULT;
 	if (copy_from_user(&tmp, args, sizeof(tmp)))
-		goto out;
-	devname = getname(tmp.devname);
-	retval = PTR_ERR(devname);
+		return -EFAULT;
+	devname = strndup_user(tmp.devname, PATH_MAX);
 	if (IS_ERR(devname))
-		goto out;
-	retval = do_mount(devname->name, dirname, "iso9660", flags, NULL);
-	putname(devname);
- out:
-	return retval;
+		return PTR_ERR(devname);
+	return do_mount(devname, dirname, "iso9660", flags, NULL);
 }
 
 static int
@@ -1210,8 +1198,7 @@ SYSCALL_DEFINE1(old_adjtimex, struct timex32 __user *, txc_p)
 	return ret;
 }
 
-/* Get an address range which is currently unmapped.  Similar to the
-   generic version except that we know how to honor ADDR_LIMIT_32BIT.  */
+/* Get an address range which is currently unmapped. */
 
 static unsigned long
 arch_get_unmapped_area_1(unsigned long addr, unsigned long len,
@@ -1230,13 +1217,7 @@ arch_get_unmapped_area(struct file *filp, unsigned long addr,
 		       unsigned long len, unsigned long pgoff,
 		       unsigned long flags, vm_flags_t vm_flags)
 {
-	unsigned long limit;
-
-	/* "32 bit" actually means 31 bit, since pointers sign extend.  */
-	if (current->personality & ADDR_LIMIT_32BIT)
-		limit = 0x80000000;
-	else
-		limit = TASK_SIZE;
+	unsigned long limit = TASK_SIZE;
 
 	if (len > limit)
 		return -ENOMEM;

@@ -19,13 +19,9 @@
 #include <um_malloc.h>
 #include "internal.h"
 
-#define PGD_BOUND (4 * 1024 * 1024)
 #define STACKSIZE (8 * 1024 * 1024)
-#define THREAD_NAME_LEN (256)
 
-long elf_aux_hwcap;
-
-static void set_stklim(void)
+static void __init set_stklim(void)
 {
 	struct rlimit lim;
 
@@ -48,7 +44,7 @@ static void last_ditch_exit(int sig)
 	exit(1);
 }
 
-static void install_fatal_handler(int sig)
+static void __init install_fatal_handler(int sig)
 {
 	struct sigaction action;
 
@@ -73,7 +69,7 @@ static void install_fatal_handler(int sig)
 
 #define UML_LIB_PATH	":" OS_LIB_PATH "/uml"
 
-static void setup_env_path(void)
+static void __init setup_env_path(void)
 {
 	char *new_path = NULL;
 	char *old_path = NULL;
@@ -151,9 +147,7 @@ int __init main(int argc, char **argv, char **envp)
 	install_fatal_handler(SIGINT);
 	install_fatal_handler(SIGTERM);
 
-#ifdef CONFIG_ARCH_REUSE_HOST_VSYSCALL_AREA
 	scan_elf_aux(envp);
-#endif
 
 	change_sig(SIGPIPE, 0);
 	ret = linux_main(argc, argv, envp);
@@ -173,7 +167,7 @@ int __init main(int argc, char **argv, char **envp)
 	 */
 
 	/* stop timers and set timer signal to be ignored */
-	os_timer_disable();
+	os_timer_disable(0);
 
 	/* disable SIGIO for the fds and set SIGIO to be ignored */
 	err = deactivate_all_fds();

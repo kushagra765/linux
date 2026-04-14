@@ -426,16 +426,16 @@ static int bh1745_read_raw(struct iio_dev *indio_dev,
 
 	switch (mask) {
 	case IIO_CHAN_INFO_RAW:
-		iio_device_claim_direct_scoped(return -EBUSY, indio_dev) {
-			ret = regmap_bulk_read(data->regmap, chan->address,
-					       &value, 2);
-			if (ret)
-				return ret;
-			*val = value;
+		if (!iio_device_claim_direct(indio_dev))
+			return -EBUSY;
 
-			return IIO_VAL_INT;
-		}
-		unreachable();
+		ret = regmap_bulk_read(data->regmap, chan->address, &value, 2);
+		iio_device_release_direct(indio_dev);
+		if (ret)
+			return ret;
+		*val = value;
+
+		return IIO_VAL_INT;
 
 	case IIO_CHAN_INFO_SCALE: {
 			guard(mutex)(&data->lock);
@@ -739,8 +739,8 @@ static irqreturn_t bh1745_trigger_handler(int interrupt, void *p)
 	struct bh1745_data *data = iio_priv(indio_dev);
 	struct {
 		u16 chans[4];
-		s64 timestamp __aligned(8);
-	} scan;
+		aligned_s64 timestamp;
+	} scan = { };
 	u16 value;
 	int ret;
 	int i;
@@ -755,8 +755,8 @@ static irqreturn_t bh1745_trigger_handler(int interrupt, void *p)
 		scan.chans[j++] = value;
 	}
 
-	iio_push_to_buffers_with_timestamp(indio_dev, &scan,
-					   iio_get_time_ns(indio_dev));
+	iio_push_to_buffers_with_ts(indio_dev, &scan, sizeof(scan),
+				    iio_get_time_ns(indio_dev));
 
 err:
 	iio_trigger_notify_done(indio_dev->trig);
@@ -814,8 +814,7 @@ static int bh1745_init(struct bh1745_data *data)
 
 	ret = devm_add_action_or_reset(dev, bh1745_power_off, data);
 	if (ret)
-		return dev_err_probe(dev, ret,
-				     "Failed to add action or reset\n");
+		return ret;
 
 	return 0;
 }

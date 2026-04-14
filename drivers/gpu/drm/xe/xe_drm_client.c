@@ -88,7 +88,7 @@ struct xe_drm_client *xe_drm_client_alloc(void)
 {
 	struct xe_drm_client *client;
 
-	client = kzalloc(sizeof(*client), GFP_KERNEL);
+	client = kzalloc_obj(*client);
 	if (!client)
 		return NULL;
 
@@ -135,8 +135,8 @@ void xe_drm_client_add_bo(struct xe_drm_client *client,
 	XE_WARN_ON(bo->client);
 	XE_WARN_ON(!list_empty(&bo->client_link));
 
-	spin_lock(&client->bos_lock);
 	bo->client = xe_drm_client_get(client);
+	spin_lock(&client->bos_lock);
 	list_add_tail(&bo->client_link, &client->bos_list);
 	spin_unlock(&client->bos_lock);
 }
@@ -167,7 +167,7 @@ void xe_drm_client_remove_bo(struct xe_bo *bo)
 static void bo_meminfo(struct xe_bo *bo,
 		       struct drm_memory_stats stats[TTM_NUM_MEM_TYPES])
 {
-	u64 sz = bo->size;
+	u64 sz = xe_bo_size(bo);
 	u32 mem_type = bo->ttm.resource->mem_type;
 
 	xe_bo_assert_held(bo);
@@ -261,12 +261,55 @@ static void show_meminfo(struct drm_printer *p, struct drm_file *file)
 		if (man) {
 			drm_print_memory_stats(p,
 					       &stats[mem_type],
+					       DRM_GEM_OBJECT_ACTIVE |
 					       DRM_GEM_OBJECT_RESIDENT |
 					       (mem_type != XE_PL_SYSTEM ? 0 :
 					       DRM_GEM_OBJECT_PURGEABLE),
 					       xe_mem_type_to_name[mem_type]);
 		}
 	}
+}
+
+static struct xe_hw_engine *any_engine(struct xe_device *xe)
+{
+	struct xe_gt *gt;
+	unsigned long gt_id;
+
+	for_each_gt(gt, xe, gt_id) {
+		struct xe_hw_engine *hwe = xe_gt_any_hw_engine(gt);
+
+		if (hwe)
+			return hwe;
+	}
+
+	return NULL;
+}
+
+/*
+ * Pick any engine and grab its forcewake.  On error phwe will be NULL and
+ * the returned forcewake reference will be invalid.  Callers should check
+ * phwe against NULL.
+ */
+static struct xe_force_wake_ref force_wake_get_any_engine(struct xe_device *xe,
+							  struct xe_hw_engine **phwe)
+{
+	enum xe_force_wake_domains domain;
+	struct xe_force_wake_ref fw_ref = {};
+	struct xe_hw_engine *hwe;
+
+	*phwe = NULL;
+
+	hwe = any_engine(xe);
+	if (!hwe)
+		return fw_ref;	/* will be invalid */
+
+	domain = xe_hw_engine_to_fw_domain(hwe);
+
+	fw_ref = xe_force_wake_constructor(gt_to_fw(hwe->gt), domain);
+	if (xe_force_wake_ref_has_domain(fw_ref.domains, domain))
+		*phwe = hwe;	/* valid forcewake */
+
+	return fw_ref;
 }
 
 static void show_run_ticks(struct drm_printer *p, struct drm_file *file)
@@ -278,49 +321,42 @@ static void show_run_ticks(struct drm_printer *p, struct drm_file *file)
 	struct xe_hw_engine *hwe;
 	struct xe_exec_queue *q;
 	u64 gpu_timestamp;
-	unsigned int fw_ref;
 
-	xe_pm_runtime_get(xe);
+	/*
+	 * RING_TIMESTAMP registers are inaccessible in VF mode.
+	 * Without drm-total-cycles-*, other keys provide little value.
+	 * Show all or none of the optional "run_ticks" keys in this case.
+	 */
+	if (IS_SRIOV_VF(xe))
+		return;
 
-	/* Accumulate all the exec queues from this client */
-	mutex_lock(&xef->exec_queue.lock);
-	xa_for_each(&xef->exec_queue.xa, i, q) {
-		xe_exec_queue_get(q);
+	/*
+	 * Wait for any exec queue going away: their cycles will get updated on
+	 * context switch out, so wait for that to happen
+	 */
+	wait_var_event(&xef->exec_queue.pending_removal,
+		       !atomic_read(&xef->exec_queue.pending_removal));
+
+	scoped_guard(xe_pm_runtime, xe) {
+		CLASS(xe_force_wake_release_only, fw_ref)(force_wake_get_any_engine(xe, &hwe));
+		if (!hwe)
+			return;
+
+		/* Accumulate all the exec queues from this client */
+		mutex_lock(&xef->exec_queue.lock);
+		xa_for_each(&xef->exec_queue.xa, i, q) {
+			xe_exec_queue_get(q);
+			mutex_unlock(&xef->exec_queue.lock);
+
+			xe_exec_queue_update_run_ticks(q);
+
+			mutex_lock(&xef->exec_queue.lock);
+			xe_exec_queue_put(q);
+		}
 		mutex_unlock(&xef->exec_queue.lock);
 
-		xe_exec_queue_update_run_ticks(q);
-
-		mutex_lock(&xef->exec_queue.lock);
-		xe_exec_queue_put(q);
-	}
-	mutex_unlock(&xef->exec_queue.lock);
-
-	/* Get the total GPU cycles */
-	for_each_gt(gt, xe, gt_id) {
-		enum xe_force_wake_domains fw;
-
-		hwe = xe_gt_any_hw_engine(gt);
-		if (!hwe)
-			continue;
-
-		fw = xe_hw_engine_to_fw_domain(hwe);
-
-		fw_ref = xe_force_wake_get(gt_to_fw(gt), fw);
-		if (!xe_force_wake_ref_has_domain(fw_ref, fw)) {
-			hwe = NULL;
-			xe_force_wake_put(gt_to_fw(gt), fw_ref);
-			break;
-		}
-
 		gpu_timestamp = xe_hw_engine_read_timestamp(hwe);
-		xe_force_wake_put(gt_to_fw(gt), fw_ref);
-		break;
 	}
-
-	xe_pm_runtime_put(xe);
-
-	if (unlikely(!hwe))
-		return;
 
 	for (class = 0; class < XE_ENGINE_CLASS_MAX; class++) {
 		const char *class_name;
@@ -352,7 +388,7 @@ static void show_run_ticks(struct drm_printer *p, struct drm_file *file)
  * @p: The drm_printer ptr
  * @file: The drm_file ptr
  *
- * This is callabck for drm fdinfo interface. Register this callback
+ * This is callback for drm fdinfo interface. Register this callback
  * in drm driver ops for show_fdinfo.
  *
  * Return: void

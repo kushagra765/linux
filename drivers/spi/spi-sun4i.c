@@ -264,6 +264,9 @@ static int sun4i_spi_transfer_one(struct spi_controller *host,
 	else
 		reg |= SUN4I_CTL_DHB;
 
+	/* Now that the settings are correct, enable the interface */
+	reg |= SUN4I_CTL_ENABLE;
+
 	sun4i_spi_write(sspi, SUN4I_CTL_REG, reg);
 
 	/* Ensure that we have a parent clock fast enough */
@@ -404,7 +407,7 @@ static int sun4i_spi_runtime_resume(struct device *dev)
 	}
 
 	sun4i_spi_write(sspi, SUN4I_CTL_REG,
-			SUN4I_CTL_ENABLE | SUN4I_CTL_MASTER | SUN4I_CTL_TP);
+			SUN4I_CTL_MASTER | SUN4I_CTL_TP);
 
 	return 0;
 
@@ -462,12 +465,12 @@ static int sun4i_spi_probe(struct platform_device *pdev)
 	sspi->host = host;
 	host->max_speed_hz = 100 * 1000 * 1000;
 	host->min_speed_hz = 3 * 1000;
+	host->use_gpio_descriptors = true;
 	host->set_cs = sun4i_spi_set_cs;
 	host->transfer_one = sun4i_spi_transfer_one;
 	host->num_chipselect = 4;
 	host->mode_bits = SPI_CPOL | SPI_CPHA | SPI_CS_HIGH | SPI_LSB_FIRST;
 	host->bits_per_word_mask = SPI_BPW_MASK(8);
-	host->dev.of_node = pdev->dev.of_node;
 	host->auto_runtime_pm = true;
 	host->max_transfer_size = sun4i_spi_max_transfer_size;
 

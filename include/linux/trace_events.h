@@ -22,23 +22,29 @@ union bpf_attr;
 
 const char *trace_print_flags_seq(struct trace_seq *p, const char *delim,
 				  unsigned long flags,
-				  const struct trace_print_flags *flag_array);
+				  const struct trace_print_flags *flag_array,
+				  size_t flag_array_size);
 
 const char *trace_print_symbols_seq(struct trace_seq *p, unsigned long val,
-				    const struct trace_print_flags *symbol_array);
+				    const struct trace_print_flags *symbol_array,
+				    size_t symbol_array_size);
 
 #if BITS_PER_LONG == 32
 const char *trace_print_flags_seq_u64(struct trace_seq *p, const char *delim,
 		      unsigned long long flags,
-		      const struct trace_print_flags_u64 *flag_array);
+		      const struct trace_print_flags_u64 *flag_array,
+		      size_t flag_array_size);
 
 const char *trace_print_symbols_seq_u64(struct trace_seq *p,
 					unsigned long long val,
-					const struct trace_print_flags_u64
-								 *symbol_array);
+					const struct trace_print_flags_u64 *symbol_array,
+					size_t symbol_array_size);
 #endif
 
-const char *trace_print_bitmask_seq(struct trace_seq *p, void *bitmask_ptr,
+struct trace_iterator;
+struct trace_event;
+
+const char *trace_print_bitmask_seq(struct trace_iterator *iter, void *bitmask_ptr,
 				    unsigned int bitmask_size);
 
 const char *trace_print_hex_seq(struct trace_seq *p,
@@ -53,9 +59,6 @@ const char *
 trace_print_hex_dump_seq(struct trace_seq *p, const char *prefix_str,
 			 int prefix_type, int rowsize, int groupsize,
 			 const void *buf, size_t len, bool ascii);
-
-struct trace_iterator;
-struct trace_event;
 
 int trace_raw_output_prep(struct trace_iterator *iter,
 			  struct trace_event *event);
@@ -138,6 +141,7 @@ enum trace_iter_flags {
 	TRACE_FILE_LAT_FMT	= 1,
 	TRACE_FILE_ANNOTATE	= 2,
 	TRACE_FILE_TIME_IN_NS	= 4,
+	TRACE_FILE_PAUSE	= 8,
 };
 
 
@@ -273,7 +277,8 @@ struct trace_event_fields {
 			const char *name;
 			const int  size;
 			const int  align;
-			const int  is_signed;
+			const unsigned int is_signed:1;
+			unsigned int needs_test:1;
 			const int  filter_type;
 			const int  len;
 		};
@@ -324,6 +329,7 @@ enum {
 	TRACE_EVENT_FL_EPROBE_BIT,
 	TRACE_EVENT_FL_FPROBE_BIT,
 	TRACE_EVENT_FL_CUSTOM_BIT,
+	TRACE_EVENT_FL_TEST_STR_BIT,
 };
 
 /*
@@ -340,6 +346,7 @@ enum {
  *  CUSTOM        - Event is a custom event (to be attached to an exsiting tracepoint)
  *                   This is set when the custom event has not been attached
  *                   to a tracepoint yet, then it is cleared when it is.
+ *  TEST_STR      - The event has a "%s" that points to a string outside the event
  */
 enum {
 	TRACE_EVENT_FL_CAP_ANY		= (1 << TRACE_EVENT_FL_CAP_ANY_BIT),
@@ -352,6 +359,7 @@ enum {
 	TRACE_EVENT_FL_EPROBE		= (1 << TRACE_EVENT_FL_EPROBE_BIT),
 	TRACE_EVENT_FL_FPROBE		= (1 << TRACE_EVENT_FL_FPROBE_BIT),
 	TRACE_EVENT_FL_CUSTOM		= (1 << TRACE_EVENT_FL_CUSTOM_BIT),
+	TRACE_EVENT_FL_TEST_STR		= (1 << TRACE_EVENT_FL_TEST_STR_BIT),
 };
 
 #define TRACE_EVENT_FL_UKPROBE (TRACE_EVENT_FL_KPROBE | TRACE_EVENT_FL_UPROBE)
@@ -360,7 +368,7 @@ struct trace_event_call {
 	struct list_head	list;
 	struct trace_event_class *class;
 	union {
-		char			*name;
+		const char		*name;
 		/* Set TRACE_EVENT_FL_TRACEPOINT flag when using "tp" */
 		struct tracepoint	*tp;
 	};
@@ -476,7 +484,6 @@ enum {
 	EVENT_FILE_FL_RECORDED_TGID_BIT,
 	EVENT_FILE_FL_FILTERED_BIT,
 	EVENT_FILE_FL_NO_SET_FILTER_BIT,
-	EVENT_FILE_FL_SOFT_MODE_BIT,
 	EVENT_FILE_FL_SOFT_DISABLED_BIT,
 	EVENT_FILE_FL_TRIGGER_MODE_BIT,
 	EVENT_FILE_FL_TRIGGER_COND_BIT,
@@ -614,7 +621,6 @@ extern int __kprobe_event_add_fields(struct dynevent_cmd *cmd, ...);
  *  RECORDED_TGID - The tgids should be recorded at sched_switch
  *  FILTERED	  - The event has a filter attached
  *  NO_SET_FILTER - Set when filter has error and is to be ignored
- *  SOFT_MODE     - The event is enabled/disabled by SOFT_DISABLED
  *  SOFT_DISABLED - When set, do not trace the event (even though its
  *                   tracepoint may be enabled)
  *  TRIGGER_MODE  - When set, invoke the triggers associated with the event
@@ -629,7 +635,6 @@ enum {
 	EVENT_FILE_FL_RECORDED_TGID	= (1 << EVENT_FILE_FL_RECORDED_TGID_BIT),
 	EVENT_FILE_FL_FILTERED		= (1 << EVENT_FILE_FL_FILTERED_BIT),
 	EVENT_FILE_FL_NO_SET_FILTER	= (1 << EVENT_FILE_FL_NO_SET_FILTER_BIT),
-	EVENT_FILE_FL_SOFT_MODE		= (1 << EVENT_FILE_FL_SOFT_MODE_BIT),
 	EVENT_FILE_FL_SOFT_DISABLED	= (1 << EVENT_FILE_FL_SOFT_DISABLED_BIT),
 	EVENT_FILE_FL_TRIGGER_MODE	= (1 << EVENT_FILE_FL_TRIGGER_MODE_BIT),
 	EVENT_FILE_FL_TRIGGER_COND	= (1 << EVENT_FILE_FL_TRIGGER_COND_BIT),
@@ -668,6 +673,25 @@ struct trace_event_file {
 	atomic_t		sm_ref;	/* soft-mode reference counter */
 	atomic_t		tm_ref;	/* trigger-mode reference counter */
 };
+
+#ifdef CONFIG_HIST_TRIGGERS
+extern struct irq_work hist_poll_work;
+extern wait_queue_head_t hist_poll_wq;
+
+static inline void hist_poll_wakeup(void)
+{
+	if (wq_has_sleeper(&hist_poll_wq))
+		irq_work_queue(&hist_poll_work);
+}
+
+#define hist_poll_wait(file, wait)	\
+	poll_wait(file, &hist_poll_wq, wait)
+
+#else
+static inline void hist_poll_wakeup(void)
+{
+}
+#endif
 
 #define __TRACE_EVENT_FLAGS(name, value)				\
 	static int __init trace_init_flags_##name(void)			\
@@ -841,24 +865,6 @@ int ftrace_set_clr_event(struct trace_array *tr, char *buf, int set);
 int trace_set_clr_event(const char *system, const char *event, int set);
 int trace_array_set_clr_event(struct trace_array *tr, const char *system,
 		const char *event, bool enable);
-/*
- * The double __builtin_constant_p is because gcc will give us an error
- * if we try to allocate the static variable to fmt if it is not a
- * constant. Even with the outer if statement optimizing out.
- */
-#define event_trace_printk(ip, fmt, args...)				\
-do {									\
-	__trace_printk_check_format(fmt, ##args);			\
-	tracing_record_cmdline(current);				\
-	if (__builtin_constant_p(fmt)) {				\
-		static const char *trace_printk_fmt			\
-		  __section("__trace_printk_fmt") =			\
-			__builtin_constant_p(fmt) ? fmt : NULL;		\
-									\
-		__trace_bprintk(ip, trace_printk_fmt, ##args);		\
-	} else								\
-		__trace_printk(ip, fmt, ##args);			\
-} while (0)
 
 #ifdef CONFIG_PERF_EVENTS
 struct perf_event;

@@ -163,7 +163,7 @@ static int snd_sh_dac_pcm_copy(struct snd_pcm_substream *substream,
 	/* channel is not used (interleaved data) */
 	struct snd_sh_dac *chip = snd_pcm_substream_chip(substream);
 
-	if (copy_from_iter(chip->data_buffer + pos, src, count) != count)
+	if (copy_from_iter(chip->data_buffer + pos, count, src) != count)
 		return -EFAULT;
 	chip->buffer_end = chip->data_buffer + pos + count;
 
@@ -224,7 +224,7 @@ static int snd_sh_dac_pcm(struct snd_sh_dac *chip, int device)
 		return err;
 
 	pcm->private_data = chip;
-	strcpy(pcm->name, "SH_DAC PCM");
+	strscpy(pcm->name, "SH_DAC PCM");
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &snd_sh_dac_pcm_ops);
 
 	/* buffer size=48K */
@@ -306,14 +306,13 @@ static int snd_sh_dac_create(struct snd_card *card,
 
 	*rchip = NULL;
 
-	chip = kzalloc(sizeof(*chip), GFP_KERNEL);
+	chip = kzalloc_obj(*chip);
 	if (chip == NULL)
 		return -ENOMEM;
 
 	chip->card = card;
 
-	hrtimer_init(&chip->hrtimer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	chip->hrtimer.function = sh_dac_audio_timer;
+	hrtimer_setup(&chip->hrtimer, sh_dac_audio_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 
 	dac_audio_reset(chip);
 	chip->rate = 8000;
@@ -359,8 +358,8 @@ static int snd_sh_dac_probe(struct platform_device *devptr)
 	if (err < 0)
 		goto probe_error;
 
-	strcpy(card->driver, "snd_sh_dac");
-	strcpy(card->shortname, "SuperH DAC audio driver");
+	strscpy(card->driver, "snd_sh_dac");
+	strscpy(card->shortname, "SuperH DAC audio driver");
 	dev_info(&devptr->dev, "%s %s\n", card->longname, card->shortname);
 
 	err = snd_card_register(card);

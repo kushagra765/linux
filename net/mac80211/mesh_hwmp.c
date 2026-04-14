@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2008, 2009 open80211s Ltd.
- * Copyright (C) 2019, 2021-2023 Intel Corporation
+ * Copyright (C) 2019, 2021-2023, 2025 Intel Corporation
  * Author:     Luis Carlos Cobo <luisca@cozybit.com>
  */
 
@@ -367,6 +367,12 @@ u32 airtime_link_metric_get(struct ieee80211_local *local,
 	return (u32)result;
 }
 
+/* Check that the first metric is at least 10% better than the second one */
+static bool is_metric_better(u32 x, u32 y)
+{
+	return (x < y) && (x < (y - x / 10));
+}
+
 /**
  * hwmp_route_info_get - Update routing info to originator and transmitter
  *
@@ -458,8 +464,8 @@ static u32 hwmp_route_info_get(struct ieee80211_sub_if_data *sdata,
 				    (mpath->sn == orig_sn &&
 				     (rcu_access_pointer(mpath->next_hop) !=
 						      sta ?
-					      mult_frac(new_metric, 10, 9) :
-					      new_metric) >= mpath->metric)) {
+					      !is_metric_better(new_metric, mpath->metric) :
+					      new_metric >= mpath->metric))) {
 					process = false;
 					fresh_info = false;
 				}
@@ -533,8 +539,8 @@ static u32 hwmp_route_info_get(struct ieee80211_sub_if_data *sdata,
 			if ((mpath->flags & MESH_PATH_FIXED) ||
 			    ((mpath->flags & MESH_PATH_ACTIVE) &&
 			     ((rcu_access_pointer(mpath->next_hop) != sta ?
-				       mult_frac(last_hop_metric, 10, 9) :
-				       last_hop_metric) > mpath->metric)))
+				      !is_metric_better(last_hop_metric, mpath->metric) :
+				       last_hop_metric > mpath->metric))))
 				fresh_info = false;
 		} else {
 			mpath = mesh_path_add(sdata, ta);
@@ -630,7 +636,7 @@ static void hwmp_preq_frame_process(struct ieee80211_sub_if_data *sdata,
 				mesh_path_add_gate(mpath);
 		}
 		rcu_read_unlock();
-	} else {
+	} else if (ifmsh->mshcfg.dot11MeshForwarding) {
 		rcu_read_lock();
 		mpath = mesh_path_lookup(sdata, target_addr);
 		if (mpath) {
@@ -648,6 +654,8 @@ static void hwmp_preq_frame_process(struct ieee80211_sub_if_data *sdata,
 			}
 		}
 		rcu_read_unlock();
+	} else {
+		forward = false;
 	}
 
 	if (reply) {
@@ -665,7 +673,7 @@ static void hwmp_preq_frame_process(struct ieee80211_sub_if_data *sdata,
 		}
 	}
 
-	if (forward && ifmsh->mshcfg.dot11MeshForwarding) {
+	if (forward) {
 		u32 preq_id;
 		u8 hopcount;
 
@@ -943,7 +951,10 @@ void mesh_rx_path_sel_frame(struct ieee80211_sub_if_data *sdata,
 
 	baselen = (u8 *) mgmt->u.action.u.mesh_action.variable - (u8 *) mgmt;
 	elems = ieee802_11_parse_elems(mgmt->u.action.u.mesh_action.variable,
-				       len - baselen, false, NULL);
+				       len - baselen,
+				       IEEE80211_FTYPE_MGMT |
+				       IEEE80211_STYPE_ACTION,
+				       NULL);
 	if (!elems)
 		return;
 
@@ -994,7 +1005,7 @@ static void mesh_queue_preq(struct mesh_path *mpath, u8 flags)
 	struct ieee80211_if_mesh *ifmsh = &sdata->u.mesh;
 	struct mesh_preq_queue *preq_node;
 
-	preq_node = kmalloc(sizeof(struct mesh_preq_queue), GFP_ATOMIC);
+	preq_node = kmalloc_obj(struct mesh_preq_queue, GFP_ATOMIC);
 	if (!preq_node) {
 		mhwmp_dbg(sdata, "could not allocate PREQ node\n");
 		return;
@@ -1284,7 +1295,7 @@ int mesh_nexthop_lookup(struct ieee80211_sub_if_data *sdata,
 
 void mesh_path_timer(struct timer_list *t)
 {
-	struct mesh_path *mpath = from_timer(mpath, t, timer);
+	struct mesh_path *mpath = timer_container_of(mpath, t, timer);
 	struct ieee80211_sub_if_data *sdata = mpath->sdata;
 	int ret;
 

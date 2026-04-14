@@ -29,7 +29,7 @@ const struct kobj_type of_node_ktype = {
 };
 
 static ssize_t of_node_property_read(struct file *filp, struct kobject *kobj,
-				struct bin_attribute *bin_attr, char *buf,
+				const struct bin_attribute *bin_attr, char *buf,
 				loff_t offset, size_t count)
 {
 	struct property *pp = container_of(bin_attr, struct property, attr);

@@ -752,7 +752,7 @@ netdev_tx_t wilc_mac_xmit(struct sk_buff *skb, struct net_device *ndev)
 		return NETDEV_TX_OK;
 	}
 
-	tx_data = kmalloc(sizeof(*tx_data), GFP_ATOMIC);
+	tx_data = kmalloc_obj(*tx_data, GFP_ATOMIC);
 	if (!tx_data) {
 		dev_kfree_skb(skb);
 		netif_wake_queue(ndev);
@@ -925,8 +925,6 @@ void wilc_netdev_cleanup(struct wilc *wilc)
 
 	wilc_wlan_cfg_deinit(wilc);
 	wlan_deinit_locks(wilc);
-	wiphy_unregister(wilc->wiphy);
-	wiphy_free(wilc->wiphy);
 }
 EXPORT_SYMBOL_GPL(wilc_netdev_cleanup);
 

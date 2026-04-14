@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (C) Fuzhou Rockchip Electronics Co.Ltd
+ * Copyright (C) Rockchip Electronics Co., Ltd.
  * Author:Mark Yao <mark.yao@rock-chips.com>
  *
  * based on exynos_drm_drv.c
@@ -17,11 +17,12 @@
 #include <linux/console.h>
 #include <linux/iommu.h>
 
-#include <drm/drm_client_setup.h>
+#include <drm/clients/drm_client_setup.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_fbdev_dma.h>
 #include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_of.h>
+#include <drm/drm_print.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 
@@ -39,7 +40,6 @@
 
 #define DRIVER_NAME	"rockchip"
 #define DRIVER_DESC	"RockChip Soc DRM"
-#define DRIVER_DATE	"20140818"
 #define DRIVER_MAJOR	1
 #define DRIVER_MINOR	0
 
@@ -97,6 +97,9 @@ void rockchip_drm_dma_init_device(struct drm_device *drm_dev,
 		private->iommu_dev = ERR_PTR(-ENODEV);
 	else if (!private->iommu_dev)
 		private->iommu_dev = dev;
+
+	if (!IS_ERR(private->iommu_dev))
+		drm_dev_set_dma_dev(drm_dev, private->iommu_dev);
 }
 
 static int rockchip_drm_init_iommu(struct drm_device *drm_dev)
@@ -235,7 +238,6 @@ static const struct drm_driver rockchip_drm_driver = {
 	.fops			= &rockchip_drm_driver_fops,
 	.name	= DRIVER_NAME,
 	.desc	= DRIVER_DESC,
-	.date	= DRIVER_DATE,
 	.major	= DRIVER_MAJOR,
 	.minor	= DRIVER_MINOR,
 };
@@ -486,10 +488,11 @@ static void rockchip_drm_platform_remove(struct platform_device *pdev)
 
 static void rockchip_drm_platform_shutdown(struct platform_device *pdev)
 {
-	struct drm_device *drm = platform_get_drvdata(pdev);
+	if (component_master_is_bound(&pdev->dev, &rockchip_drm_ops)) {
+		struct drm_device *drm = platform_get_drvdata(pdev);
 
-	if (drm)
 		drm_atomic_helper_shutdown(drm);
+	}
 }
 
 static const struct of_device_id rockchip_drm_dt_ids[] = {
@@ -530,12 +533,15 @@ static int __init rockchip_drm_init(void)
 	ADD_ROCKCHIP_SUB_DRIVER(rockchip_dp_driver,
 				CONFIG_ROCKCHIP_ANALOGIX_DP);
 	ADD_ROCKCHIP_SUB_DRIVER(cdn_dp_driver, CONFIG_ROCKCHIP_CDN_DP);
+	ADD_ROCKCHIP_SUB_DRIVER(dw_dp_driver, CONFIG_ROCKCHIP_DW_DP);
 	ADD_ROCKCHIP_SUB_DRIVER(dw_hdmi_rockchip_pltfm_driver,
 				CONFIG_ROCKCHIP_DW_HDMI);
 	ADD_ROCKCHIP_SUB_DRIVER(dw_hdmi_qp_rockchip_pltfm_driver,
 				CONFIG_ROCKCHIP_DW_HDMI_QP);
 	ADD_ROCKCHIP_SUB_DRIVER(dw_mipi_dsi_rockchip_driver,
 				CONFIG_ROCKCHIP_DW_MIPI_DSI);
+	ADD_ROCKCHIP_SUB_DRIVER(dw_mipi_dsi2_rockchip_driver,
+				CONFIG_ROCKCHIP_DW_MIPI_DSI2);
 	ADD_ROCKCHIP_SUB_DRIVER(inno_hdmi_driver, CONFIG_ROCKCHIP_INNO_HDMI);
 	ADD_ROCKCHIP_SUB_DRIVER(rk3066_hdmi_driver,
 				CONFIG_ROCKCHIP_RK3066_HDMI);

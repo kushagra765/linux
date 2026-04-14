@@ -1122,15 +1122,11 @@ static int cpcap_battery_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, ddata);
 
-	error = cpcap_battery_init_interrupts(pdev, ddata);
-	if (error)
-		return error;
-
 	error = cpcap_battery_init_iio(ddata);
 	if (error)
 		return error;
 
-	psy_cfg.of_node = pdev->dev.of_node;
+	psy_cfg.fwnode = dev_fwnode(&pdev->dev);
 	psy_cfg.drv_data = ddata;
 
 	ddata->psy = devm_power_supply_register(ddata->dev,
@@ -1141,6 +1137,10 @@ static int cpcap_battery_probe(struct platform_device *pdev)
 		dev_err(ddata->dev, "failed to register power supply\n");
 		return error;
 	}
+
+	error = cpcap_battery_init_interrupts(pdev, ddata);
+	if (error)
+		return error;
 
 	atomic_set(&ddata->active, 1);
 

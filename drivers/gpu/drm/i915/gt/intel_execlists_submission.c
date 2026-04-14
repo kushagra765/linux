@@ -106,14 +106,20 @@
  * preemption, but just sampling the new tail pointer).
  *
  */
+
 #include <linux/interrupt.h>
 #include <linux/string_helpers.h>
 
+#include <drm/drm_print.h>
+
+#include "gen8_engine_cs.h"
 #include "i915_drv.h"
+#include "i915_list_util.h"
 #include "i915_reg.h"
+#include "i915_timer_util.h"
 #include "i915_trace.h"
 #include "i915_vgpu.h"
-#include "gen8_engine_cs.h"
+#include "i915_wait_util.h"
 #include "intel_breadcrumbs.h"
 #include "intel_context.h"
 #include "intel_engine_heartbeat.h"
@@ -403,15 +409,6 @@ __unwind_incomplete_requests(struct intel_engine_cs *engine)
 	}
 
 	return active;
-}
-
-struct i915_request *
-execlists_unwind_incomplete_requests(struct intel_engine_execlists *execlists)
-{
-	struct intel_engine_cs *engine =
-		container_of(execlists, typeof(*engine), execlists);
-
-	return __unwind_incomplete_requests(engine);
 }
 
 static void
@@ -2257,7 +2254,7 @@ static struct execlists_capture *capture_regs(struct intel_engine_cs *engine)
 	const gfp_t gfp = GFP_ATOMIC | __GFP_NOWARN;
 	struct execlists_capture *cap;
 
-	cap = kmalloc(sizeof(*cap), gfp);
+	cap = kmalloc_obj(*cap, gfp);
 	if (!cap)
 		return NULL;
 
@@ -2511,7 +2508,7 @@ static void execlists_irq_handler(struct intel_engine_cs *engine, u16 iir)
 			   ENGINE_READ_FW(engine, RING_EXECLIST_STATUS_HI));
 		ENGINE_TRACE(engine, "semaphore yield: %08x\n",
 			     engine->execlists.yield);
-		if (del_timer(&engine->execlists.timer))
+		if (timer_delete(&engine->execlists.timer))
 			tasklet = true;
 	}
 
@@ -3379,8 +3376,8 @@ static void execlists_set_default_submission(struct intel_engine_cs *engine)
 static void execlists_shutdown(struct intel_engine_cs *engine)
 {
 	/* Synchronise with residual timers and any softirq they raise */
-	del_timer_sync(&engine->execlists.timer);
-	del_timer_sync(&engine->execlists.preempt);
+	timer_delete_sync(&engine->execlists.timer);
+	timer_delete_sync(&engine->execlists.preempt);
 	tasklet_kill(&engine->sched_engine->tasklet);
 }
 
@@ -3937,7 +3934,7 @@ execlists_create_virtual(struct intel_engine_cs **siblings, unsigned int count,
 	unsigned int n;
 	int err;
 
-	ve = kzalloc(struct_size(ve, siblings, count), GFP_KERNEL);
+	ve = kzalloc_flex(*ve, siblings, count);
 	if (!ve)
 		return ERR_PTR(-ENOMEM);
 

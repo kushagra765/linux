@@ -344,18 +344,133 @@ hws_send_engine_update_rule_resize(struct mlx5hws_send_engine *queue,
 	}
 }
 
+static void hws_send_engine_dump_error_cqe(struct mlx5hws_send_engine *queue,
+					   struct mlx5hws_send_ring_priv *priv,
+					   struct mlx5_cqe64 *cqe)
+{
+	u8 wqe_opcode = cqe ? be32_to_cpu(cqe->sop_drop_qpn) >> 24 : 0;
+	struct mlx5hws_context *ctx = priv->rule->matcher->tbl->ctx;
+	u32 opcode = cqe ? get_cqe_opcode(cqe) : 0;
+	struct mlx5hws_rule *rule = priv->rule;
+
+	/* If something bad happens and lots of rules are failing, we don't
+	 * want to pollute dmesg. Print only the first bad cqe per engine,
+	 * the one that started the avalanche.
+	 */
+	if (queue->error_cqe_printed)
+		return;
+
+	queue->error_cqe_printed = true;
+
+	if (mlx5hws_rule_move_in_progress(rule))
+		mlx5hws_err(ctx,
+			    "--- rule 0x%08llx: error completion moving rule: phase %s, wqes left %d\n",
+			    HWS_PTR_TO_ID(rule),
+			    rule->resize_info->state ==
+			    MLX5HWS_RULE_RESIZE_STATE_WRITING ? "WRITING" :
+			    rule->resize_info->state ==
+			    MLX5HWS_RULE_RESIZE_STATE_DELETING ? "DELETING" :
+			    "UNKNOWN",
+			    rule->pending_wqes);
+	else
+		mlx5hws_err(ctx,
+			    "--- rule 0x%08llx: error completion %s (%d), wqes left %d\n",
+			    HWS_PTR_TO_ID(rule),
+			    rule->status ==
+			    MLX5HWS_RULE_STATUS_CREATING ? "CREATING" :
+			    rule->status ==
+			    MLX5HWS_RULE_STATUS_DELETING ? "DELETING" :
+			    rule->status ==
+			    MLX5HWS_RULE_STATUS_FAILING ? "FAILING" :
+			    rule->status ==
+			    MLX5HWS_RULE_STATUS_UPDATING ? "UPDATING" : "NA",
+			    rule->status,
+			    rule->pending_wqes);
+
+	mlx5hws_err(ctx, "    rule 0x%08llx: matcher 0x%llx %s\n",
+		    HWS_PTR_TO_ID(rule),
+		    HWS_PTR_TO_ID(rule->matcher),
+		    (rule->matcher->flags & MLX5HWS_MATCHER_FLAGS_ISOLATED) ?
+		    "(isolated)" : "");
+
+	if (!cqe) {
+		mlx5hws_err(ctx, "    rule 0x%08llx: no CQE\n",
+			    HWS_PTR_TO_ID(rule));
+		return;
+	}
+
+	mlx5hws_err(ctx, "    rule 0x%08llx: cqe->opcode      = %d %s\n",
+		    HWS_PTR_TO_ID(rule), opcode,
+		    opcode == MLX5_CQE_REQ ? "(MLX5_CQE_REQ)" :
+		    opcode == MLX5_CQE_REQ_ERR ? "(MLX5_CQE_REQ_ERR)" : " ");
+
+	if (opcode == MLX5_CQE_REQ_ERR) {
+		struct mlx5_err_cqe *err_cqe = (struct mlx5_err_cqe *)cqe;
+
+		mlx5hws_err(ctx,
+			    "    rule 0x%08llx:  |--- hw_error_syndrome = 0x%x\n",
+			    HWS_PTR_TO_ID(rule),
+			    err_cqe->rsvd1[16]);
+		mlx5hws_err(ctx,
+			    "    rule 0x%08llx:  |--- hw_syndrome_type = 0x%x\n",
+			    HWS_PTR_TO_ID(rule),
+			    err_cqe->rsvd1[17] >> 4);
+		mlx5hws_err(ctx,
+			    "    rule 0x%08llx:  |--- vendor_err_synd = 0x%x\n",
+			    HWS_PTR_TO_ID(rule),
+			    err_cqe->vendor_err_synd);
+		mlx5hws_err(ctx,
+			    "    rule 0x%08llx:  |--- syndrome = 0x%x\n",
+			    HWS_PTR_TO_ID(rule),
+			    err_cqe->syndrome);
+	}
+
+	mlx5hws_err(ctx,
+		    "    rule 0x%08llx: cqe->byte_cnt      = 0x%08x\n",
+		    HWS_PTR_TO_ID(rule), be32_to_cpu(cqe->byte_cnt));
+	mlx5hws_err(ctx,
+		    "    rule 0x%08llx:  |-- UPDATE STATUS = %s\n",
+		    HWS_PTR_TO_ID(rule),
+		    (be32_to_cpu(cqe->byte_cnt) & 0x80000000) ?
+		    "FAILURE" : "SUCCESS");
+	mlx5hws_err(ctx,
+		    "    rule 0x%08llx:  |------- SYNDROME = %s\n",
+		    HWS_PTR_TO_ID(rule),
+		    ((be32_to_cpu(cqe->byte_cnt) & 0x00000003) == 1) ?
+		    "SET_FLOW_FAIL" :
+		    ((be32_to_cpu(cqe->byte_cnt) & 0x00000003) == 2) ?
+		    "DISABLE_FLOW_FAIL" : "UNKNOWN");
+	mlx5hws_err(ctx,
+		    "    rule 0x%08llx: cqe->sop_drop_qpn  = 0x%08x\n",
+		    HWS_PTR_TO_ID(rule), be32_to_cpu(cqe->sop_drop_qpn));
+	mlx5hws_err(ctx,
+		    "    rule 0x%08llx:  |-send wqe opcode = 0x%02x %s\n",
+		    HWS_PTR_TO_ID(rule), wqe_opcode,
+		    wqe_opcode == MLX5HWS_WQE_OPCODE_TBL_ACCESS ?
+		    "(MLX5HWS_WQE_OPCODE_TBL_ACCESS)" : "(UNKNOWN)");
+	mlx5hws_err(ctx,
+		    "    rule 0x%08llx:  |------------ qpn = 0x%06x\n",
+		    HWS_PTR_TO_ID(rule),
+		    be32_to_cpu(cqe->sop_drop_qpn) & 0xffffff);
+}
+
 static void hws_send_engine_update_rule(struct mlx5hws_send_engine *queue,
 					struct mlx5hws_send_ring_priv *priv,
 					u16 wqe_cnt,
-					enum mlx5hws_flow_op_status *status)
+					enum mlx5hws_flow_op_status *status,
+					struct mlx5_cqe64 *cqe)
 {
 	priv->rule->pending_wqes--;
 
-	if (*status == MLX5HWS_FLOW_OP_ERROR) {
+	if (unlikely(*status == MLX5HWS_FLOW_OP_ERROR)) {
 		if (priv->retry_id) {
+			/* If there is a retry_id, then it's not an error yet,
+			 * retry to insert this rule in the collision RTC.
+			 */
 			hws_send_engine_retry_post_send(queue, priv, wqe_cnt);
 			return;
 		}
+		hws_send_engine_dump_error_cqe(queue, priv, cqe);
 		/* Some part of the rule failed */
 		priv->rule->status = MLX5HWS_RULE_STATUS_FAILING;
 		*priv->used_id = 0;
@@ -377,17 +492,25 @@ static void hws_send_engine_update_rule(struct mlx5hws_send_engine *queue,
 
 			*status = MLX5HWS_FLOW_OP_ERROR;
 		} else {
-			/* Increase the status, this only works on good flow as the enum
-			 * is arrange it away creating -> created -> deleting -> deleted
+			/* Increase the status, this only works on good flow as
+			 * the enum is arranged this way:
+			 *  - creating -> created
+			 *  - updating -> updated
+			 *  - deleting -> deleted
 			 */
 			priv->rule->status++;
 			*status = MLX5HWS_FLOW_OP_SUCCESS;
-			/* Rule was deleted now we can safely release action STEs
-			 * and clear resize info
-			 */
 			if (priv->rule->status == MLX5HWS_RULE_STATUS_DELETED) {
-				mlx5hws_rule_free_action_ste(priv->rule);
+				/* Rule was deleted, now we can safely release
+				 * action STEs and clear resize info
+				 */
+				mlx5hws_rule_free_action_ste(&priv->rule->action_ste);
 				mlx5hws_rule_clear_resize_info(priv->rule);
+			} else if (priv->rule->status == MLX5HWS_RULE_STATUS_UPDATED) {
+				/* Rule was updated, free the old action STEs */
+				mlx5hws_rule_free_action_ste(&priv->rule->old_action_ste);
+				/* Update completed - move the rule back to "created" */
+				priv->rule->status = MLX5HWS_RULE_STATUS_CREATED;
 			}
 		}
 	}
@@ -412,7 +535,8 @@ static void hws_send_engine_update(struct mlx5hws_send_engine *queue,
 
 	if (priv->user_data) {
 		if (priv->rule) {
-			hws_send_engine_update_rule(queue, priv, wqe_cnt, &status);
+			hws_send_engine_update_rule(queue, priv, wqe_cnt,
+						    &status, cqe);
 			/* Completion is provided on the last rule WQE */
 			if (priv->rule->pending_wqes)
 				return;
@@ -566,7 +690,7 @@ static int hws_send_ring_alloc_sq(struct mlx5_core_dev *mdev,
 	size_t buf_sz;
 	int err;
 
-	sq->uar_map = mdev->mlx5e_res.hw_objs.bfreg.map;
+	sq->uar_map = mdev->priv.bfreg.map;
 	sq->mdev = mdev;
 
 	param.db_numa_node = numa_node;
@@ -577,7 +701,7 @@ static int hws_send_ring_alloc_sq(struct mlx5_core_dev *mdev,
 	wq->db = &wq->db[MLX5_SND_DBR];
 
 	buf_sz = queue->num_entries * MAX_WQES_PER_RULE;
-	sq->dep_wqe = kcalloc(queue->num_entries, sizeof(*sq->dep_wqe), GFP_KERNEL);
+	sq->dep_wqe = kzalloc_objs(*sq->dep_wqe, queue->num_entries);
 	if (!sq->dep_wqe) {
 		err = -ENOMEM;
 		goto destroy_wq_cyc;
@@ -633,13 +757,14 @@ static int hws_send_ring_create_sq(struct mlx5_core_dev *mdev, u32 pdn,
 
 	MLX5_SET(sqc, sqc, state, MLX5_SQC_STATE_RST);
 	MLX5_SET(sqc, sqc, flush_in_error_en, 1);
+	MLX5_SET(sqc, sqc, non_wire, 1);
 
 	ts_format = mlx5_is_real_time_sq(mdev) ? MLX5_TIMESTAMP_FORMAT_REAL_TIME :
 						 MLX5_TIMESTAMP_FORMAT_FREE_RUNNING;
 	MLX5_SET(sqc, sqc, ts_format, ts_format);
 
 	MLX5_SET(wq, wq, wq_type, MLX5_WQ_TYPE_CYCLIC);
-	MLX5_SET(wq, wq, uar_page, mdev->mlx5e_res.hw_objs.bfreg.index);
+	MLX5_SET(wq, wq, uar_page, mdev->priv.bfreg.index);
 	MLX5_SET(wq, wq, log_wq_pg_sz, sq->wq_ctrl.buf.page_shift - MLX5_ADAPTER_PAGE_SHIFT);
 	MLX5_SET64(wq, wq, dbr_addr, sq->wq_ctrl.db.dma);
 
@@ -748,12 +873,6 @@ err_free_sqc:
 	return err;
 }
 
-static void hws_cq_complete(struct mlx5_core_cq *mcq,
-			    struct mlx5_eqe *eqe)
-{
-	pr_err("CQ completion CQ: #%u\n", mcq->cqn);
-}
-
 static int hws_send_ring_alloc_cq(struct mlx5_core_dev *mdev,
 				  int numa_node,
 				  struct mlx5hws_send_engine *queue,
@@ -776,7 +895,6 @@ static int hws_send_ring_alloc_cq(struct mlx5_core_dev *mdev,
 	mcq->cqe_sz = 64;
 	mcq->set_ci_db = cq->wq_ctrl.db.db;
 	mcq->arm_db = cq->wq_ctrl.db.db + 1;
-	mcq->comp = hws_cq_complete;
 
 	for (i = 0; i < mlx5_cqwq_get_size(&cq->wq); i++) {
 		cqe = mlx5_cqwq_get_wqe(&cq->wq, i);
@@ -815,7 +933,7 @@ static int hws_send_ring_create_cq(struct mlx5_core_dev *mdev,
 				  (__be64 *)MLX5_ADDR_OF(create_cq_in, in, pas));
 
 	MLX5_SET(cqc, cqc, c_eqn_or_apu_element, eqn);
-	MLX5_SET(cqc, cqc, uar_page, mdev->priv.uar->index);
+	MLX5_SET(cqc, cqc, uar_page, mdev->priv.bfreg.up->index);
 	MLX5_SET(cqc, cqc, log_page_size, cq->wq_ctrl.buf.page_shift - MLX5_ADAPTER_PAGE_SHIFT);
 	MLX5_SET64(cqc, cqc, dbr_addr, cq->wq_ctrl.db.dma);
 
@@ -838,8 +956,7 @@ static int hws_send_ring_open_cq(struct mlx5_core_dev *mdev,
 	if (!cqc_data)
 		return -ENOMEM;
 
-	MLX5_SET(cqc, cqc_data, uar_page, mdev->priv.uar->index);
-	MLX5_SET(cqc, cqc_data, cqe_sz, queue->num_entries);
+	MLX5_SET(cqc, cqc_data, uar_page, mdev->priv.bfreg.up->index);
 	MLX5_SET(cqc, cqc_data, log_cq_size, ilog2(queue->num_entries));
 
 	err = hws_send_ring_alloc_cq(mdev, numa_node, queue, cqc_data, cq);
@@ -896,15 +1013,18 @@ close_cq:
 	return err;
 }
 
-void mlx5hws_send_queue_close(struct mlx5hws_send_engine *queue)
+static void mlx5hws_send_queue_close(struct mlx5hws_send_engine *queue)
 {
+	if (!queue->num_entries)
+		return; /* this queue wasn't initialized */
+
 	hws_send_ring_close(queue);
 	kfree(queue->completed.entries);
 }
 
-int mlx5hws_send_queue_open(struct mlx5hws_context *ctx,
-			    struct mlx5hws_send_engine *queue,
-			    u16 queue_size)
+static int mlx5hws_send_queue_open(struct mlx5hws_context *ctx,
+				   struct mlx5hws_send_engine *queue,
+				   u16 queue_size)
 {
 	int err;
 
@@ -913,9 +1033,8 @@ int mlx5hws_send_queue_open(struct mlx5hws_context *ctx,
 	queue->num_entries = roundup_pow_of_two(queue_size);
 	queue->used_entries = 0;
 
-	queue->completed.entries = kcalloc(queue->num_entries,
-					   sizeof(queue->completed.entries[0]),
-					   GFP_KERNEL);
+	queue->completed.entries = kzalloc_objs(queue->completed.entries[0],
+						queue->num_entries);
 	if (!queue->completed.entries)
 		return -ENOMEM;
 
@@ -974,16 +1093,14 @@ static int hws_bwc_send_queues_init(struct mlx5hws_context *ctx)
 
 	ctx->queues += bwc_queues;
 
-	ctx->bwc_send_queue_locks = kcalloc(bwc_queues,
-					    sizeof(*ctx->bwc_send_queue_locks),
-					    GFP_KERNEL);
+	ctx->bwc_send_queue_locks = kzalloc_objs(*ctx->bwc_send_queue_locks,
+						 bwc_queues);
 
 	if (!ctx->bwc_send_queue_locks)
 		return -ENOMEM;
 
-	ctx->bwc_lock_class_keys = kcalloc(bwc_queues,
-					   sizeof(*ctx->bwc_lock_class_keys),
-					   GFP_KERNEL);
+	ctx->bwc_lock_class_keys = kzalloc_objs(*ctx->bwc_lock_class_keys,
+						bwc_queues);
 	if (!ctx->bwc_lock_class_keys)
 		goto err_lock_class_keys;
 
@@ -1005,7 +1122,7 @@ int mlx5hws_send_queues_open(struct mlx5hws_context *ctx,
 			     u16 queue_size)
 {
 	int err = 0;
-	u32 i;
+	int i = 0;
 
 	/* Open one extra queue for control path */
 	ctx->queues = queues + 1;
@@ -1015,13 +1132,19 @@ int mlx5hws_send_queues_open(struct mlx5hws_context *ctx,
 	if (err)
 		return err;
 
-	ctx->send_queue = kcalloc(ctx->queues, sizeof(*ctx->send_queue), GFP_KERNEL);
+	ctx->send_queue = kzalloc_objs(*ctx->send_queue, ctx->queues);
 	if (!ctx->send_queue) {
 		err = -ENOMEM;
 		goto free_bwc_locks;
 	}
 
-	for (i = 0; i < ctx->queues; i++) {
+	/* If native API isn't supported, skip the unused native queues:
+	 * initialize BWC queues and control queue only.
+	 */
+	if (!mlx5hws_context_native_supported(ctx))
+		i = mlx5hws_bwc_get_queue_id(ctx, 0);
+
+	for (; i < ctx->queues; i++) {
 		err = mlx5hws_send_queue_open(ctx, &ctx->send_queue[i], queue_size);
 		if (err)
 			goto close_send_queues;

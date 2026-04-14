@@ -14,12 +14,14 @@
 #include <netinet/in.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <linux/keyctl.h>
 #include <sys/un.h>
 #include <bpf/btf.h>
 #include <time.h>
 #include "json_writer.h"
 
 #include "network_helpers.h"
+#include "verification_cert.h"
 
 /* backtrace() and backtrace_symbols_fd() are glibc specific,
  * use header file when glibc is available and provide stub
@@ -88,27 +90,7 @@ static void stdio_hijack(char **log_buf, size_t *log_cnt)
 #endif
 }
 
-static void stdio_restore_cleanup(void)
-{
-#ifdef __GLIBC__
-	if (verbose() && env.worker_id == -1) {
-		/* nothing to do, output to stdout by default */
-		return;
-	}
-
-	fflush(stdout);
-
-	if (env.subtest_state) {
-		fclose(env.subtest_state->stdout_saved);
-		env.subtest_state->stdout_saved = NULL;
-		stdout = env.test_state->stdout_saved;
-		stderr = env.test_state->stdout_saved;
-	} else {
-		fclose(env.test_state->stdout_saved);
-		env.test_state->stdout_saved = NULL;
-	}
-#endif
-}
+static pthread_mutex_t stdout_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void stdio_restore(void)
 {
@@ -118,14 +100,35 @@ static void stdio_restore(void)
 		return;
 	}
 
-	if (stdout == env.stdout_saved)
-		return;
+	fflush(stdout);
 
-	stdio_restore_cleanup();
+	pthread_mutex_lock(&stdout_lock);
 
-	stdout = env.stdout_saved;
-	stderr = env.stderr_saved;
+	if (env.subtest_state) {
+		if (env.subtest_state->stdout_saved)
+			fclose(env.subtest_state->stdout_saved);
+		env.subtest_state->stdout_saved = NULL;
+		stdout = env.test_state->stdout_saved;
+		stderr = env.test_state->stdout_saved;
+	} else {
+		if (env.test_state->stdout_saved)
+			fclose(env.test_state->stdout_saved);
+		env.test_state->stdout_saved = NULL;
+		stdout = env.stdout_saved;
+		stderr = env.stderr_saved;
+	}
+
+	pthread_mutex_unlock(&stdout_lock);
 #endif
+}
+
+static int traffic_monitor_print_fn(const char *format, va_list args)
+{
+	pthread_mutex_lock(&stdout_lock);
+	vfprintf(stdout, format, args);
+	pthread_mutex_unlock(&stdout_lock);
+
+	return 0;
 }
 
 /* Adapted from perf/util/string.c */
@@ -474,8 +477,6 @@ static void dump_test_log(const struct prog_test_def *test,
 	print_test_result(test, test_state);
 }
 
-static void stdio_restore(void);
-
 /* A bunch of tests set custom affinity per-thread and/or per-process. Reset
  * it after each test/sub-test.
  */
@@ -490,13 +491,11 @@ static void reset_affinity(void)
 
 	err = sched_setaffinity(0, sizeof(cpuset), &cpuset);
 	if (err < 0) {
-		stdio_restore();
 		fprintf(stderr, "Failed to reset process affinity: %d!\n", err);
 		exit(EXIT_ERR_SETUP_INFRA);
 	}
 	err = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
 	if (err < 0) {
-		stdio_restore();
 		fprintf(stderr, "Failed to reset thread affinity: %d!\n", err);
 		exit(EXIT_ERR_SETUP_INFRA);
 	}
@@ -514,7 +513,6 @@ static void save_netns(void)
 static void restore_netns(void)
 {
 	if (setns(env.saved_netns_fd, CLONE_NEWNET) == -1) {
-		stdio_restore();
 		perror("setns(CLONE_NEWNS)");
 		exit(EXIT_ERR_SETUP_INFRA);
 	}
@@ -541,7 +539,8 @@ void test__end_subtest(void)
 				   test_result(subtest_state->error_cnt,
 					       subtest_state->skipped));
 
-	stdio_restore_cleanup();
+	stdio_restore();
+
 	env.subtest_state = NULL;
 }
 
@@ -1262,7 +1261,20 @@ int get_bpf_max_tramp_links(void)
 	return ret;
 }
 
+static void dump_crash_log(void)
+{
+	fflush(stdout);
+	stdout = env.stdout_saved;
+	stderr = env.stderr_saved;
+
+	if (env.test) {
+		env.test_state->error_cnt++;
+		dump_test_log(env.test, env.test_state, true, false, NULL);
+	}
+}
+
 #define MAX_BACKTRACE_SZ 128
+
 void crash_handler(int signum)
 {
 	void *bt[MAX_BACKTRACE_SZ];
@@ -1270,16 +1282,34 @@ void crash_handler(int signum)
 
 	sz = backtrace(bt, ARRAY_SIZE(bt));
 
-	if (env.stdout_saved)
-		stdio_restore();
-	if (env.test) {
-		env.test_state->error_cnt++;
-		dump_test_log(env.test, env.test_state, true, false, NULL);
-	}
+	dump_crash_log();
+
 	if (env.worker_id != -1)
 		fprintf(stderr, "[%d]: ", env.worker_id);
 	fprintf(stderr, "Caught signal #%d!\nStack trace:\n", signum);
 	backtrace_symbols_fd(bt, sz, STDERR_FILENO);
+}
+
+#ifdef __SANITIZE_ADDRESS__
+void __asan_on_error(void)
+{
+	dump_crash_log();
+}
+#endif
+
+void hexdump(const char *prefix, const void *buf, size_t len)
+{
+	for (int i = 0; i < len; i++) {
+		if (!(i % 16)) {
+			if (i)
+				fprintf(stdout, "\n");
+			fprintf(stdout, "%s", prefix);
+		}
+		if (i && !(i % 8) && (i % 16))
+			fprintf(stdout, "\t");
+		fprintf(stdout, "%02X ", ((uint8_t *)(buf))[i]);
+	}
+	fprintf(stdout, "\n");
 }
 
 static void sigint_handler(int signum)
@@ -1350,10 +1380,19 @@ static int recv_message(int sock, struct msg *msg)
 	return ret;
 }
 
+static bool ns_is_needed(const char *test_name)
+{
+	if (strlen(test_name) < 3)
+		return false;
+
+	return !strncmp(test_name, "ns_", 3);
+}
+
 static void run_one_test(int test_num)
 {
 	struct prog_test_def *test = &prog_test_defs[test_num];
 	struct test_state *state = &test_states[test_num];
+	struct netns_obj *ns = NULL;
 
 	env.test = test;
 	env.test_state = state;
@@ -1361,10 +1400,13 @@ static void run_one_test(int test_num)
 	stdio_hijack(&state->log_buf, &state->log_cnt);
 
 	watchdog_start();
+	if (ns_is_needed(test->test_name))
+		ns = netns_new(test->test_name, true);
 	if (test->run_test)
 		test->run_test();
 	else if (test->run_serial_test)
 		test->run_serial_test();
+	netns_free(ns);
 	watchdog_stop();
 
 	/* ensure last sub-test is finalized properly */
@@ -1372,6 +1414,8 @@ static void run_one_test(int test_num)
 		test__end_subtest();
 
 	state->tested = true;
+
+	stdio_restore();
 
 	if (verbose() && env.worker_id == -1)
 		print_test_result(test, state);
@@ -1381,7 +1425,6 @@ static void run_one_test(int test_num)
 	if (test->need_cgroup_cleanup)
 		cleanup_cgroup_environment();
 
-	stdio_restore();
 	free(stop_libbpf_log_capture());
 
 	dump_test_log(test, state, false, false, NULL);
@@ -1770,7 +1813,7 @@ static int worker_main_send_subtests(int sock, struct test_state *state)
 
 		msg.subtest_done.num = i;
 
-		strncpy(msg.subtest_done.name, subtest_state->name, MAX_SUBTEST_NAME);
+		strscpy(msg.subtest_done.name, subtest_state->name, MAX_SUBTEST_NAME);
 
 		msg.subtest_done.error_cnt = subtest_state->error_cnt;
 		msg.subtest_done.skipped = subtest_state->skipped;
@@ -1901,6 +1944,13 @@ static void free_test_states(void)
 	}
 }
 
+static __u32 register_session_key(const char *key_data, size_t key_data_size)
+{
+	return syscall(__NR_add_key, "asymmetric", "libbpf_session_key",
+			(const void *)key_data, key_data_size,
+			KEY_SPEC_SESSION_KEYRING);
+}
+
 int main(int argc, char **argv)
 {
 	static const struct argp argp = {
@@ -1908,13 +1958,18 @@ int main(int argc, char **argv)
 		.parser = parse_arg,
 		.doc = argp_program_doc,
 	};
+	int err, i;
+
+#ifndef __SANITIZE_ADDRESS__
 	struct sigaction sigact = {
 		.sa_handler = crash_handler,
 		.sa_flags = SA_RESETHAND,
-		};
-	int err, i;
-
+	};
 	sigaction(SIGSEGV, &sigact, NULL);
+#endif
+
+	env.stdout_saved = stdout;
+	env.stderr_saved = stderr;
 
 	env.secs_till_notify = 10;
 	env.secs_till_kill = 120;
@@ -1931,6 +1986,12 @@ int main(int argc, char **argv)
 	/* Use libbpf 1.0 API mode */
 	libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 	libbpf_set_print(libbpf_print_fn);
+	err = register_session_key((const char *)test_progs_verification_cert,
+				   test_progs_verification_cert_len);
+	if (err < 0)
+		return err;
+
+	traffic_monitor_set_print(traffic_monitor_print_fn);
 
 	srand(time(NULL));
 
@@ -1941,9 +2002,6 @@ int main(int argc, char **argv)
 			env.nr_cpus);
 		return -1;
 	}
-
-	env.stdout_saved = stdout;
-	env.stderr_saved = stderr;
 
 	env.has_testmod = true;
 	if (!env.list_test_names) {

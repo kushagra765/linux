@@ -10,8 +10,7 @@
  *    Bugreports to: <Linux390@de.ibm.com>
  */
 
-#define KMSG_COMPONENT "s390dbf"
-#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
+#define pr_fmt(fmt) "s390dbf: " fmt
 
 #include <linux/stddef.h>
 #include <linux/kernel.h>
@@ -24,6 +23,7 @@
 #include <linux/export.h>
 #include <linux/init.h>
 #include <linux/fs.h>
+#include <linux/math.h>
 #include <linux/minmax.h>
 #include <linux/debugfs.h>
 
@@ -94,9 +94,6 @@ static int debug_input_flush_fn(debug_info_t *id, struct debug_view *view,
 static int debug_hex_ascii_format_fn(debug_info_t *id, struct debug_view *view,
 				     char *out_buf, size_t out_buf_size,
 				     const char *in_buf);
-static int debug_sprintf_format_fn(debug_info_t *id, struct debug_view *view,
-				   char *out_buf, size_t out_buf_size,
-				   const char *inbuf);
 static void debug_areas_swap(debug_info_t *a, debug_info_t *b);
 static void debug_events_append(debug_info_t *dest, debug_info_t *src);
 
@@ -184,14 +181,13 @@ static debug_entry_t ***debug_areas_alloc(int pages_per_area, int nr_areas)
 	debug_entry_t ***areas;
 	int i, j;
 
-	areas = kmalloc_array(nr_areas, sizeof(debug_entry_t **), GFP_KERNEL);
+	areas = kmalloc_objs(debug_entry_t **, nr_areas);
 	if (!areas)
 		goto fail_malloc_areas;
 	for (i = 0; i < nr_areas; i++) {
 		/* GFP_NOWARN to avoid user triggerable WARN, we handle fails */
-		areas[i] = kmalloc_array(pages_per_area,
-					 sizeof(debug_entry_t *),
-					 GFP_KERNEL | __GFP_NOWARN);
+		areas[i] = kmalloc_objs(debug_entry_t *, pages_per_area,
+					GFP_KERNEL | __GFP_NOWARN);
 		if (!areas[i])
 			goto fail_malloc_areas2;
 		for (j = 0; j < pages_per_area; j++) {
@@ -228,13 +224,13 @@ static debug_info_t *debug_info_alloc(const char *name, int pages_per_area,
 	debug_info_t *rc;
 
 	/* alloc everything */
-	rc = kmalloc(sizeof(debug_info_t), GFP_KERNEL);
+	rc = kmalloc_obj(debug_info_t);
 	if (!rc)
 		goto fail_malloc_rc;
-	rc->active_entries = kcalloc(nr_areas, sizeof(int), GFP_KERNEL);
+	rc->active_entries = kzalloc_objs(int, nr_areas);
 	if (!rc->active_entries)
 		goto fail_malloc_active_entries;
-	rc->active_pages = kcalloc(nr_areas, sizeof(int), GFP_KERNEL);
+	rc->active_pages = kzalloc_objs(int, nr_areas);
 	if (!rc->active_pages)
 		goto fail_malloc_active_pages;
 	if ((mode == ALL_AREAS) && (pages_per_area != 0)) {
@@ -246,14 +242,14 @@ static debug_info_t *debug_info_alloc(const char *name, int pages_per_area,
 	}
 
 	/* initialize members */
-	spin_lock_init(&rc->lock);
+	raw_spin_lock_init(&rc->lock);
 	rc->pages_per_area = pages_per_area;
 	rc->nr_areas	   = nr_areas;
 	rc->active_area    = 0;
 	rc->level	   = level;
 	rc->buf_size	   = buf_size;
 	rc->entry_size	   = sizeof(debug_entry_t) + buf_size;
-	strscpy(rc->name, name, sizeof(rc->name));
+	strscpy(rc->name, name);
 	memset(rc->views, 0, DEBUG_MAX_VIEWS * sizeof(struct debug_view *));
 	memset(rc->debugfs_entries, 0, DEBUG_MAX_VIEWS * sizeof(struct dentry *));
 	refcount_set(&(rc->ref_count), 0);
@@ -336,7 +332,7 @@ static debug_info_t *debug_info_copy(debug_info_t *in, int mode)
 	do {
 		rc = debug_info_alloc(in->name, in->pages_per_area,
 			in->nr_areas, in->buf_size, in->level, mode);
-		spin_lock_irqsave(&in->lock, flags);
+		raw_spin_lock_irqsave(&in->lock, flags);
 		if (!rc)
 			goto out;
 		/* has something changed in the meantime ? */
@@ -344,7 +340,7 @@ static debug_info_t *debug_info_copy(debug_info_t *in, int mode)
 		    (rc->nr_areas == in->nr_areas)) {
 			break;
 		}
-		spin_unlock_irqrestore(&in->lock, flags);
+		raw_spin_unlock_irqrestore(&in->lock, flags);
 		debug_info_free(rc);
 	} while (1);
 
@@ -354,9 +350,12 @@ static debug_info_t *debug_info_copy(debug_info_t *in, int mode)
 	for (i = 0; i < in->nr_areas; i++) {
 		for (j = 0; j < in->pages_per_area; j++)
 			memcpy(rc->areas[i][j], in->areas[i][j], PAGE_SIZE);
+		rc->active_pages[i] = in->active_pages[i];
+		rc->active_entries[i] = in->active_entries[i];
 	}
+	rc->active_area = in->active_area;
 out:
-	spin_unlock_irqrestore(&in->lock, flags);
+	raw_spin_unlock_irqrestore(&in->lock, flags);
 	return rc;
 }
 
@@ -422,11 +421,17 @@ out:
 	return len;
 }
 
-/*
- * debug_next_entry:
- * - goto next entry in p_info
+/**
+ * debug_next_entry - Go to the next entry
+ * @p_info:	Private info that is manipulated
+ *
+ * Sets the current position in @p_info to the next entry. If no further entry
+ * exists the current position is set to one after the end the return value
+ * indicates that no further entries exist.
+ *
+ * Return: True if there are more following entries, false otherwise
  */
-static inline int debug_next_entry(file_private_info_t *p_info)
+static inline bool debug_next_entry(file_private_info_t *p_info)
 {
 	debug_info_t *id;
 
@@ -434,10 +439,10 @@ static inline int debug_next_entry(file_private_info_t *p_info)
 	if (p_info->act_entry == DEBUG_PROLOG_ENTRY) {
 		p_info->act_entry = 0;
 		p_info->act_page  = 0;
-		goto out;
+		return true;
 	}
 	if (!id->areas)
-		return 1;
+		return false;
 	p_info->act_entry += id->entry_size;
 	/* switch to next page, if we reached the end of the page  */
 	if (p_info->act_entry > (PAGE_SIZE - id->entry_size)) {
@@ -450,10 +455,87 @@ static inline int debug_next_entry(file_private_info_t *p_info)
 			p_info->act_page = 0;
 		}
 		if (p_info->act_area >= id->nr_areas)
-			return 1;
+			return false;
 	}
-out:
-	return 0;
+	return true;
+}
+
+/**
+ * debug_to_act_entry - Go to the currently active entry
+ * @p_info:	Private info that is manipulated
+ *
+ * Sets the current position in @p_info to the currently active
+ * entry of @p_info->debug_info_snap
+ */
+static void debug_to_act_entry(file_private_info_t *p_info)
+{
+	debug_info_t *snap_id;
+
+	snap_id = p_info->debug_info_snap;
+	p_info->act_area = snap_id->active_area;
+	p_info->act_page = snap_id->active_pages[snap_id->active_area];
+	p_info->act_entry = snap_id->active_entries[snap_id->active_area];
+}
+
+/**
+ * debug_prev_entry - Go to the previous entry
+ * @p_info:	Private info that is manipulated
+ *
+ * Sets the current position in @p_info to the previous entry. If no previous entry
+ * exists the current position is set left as DEBUG_PROLOG_ENTRY and the return value
+ * indicates that no previous entries exist.
+ *
+ * Return: True if there are more previous entries, false otherwise
+ */
+
+static inline bool debug_prev_entry(file_private_info_t *p_info)
+{
+	debug_info_t *id;
+
+	id = p_info->debug_info_snap;
+	if (p_info->act_entry == DEBUG_PROLOG_ENTRY)
+		debug_to_act_entry(p_info);
+	if (!id->areas)
+		return false;
+	p_info->act_entry -= id->entry_size;
+	/* switch to prev page, if we reached the beginning of the page  */
+	if (p_info->act_entry < 0) {
+		/* end of previous page */
+		p_info->act_entry = rounddown(PAGE_SIZE, id->entry_size) - id->entry_size;
+		p_info->act_page--;
+		if (p_info->act_page < 0) {
+			/* previous area */
+			p_info->act_area--;
+			p_info->act_page = id->pages_per_area - 1;
+		}
+		if (p_info->act_area < 0)
+			p_info->act_area = (id->nr_areas - 1) % id->nr_areas;
+	}
+	/* check full circle */
+	if (id->active_area == p_info->act_area &&
+	    id->active_pages[id->active_area] == p_info->act_page &&
+	    id->active_entries[id->active_area] == p_info->act_entry)
+		return false;
+	return true;
+}
+
+/**
+ * debug_move_entry - Go to next entry in either the forward or backward direction
+ * @p_info:	Private info that is manipulated
+ * @reverse:	If true go to the next entry in reverse i.e. previous
+ *
+ * Sets the current position in @p_info to the next (@reverse == false) or
+ * previous (@reverse == true) entry.
+ *
+ * Return: True if there are further entries in that direction,
+ * false otherwise.
+ */
+static bool debug_move_entry(file_private_info_t *p_info, bool reverse)
+{
+	if (reverse)
+		return debug_prev_entry(p_info);
+	else
+		return debug_next_entry(p_info);
 }
 
 /*
@@ -495,7 +577,7 @@ static ssize_t debug_output(struct file *file,		/* file descriptor */
 		}
 		if (copy_size == formatted_line_residue) {
 			entry_offset = 0;
-			if (debug_next_entry(p_info))
+			if (!debug_next_entry(p_info))
 				goto out;
 		}
 	}
@@ -530,6 +612,42 @@ static ssize_t debug_input(struct file *file, const char __user *user_buf,
 	return rc; /* number of input characters */
 }
 
+static file_private_info_t *debug_file_private_alloc(debug_info_t *debug_info,
+						     struct debug_view *view)
+{
+	debug_info_t *debug_info_snapshot;
+	file_private_info_t *p_info;
+
+	/*
+	 * Make snapshot of current debug areas to get it consistent.
+	 * To copy all the areas is only needed, if we have a view which
+	 * formats the debug areas.
+	 */
+	if (!view->format_proc && !view->header_proc)
+		debug_info_snapshot = debug_info_copy(debug_info, NO_AREAS);
+	else
+		debug_info_snapshot = debug_info_copy(debug_info, ALL_AREAS);
+
+	if (!debug_info_snapshot)
+		return NULL;
+	p_info = kmalloc_obj(file_private_info_t);
+	if (!p_info) {
+		debug_info_free(debug_info_snapshot);
+		return NULL;
+	}
+	p_info->offset = 0;
+	p_info->debug_info_snap = debug_info_snapshot;
+	p_info->debug_info_org	= debug_info;
+	p_info->view = view;
+	p_info->act_area = 0;
+	p_info->act_page = 0;
+	p_info->act_entry = DEBUG_PROLOG_ENTRY;
+	p_info->act_entry_offset = 0;
+	debug_info_get(debug_info);
+
+	return p_info;
+}
+
 /*
  * debug_open:
  * - called for user open()
@@ -538,7 +656,7 @@ static ssize_t debug_input(struct file *file, const char __user *user_buf,
  */
 static int debug_open(struct inode *inode, struct file *file)
 {
-	debug_info_t *debug_info, *debug_info_snapshot;
+	debug_info_t *debug_info;
 	file_private_info_t *p_info;
 	int i, rc = 0;
 
@@ -556,40 +674,24 @@ static int debug_open(struct inode *inode, struct file *file)
 	goto out;
 
 found:
-
-	/* Make snapshot of current debug areas to get it consistent.	  */
-	/* To copy all the areas is only needed, if we have a view which  */
-	/* formats the debug areas. */
-
-	if (!debug_info->views[i]->format_proc && !debug_info->views[i]->header_proc)
-		debug_info_snapshot = debug_info_copy(debug_info, NO_AREAS);
-	else
-		debug_info_snapshot = debug_info_copy(debug_info, ALL_AREAS);
-
-	if (!debug_info_snapshot) {
-		rc = -ENOMEM;
-		goto out;
-	}
-	p_info = kmalloc(sizeof(file_private_info_t), GFP_KERNEL);
+	p_info = debug_file_private_alloc(debug_info, debug_info->views[i]);
 	if (!p_info) {
-		debug_info_free(debug_info_snapshot);
 		rc = -ENOMEM;
 		goto out;
 	}
-	p_info->offset = 0;
-	p_info->debug_info_snap = debug_info_snapshot;
-	p_info->debug_info_org	= debug_info;
-	p_info->view = debug_info->views[i];
-	p_info->act_area = 0;
-	p_info->act_page = 0;
-	p_info->act_entry = DEBUG_PROLOG_ENTRY;
-	p_info->act_entry_offset = 0;
 	file->private_data = p_info;
-	debug_info_get(debug_info);
 	nonseekable_open(inode, file);
 out:
 	mutex_unlock(&debug_mutex);
 	return rc;
+}
+
+static void debug_file_private_free(file_private_info_t *p_info)
+{
+	if (p_info->debug_info_snap)
+		debug_info_free(p_info->debug_info_snap);
+	debug_info_put(p_info->debug_info_org);
+	kfree(p_info);
 }
 
 /*
@@ -602,11 +704,57 @@ static int debug_close(struct inode *inode, struct file *file)
 	file_private_info_t *p_info;
 
 	p_info = (file_private_info_t *) file->private_data;
-	if (p_info->debug_info_snap)
-		debug_info_free(p_info->debug_info_snap);
-	debug_info_put(p_info->debug_info_org);
-	kfree(file->private_data);
+	debug_file_private_free(p_info);
+	file->private_data = NULL;
 	return 0; /* success */
+}
+
+/**
+ * debug_dump - Get a textual representation of debug info, or as much as fits
+ * @id:		Debug information to use
+ * @view:	View with which to dump the debug information
+ * @buf:	Buffer the textual debug data representation is written to
+ * @buf_size:	Size of the buffer, including the trailing '\0' byte
+ * @reverse:	Go backwards from the last written entry
+ *
+ * This function may be used whenever a textual representation of the debug
+ * information is required without using an s390dbf file.
+ *
+ * Note: It is the callers responsibility to supply a view that is compatible
+ * with the debug information data.
+ *
+ * Return: On success returns the number of bytes written to the buffer not
+ * including the trailing '\0' byte. If bug_size == 0 the function returns 0.
+ * On failure an error code less than 0 is returned.
+ */
+ssize_t debug_dump(debug_info_t *id, struct debug_view *view,
+		   char *buf, size_t buf_size, bool reverse)
+{
+	file_private_info_t *p_info;
+	size_t size, offset = 0;
+
+	/* Need space for '\0' byte */
+	if (buf_size < 1)
+		return 0;
+	buf_size--;
+
+	p_info = debug_file_private_alloc(id, view);
+	if (!p_info)
+		return -ENOMEM;
+
+	/* There is always at least the DEBUG_PROLOG_ENTRY */
+	do {
+		size = debug_format_entry(p_info);
+		size = min(size, buf_size - offset);
+		memcpy(buf + offset, p_info->temp_buf, size);
+		offset += size;
+		if (offset >= buf_size)
+			break;
+	} while (debug_move_entry(p_info, reverse));
+	debug_file_private_free(p_info);
+	buf[offset] = '\0';
+
+	return offset;
 }
 
 /* Create debugfs entries and add to internal list. */
@@ -730,20 +878,20 @@ void debug_register_static(debug_info_t *id, int pages_per_area, int nr_areas)
 		pr_err("Registering debug feature %s failed\n", id->name);
 
 		/* Clear pointers to prevent tracing into released initdata. */
-		spin_lock_irqsave(&id->lock, flags);
+		raw_spin_lock_irqsave(&id->lock, flags);
 		id->areas = NULL;
 		id->active_pages = NULL;
 		id->active_entries = NULL;
-		spin_unlock_irqrestore(&id->lock, flags);
+		raw_spin_unlock_irqrestore(&id->lock, flags);
 
 		return;
 	}
 
 	/* Replace static trace area with dynamic copy. */
-	spin_lock_irqsave(&id->lock, flags);
+	raw_spin_lock_irqsave(&id->lock, flags);
 	debug_events_append(copy, id);
 	debug_areas_swap(id, copy);
-	spin_unlock_irqrestore(&id->lock, flags);
+	raw_spin_unlock_irqrestore(&id->lock, flags);
 
 	/* Clear pointers to initdata and discard copy. */
 	copy->areas = NULL;
@@ -817,11 +965,11 @@ static int debug_set_size(debug_info_t *id, int nr_areas, int pages_per_area)
 		return -ENOMEM;
 	}
 
-	spin_lock_irqsave(&id->lock, flags);
+	raw_spin_lock_irqsave(&id->lock, flags);
 	debug_events_append(new_id, id);
 	debug_areas_swap(new_id, id);
+	raw_spin_unlock_irqrestore(&id->lock, flags);
 	debug_info_free(new_id);
-	spin_unlock_irqrestore(&id->lock, flags);
 	pr_info("%s: set new size (%i pages)\n", id->name, pages_per_area);
 
 	return 0;
@@ -851,9 +999,9 @@ void debug_set_level(debug_info_t *id, int new_level)
 		return;
 	}
 
-	spin_lock_irqsave(&id->lock, flags);
+	raw_spin_lock_irqsave(&id->lock, flags);
 	id->level = new_level;
-	spin_unlock_irqrestore(&id->lock, flags);
+	raw_spin_unlock_irqrestore(&id->lock, flags);
 }
 EXPORT_SYMBOL(debug_set_level);
 
@@ -972,7 +1120,7 @@ static int s390dbf_procactive(const struct ctl_table *table, int write,
 		return 0;
 }
 
-static struct ctl_table s390dbf_table[] = {
+static const struct ctl_table s390dbf_table[] = {
 	{
 		.procname	= "debug_stoppable",
 		.data		= &debug_stoppable,
@@ -1035,10 +1183,10 @@ debug_entry_t *debug_event_common(debug_info_t *id, int level, const void *buf,
 	if (!debug_active || !id->areas)
 		return NULL;
 	if (debug_critical) {
-		if (!spin_trylock_irqsave(&id->lock, flags))
+		if (!raw_spin_trylock_irqsave(&id->lock, flags))
 			return NULL;
 	} else {
-		spin_lock_irqsave(&id->lock, flags);
+		raw_spin_lock_irqsave(&id->lock, flags);
 	}
 	do {
 		active = get_active_entry(id);
@@ -1050,7 +1198,7 @@ debug_entry_t *debug_event_common(debug_info_t *id, int level, const void *buf,
 		buf += id->buf_size;
 	} while (len > 0);
 
-	spin_unlock_irqrestore(&id->lock, flags);
+	raw_spin_unlock_irqrestore(&id->lock, flags);
 	return active;
 }
 EXPORT_SYMBOL(debug_event_common);
@@ -1068,10 +1216,10 @@ debug_entry_t *debug_exception_common(debug_info_t *id, int level,
 	if (!debug_active || !id->areas)
 		return NULL;
 	if (debug_critical) {
-		if (!spin_trylock_irqsave(&id->lock, flags))
+		if (!raw_spin_trylock_irqsave(&id->lock, flags))
 			return NULL;
 	} else {
-		spin_lock_irqsave(&id->lock, flags);
+		raw_spin_lock_irqsave(&id->lock, flags);
 	}
 	do {
 		active = get_active_entry(id);
@@ -1083,7 +1231,7 @@ debug_entry_t *debug_exception_common(debug_info_t *id, int level,
 		buf += id->buf_size;
 	} while (len > 0);
 
-	spin_unlock_irqrestore(&id->lock, flags);
+	raw_spin_unlock_irqrestore(&id->lock, flags);
 	return active;
 }
 EXPORT_SYMBOL(debug_exception_common);
@@ -1118,10 +1266,10 @@ debug_entry_t *__debug_sprintf_event(debug_info_t *id, int level, char *string, 
 	numargs = debug_count_numargs(string);
 
 	if (debug_critical) {
-		if (!spin_trylock_irqsave(&id->lock, flags))
+		if (!raw_spin_trylock_irqsave(&id->lock, flags))
 			return NULL;
 	} else {
-		spin_lock_irqsave(&id->lock, flags);
+		raw_spin_lock_irqsave(&id->lock, flags);
 	}
 	active = get_active_entry(id);
 	curr_event = (debug_sprintf_entry_t *) DEBUG_DATA(active);
@@ -1131,7 +1279,7 @@ debug_entry_t *__debug_sprintf_event(debug_info_t *id, int level, char *string, 
 		curr_event->args[idx] = va_arg(ap, long);
 	va_end(ap);
 	debug_finish_entry(id, active, level, 0);
-	spin_unlock_irqrestore(&id->lock, flags);
+	raw_spin_unlock_irqrestore(&id->lock, flags);
 
 	return active;
 }
@@ -1154,10 +1302,10 @@ debug_entry_t *__debug_sprintf_exception(debug_info_t *id, int level, char *stri
 	numargs = debug_count_numargs(string);
 
 	if (debug_critical) {
-		if (!spin_trylock_irqsave(&id->lock, flags))
+		if (!raw_spin_trylock_irqsave(&id->lock, flags))
 			return NULL;
 	} else {
-		spin_lock_irqsave(&id->lock, flags);
+		raw_spin_lock_irqsave(&id->lock, flags);
 	}
 	active = get_active_entry(id);
 	curr_event = (debug_sprintf_entry_t *)DEBUG_DATA(active);
@@ -1167,7 +1315,7 @@ debug_entry_t *__debug_sprintf_exception(debug_info_t *id, int level, char *stri
 		curr_event->args[idx] = va_arg(ap, long);
 	va_end(ap);
 	debug_finish_entry(id, active, level, 1);
-	spin_unlock_irqrestore(&id->lock, flags);
+	raw_spin_unlock_irqrestore(&id->lock, flags);
 
 	return active;
 }
@@ -1201,7 +1349,7 @@ int debug_register_view(debug_info_t *id, struct debug_view *view)
 		mode &= ~(S_IWUSR | S_IWGRP | S_IWOTH);
 	pde = debugfs_create_file(view->name, mode, id->debugfs_root_entry,
 				  id, &debug_file_ops);
-	spin_lock_irqsave(&id->lock, flags);
+	raw_spin_lock_irqsave(&id->lock, flags);
 	for (i = 0; i < DEBUG_MAX_VIEWS; i++) {
 		if (!id->views[i])
 			break;
@@ -1212,7 +1360,7 @@ int debug_register_view(debug_info_t *id, struct debug_view *view)
 		id->views[i] = view;
 		id->debugfs_entries[i] = pde;
 	}
-	spin_unlock_irqrestore(&id->lock, flags);
+	raw_spin_unlock_irqrestore(&id->lock, flags);
 	if (rc) {
 		pr_err("Registering view %s/%s would exceed the maximum "
 		       "number of views %i\n", id->name, view->name, i);
@@ -1242,7 +1390,7 @@ int debug_unregister_view(debug_info_t *id, struct debug_view *view)
 
 	if (!id)
 		goto out;
-	spin_lock_irqsave(&id->lock, flags);
+	raw_spin_lock_irqsave(&id->lock, flags);
 	for (i = 0; i < DEBUG_MAX_VIEWS; i++) {
 		if (id->views[i] == view)
 			break;
@@ -1254,7 +1402,7 @@ int debug_unregister_view(debug_info_t *id, struct debug_view *view)
 		id->views[i] = NULL;
 		id->debugfs_entries[i] = NULL;
 	}
-	spin_unlock_irqrestore(&id->lock, flags);
+	raw_spin_unlock_irqrestore(&id->lock, flags);
 	debugfs_remove(dentry);
 out:
 	return rc;
@@ -1266,18 +1414,12 @@ static inline char *debug_get_user_string(const char __user *user_buf,
 {
 	char *buffer;
 
-	buffer = kmalloc(user_len + 1, GFP_KERNEL);
-	if (!buffer)
-		return ERR_PTR(-ENOMEM);
-	if (copy_from_user(buffer, user_buf, user_len) != 0) {
-		kfree(buffer);
-		return ERR_PTR(-EFAULT);
-	}
+	buffer = memdup_user_nul(user_buf, user_len);
+	if (IS_ERR(buffer))
+		return buffer;
 	/* got the string, now strip linefeed. */
 	if (buffer[user_len - 1] == '\n')
 		buffer[user_len - 1] = 0;
-	else
-		buffer[user_len] = 0;
 	return buffer;
 }
 
@@ -1414,7 +1556,7 @@ static void debug_flush(debug_info_t *id, int area)
 
 	if (!id || !id->areas)
 		return;
-	spin_lock_irqsave(&id->lock, flags);
+	raw_spin_lock_irqsave(&id->lock, flags);
 	if (area == DEBUG_FLUSH_ALL) {
 		id->active_area = 0;
 		memset(id->active_entries, 0, id->nr_areas * sizeof(int));
@@ -1429,7 +1571,7 @@ static void debug_flush(debug_info_t *id, int area)
 		for (i = 0; i < id->pages_per_area; i++)
 			memset(id->areas[area][i], 0, PAGE_SIZE);
 	}
-	spin_unlock_irqrestore(&id->lock, flags);
+	raw_spin_unlock_irqrestore(&id->lock, flags);
 }
 
 /*
@@ -1527,13 +1669,13 @@ EXPORT_SYMBOL(debug_dflt_header_fn);
 
 /*
  * prints debug data sprintf-formatted:
- * debug_sprinf_event/exception calls must be used together with this view
+ * debug_sprintf_event/exception calls must be used together with this view
  */
 
 #define DEBUG_SPRINTF_MAX_ARGS 10
 
-static int debug_sprintf_format_fn(debug_info_t *id, struct debug_view *view,
-				   char *out_buf, size_t out_buf_size, const char *inbuf)
+int debug_sprintf_format_fn(debug_info_t *id, struct debug_view *view,
+			    char *out_buf, size_t out_buf_size, const char *inbuf)
 {
 	debug_sprintf_entry_t *curr_event = (debug_sprintf_entry_t *)inbuf;
 	int num_longs, num_used_args = 0, i, rc = 0;
@@ -1570,6 +1712,7 @@ static int debug_sprintf_format_fn(debug_info_t *id, struct debug_view *view,
 out:
 	return rc;
 }
+EXPORT_SYMBOL(debug_sprintf_format_fn);
 
 /*
  * debug_init:

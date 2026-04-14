@@ -1,7 +1,16 @@
 .. SPDX-License-Identifier: GPL-2.0
 
+.. include:: <isonum.txt>
+
 The mgb4 driver
 ===============
+
+Copyright |copy| 2023 - 2025 Digiteq Automotive
+    author: Martin Tůma <martin.tuma@digiteqautomotive.com>
+
+This is a v4l2 device driver for the Digiteq Automotive FrameGrabber 4, a PCIe
+card capable of capturing and generating FPD-Link III and GMSL2/3 video streams
+as used in the automotive industry.
 
 sysfs interface
 ---------------
@@ -22,7 +31,11 @@ Global (PCI card) parameters
 
     | 0 - No module present
     | 1 - FPDL3
-    | 2 - GMSL
+    | 2 - GMSL3 (one serializer, two daisy chained deserializers)
+    | 3 - GMSL3 (one serializer, two deserializers)
+    | 4 - GMSL3 (two deserializers with two daisy chain outputs)
+    | 6 - GMSL1
+    | 8 - GMSL3 coax
 
 **module_version** (R):
     Module version number. Zero in case of a missing module.
@@ -31,7 +44,8 @@ Global (PCI card) parameters
     Firmware type.
 
     | 1 - FPDL3
-    | 2 - GMSL
+    | 2 - GMSL3
+    | 3 - GMSL1
 
 **fw_version** (R):
     Firmware version number.

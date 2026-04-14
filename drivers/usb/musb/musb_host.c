@@ -13,6 +13,7 @@
 #include <linux/delay.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
+#include <linux/string_choices.h>
 #include <linux/errno.h>
 #include <linux/list.h>
 #include <linux/dma-mapping.h>
@@ -1028,7 +1029,7 @@ static bool musb_h_ep0_continue(struct musb *musb, u16 len, struct urb *urb)
 					+ urb->actual_length);
 			musb_dbg(musb, "Sending %d byte%s to ep0 fifo %p",
 					fifo_count,
-					(fifo_count == 1) ? "" : "s",
+					str_plural(fifo_count),
 					fifo_dest);
 			musb_write_fifo(hw_ep, fifo_count, fifo_dest);
 
@@ -2153,7 +2154,7 @@ static int musb_urb_enqueue(
 	 * REVISIT consider a dedicated qh kmem_cache, so it's harder
 	 * for bugs in other kernel code to break this driver...
 	 */
-	qh = kzalloc(sizeof *qh, mem_flags);
+	qh = kzalloc_obj(*qh, mem_flags);
 	if (!qh) {
 		spin_lock_irqsave(&musb->lock, flags);
 		usb_hcd_unlink_urb_from_ep(hcd, urb);

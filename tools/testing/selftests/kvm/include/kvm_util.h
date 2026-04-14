@@ -18,8 +18,12 @@
 #include <asm/atomic.h>
 #include <asm/kvm.h>
 
+#include <sys/eventfd.h>
 #include <sys/ioctl.h>
 
+#include <pthread.h>
+
+#include "kvm_syscalls.h"
 #include "kvm_util_arch.h"
 #include "kvm_util_types.h"
 #include "sparsebit.h"
@@ -46,6 +50,12 @@ struct userspace_mem_region {
 	struct hlist_node slot_node;
 };
 
+struct kvm_binary_stats {
+	int fd;
+	struct kvm_stats_header header;
+	struct kvm_stats_desc *desc;
+};
+
 struct kvm_vcpu {
 	struct list_head list;
 	uint32_t id;
@@ -55,6 +65,10 @@ struct kvm_vcpu {
 #ifdef __x86_64__
 	struct kvm_cpuid2 *cpuid;
 #endif
+#ifdef __aarch64__
+	struct kvm_vcpu_init init;
+#endif
+	struct kvm_binary_stats stats;
 	struct kvm_dirty_gfn *dirty_gfns;
 	uint32_t fetch_index;
 	uint32_t dirty_gfns_count;
@@ -74,12 +88,19 @@ enum kvm_mem_region_type {
 	NR_MEM_REGIONS,
 };
 
+struct kvm_mmu {
+	bool pgd_created;
+	uint64_t pgd;
+	int pgtable_levels;
+
+	struct kvm_mmu_arch arch;
+};
+
 struct kvm_vm {
 	int mode;
 	unsigned long type;
 	int kvm_fd;
 	int fd;
-	unsigned int pgtable_levels;
 	unsigned int page_size;
 	unsigned int page_shift;
 	unsigned int pa_bits;
@@ -90,19 +111,21 @@ struct kvm_vm {
 	struct sparsebit *vpages_valid;
 	struct sparsebit *vpages_mapped;
 	bool has_irqchip;
-	bool pgd_created;
 	vm_paddr_t ucall_mmio_addr;
-	vm_paddr_t pgd;
 	vm_vaddr_t handlers;
 	uint32_t dirty_ring_size;
 	uint64_t gpa_tag_mask;
 
+	/*
+	 * "mmu" is the guest's stage-1, with a short name because the vast
+	 * majority of tests only care about the stage-1 MMU.
+	 */
+	struct kvm_mmu mmu;
+	struct kvm_mmu stage2_mmu;
+
 	struct kvm_vm_arch arch;
 
-	/* Cache of information for binary stats interface */
-	int stats_fd;
-	struct kvm_stats_header stats_header;
-	struct kvm_stats_desc *stats_desc;
+	struct kvm_binary_stats stats;
 
 	/*
 	 * KVM region slots. These are the default memslots used by page
@@ -167,13 +190,25 @@ enum vm_guest_mode {
 	VM_MODE_P40V48_4K,
 	VM_MODE_P40V48_16K,
 	VM_MODE_P40V48_64K,
-	VM_MODE_PXXV48_4K,	/* For 48bits VA but ANY bits PA */
+	VM_MODE_PXXVYY_4K,	/* For 48-bit or 57-bit VA, depending on host support */
 	VM_MODE_P47V64_4K,
 	VM_MODE_P44V64_4K,
 	VM_MODE_P36V48_4K,
 	VM_MODE_P36V48_16K,
 	VM_MODE_P36V48_64K,
+	VM_MODE_P47V47_16K,
 	VM_MODE_P36V47_16K,
+
+	VM_MODE_P56V57_4K,	/* For riscv64 */
+	VM_MODE_P56V48_4K,
+	VM_MODE_P56V39_4K,
+	VM_MODE_P50V57_4K,
+	VM_MODE_P50V48_4K,
+	VM_MODE_P50V39_4K,
+	VM_MODE_P41V57_4K,
+	VM_MODE_P41V48_4K,
+	VM_MODE_P41V39_4K,
+
 	NUM_VM_MODES,
 };
 
@@ -198,9 +233,9 @@ kvm_static_assert(sizeof(struct vm_shape) == sizeof(uint64_t));
 	shape;					\
 })
 
-#if defined(__aarch64__)
-
 extern enum vm_guest_mode vm_mode_default;
+
+#if defined(__aarch64__)
 
 #define VM_MODE_DEFAULT			vm_mode_default
 #define MIN_PAGE_SHIFT			12U
@@ -208,7 +243,7 @@ extern enum vm_guest_mode vm_mode_default;
 
 #elif defined(__x86_64__)
 
-#define VM_MODE_DEFAULT			VM_MODE_PXXV48_4K
+#define VM_MODE_DEFAULT			VM_MODE_PXXVYY_4K
 #define MIN_PAGE_SHIFT			12U
 #define ptes_per_page(page_size)	((page_size) / 8)
 
@@ -224,7 +259,12 @@ extern enum vm_guest_mode vm_mode_default;
 #error "RISC-V 32-bit kvm selftests not supported"
 #endif
 
-#define VM_MODE_DEFAULT			VM_MODE_P40V48_4K
+#define VM_MODE_DEFAULT			vm_mode_default
+#define MIN_PAGE_SHIFT			12U
+#define ptes_per_page(page_size)	((page_size) / 8)
+
+#elif defined(__loongarch__)
+#define VM_MODE_DEFAULT			VM_MODE_P47V47_16K
 #define MIN_PAGE_SHIFT			12U
 #define ptes_per_page(page_size)	((page_size) / 8)
 
@@ -243,16 +283,22 @@ struct vm_guest_mode_params {
 };
 extern const struct vm_guest_mode_params vm_guest_mode_params[];
 
+int __open_path_or_exit(const char *path, int flags, const char *enoent_help);
 int open_path_or_exit(const char *path, int flags);
 int open_kvm_dev_path_or_exit(void);
 
-bool get_kvm_param_bool(const char *param);
-bool get_kvm_intel_param_bool(const char *param);
-bool get_kvm_amd_param_bool(const char *param);
+int kvm_get_module_param_integer(const char *module_name, const char *param);
+bool kvm_get_module_param_bool(const char *module_name, const char *param);
 
-int get_kvm_param_integer(const char *param);
-int get_kvm_intel_param_integer(const char *param);
-int get_kvm_amd_param_integer(const char *param);
+static inline bool get_kvm_param_bool(const char *param)
+{
+	return kvm_get_module_param_bool("kvm", param);
+}
+
+static inline int get_kvm_param_integer(const char *param)
+{
+	return kvm_get_module_param_integer("kvm", param);
+}
 
 unsigned int kvm_check_cap(long cap);
 
@@ -260,9 +306,6 @@ static inline bool kvm_has_cap(long cap)
 {
 	return kvm_check_cap(cap);
 }
-
-#define __KVM_SYSCALL_ERROR(_name, _ret) \
-	"%s failed, rc: %i errno: %i (%s)", (_name), (_ret), errno, strerror(errno)
 
 /*
  * Use the "inner", double-underscore macro when reporting errors from within
@@ -492,6 +535,45 @@ static inline int vm_get_stats_fd(struct kvm_vm *vm)
 	return fd;
 }
 
+static inline int __kvm_irqfd(struct kvm_vm *vm, uint32_t gsi, int eventfd,
+			      uint32_t flags)
+{
+	struct kvm_irqfd irqfd = {
+		.fd = eventfd,
+		.gsi = gsi,
+		.flags = flags,
+		.resamplefd = -1,
+	};
+
+	return __vm_ioctl(vm, KVM_IRQFD, &irqfd);
+}
+
+static inline void kvm_irqfd(struct kvm_vm *vm, uint32_t gsi, int eventfd,
+			      uint32_t flags)
+{
+	int ret = __kvm_irqfd(vm, gsi, eventfd, flags);
+
+	TEST_ASSERT_VM_VCPU_IOCTL(!ret, KVM_IRQFD, ret, vm);
+}
+
+static inline void kvm_assign_irqfd(struct kvm_vm *vm, uint32_t gsi, int eventfd)
+{
+	kvm_irqfd(vm, gsi, eventfd, 0);
+}
+
+static inline void kvm_deassign_irqfd(struct kvm_vm *vm, uint32_t gsi, int eventfd)
+{
+	kvm_irqfd(vm, gsi, eventfd, KVM_IRQFD_FLAG_DEASSIGN);
+}
+
+static inline int kvm_new_eventfd(void)
+{
+	int fd = eventfd(0, 0);
+
+	TEST_ASSERT(fd >= 0, __KVM_SYSCALL_ERROR("eventfd()", fd));
+	return fd;
+}
+
 static inline void read_stats_header(int stats_fd, struct kvm_stats_header *header)
 {
 	ssize_t ret;
@@ -531,15 +613,53 @@ void read_stat_data(int stats_fd, struct kvm_stats_header *header,
 		    struct kvm_stats_desc *desc, uint64_t *data,
 		    size_t max_elements);
 
-void __vm_get_stat(struct kvm_vm *vm, const char *stat_name, uint64_t *data,
-		   size_t max_elements);
+void kvm_get_stat(struct kvm_binary_stats *stats, const char *name,
+		  uint64_t *data, size_t max_elements);
 
-static inline uint64_t vm_get_stat(struct kvm_vm *vm, const char *stat_name)
+#define __get_stat(stats, stat)							\
+({										\
+	uint64_t data;								\
+										\
+	kvm_get_stat(stats, #stat, &data, 1);					\
+	data;									\
+})
+
+#define vm_get_stat(vm, stat) __get_stat(&(vm)->stats, stat)
+#define vcpu_get_stat(vcpu, stat) __get_stat(&(vcpu)->stats, stat)
+
+static inline bool read_smt_control(char *buf, size_t buf_size)
 {
-	uint64_t data;
+	FILE *f = fopen("/sys/devices/system/cpu/smt/control", "r");
+	bool ret;
 
-	__vm_get_stat(vm, stat_name, &data, 1);
-	return data;
+	if (!f)
+		return false;
+
+	ret = fread(buf, sizeof(*buf), buf_size, f) > 0;
+	fclose(f);
+
+	return ret;
+}
+
+static inline bool is_smt_possible(void)
+{
+	char buf[16];
+
+	if (read_smt_control(buf, sizeof(buf)) &&
+	    (!strncmp(buf, "forceoff", 8) || !strncmp(buf, "notsupported", 12)))
+		return false;
+
+	return true;
+}
+
+static inline bool is_smt_on(void)
+{
+	char buf[16];
+
+	if (read_smt_control(buf, sizeof(buf)) && !strncmp(buf, "on", 2))
+		return true;
+
+	return false;
 }
 
 void vm_create_irqchip(struct kvm_vm *vm);
@@ -576,12 +696,12 @@ int __vm_set_user_memory_region2(struct kvm_vm *vm, uint32_t slot, uint32_t flag
 				 uint32_t guest_memfd, uint64_t guest_memfd_offset);
 
 void vm_userspace_mem_region_add(struct kvm_vm *vm,
-	enum vm_mem_backing_src_type src_type,
-	uint64_t guest_paddr, uint32_t slot, uint64_t npages,
-	uint32_t flags);
+				 enum vm_mem_backing_src_type src_type,
+				 uint64_t gpa, uint32_t slot, uint64_t npages,
+				 uint32_t flags);
 void vm_mem_add(struct kvm_vm *vm, enum vm_mem_backing_src_type src_type,
-		uint64_t guest_paddr, uint32_t slot, uint64_t npages,
-		uint32_t flags, int guest_memfd_fd, uint64_t guest_memfd_offset);
+		uint64_t gpa, uint32_t slot, uint64_t npages, uint32_t flags,
+		int guest_memfd_fd, uint64_t guest_memfd_offset);
 
 #ifndef vm_arch_has_protected_memory
 static inline bool vm_arch_has_protected_memory(struct kvm_vm *vm)
@@ -591,6 +711,7 @@ static inline bool vm_arch_has_protected_memory(struct kvm_vm *vm)
 #endif
 
 void vm_mem_region_set_flags(struct kvm_vm *vm, uint32_t slot, uint32_t flags);
+void vm_mem_region_reload(struct kvm_vm *vm, uint32_t slot);
 void vm_mem_region_move(struct kvm_vm *vm, uint32_t slot, uint64_t new_gpa);
 void vm_mem_region_delete(struct kvm_vm *vm, uint32_t slot);
 struct kvm_vcpu *__vm_vcpu_add(struct kvm_vm *vm, uint32_t vcpu_id);
@@ -702,15 +823,21 @@ static inline int __vcpu_set_reg(struct kvm_vcpu *vcpu, uint64_t id, uint64_t va
 
 	return __vcpu_ioctl(vcpu, KVM_SET_ONE_REG, &reg);
 }
-static inline void vcpu_get_reg(struct kvm_vcpu *vcpu, uint64_t id, void *addr)
+static inline uint64_t vcpu_get_reg(struct kvm_vcpu *vcpu, uint64_t id)
 {
-	struct kvm_one_reg reg = { .id = id, .addr = (uint64_t)addr };
+	uint64_t val;
+	struct kvm_one_reg reg = { .id = id, .addr = (uint64_t)&val };
+
+	TEST_ASSERT(KVM_REG_SIZE(id) <= sizeof(val), "Reg %lx too big", id);
 
 	vcpu_ioctl(vcpu, KVM_GET_ONE_REG, &reg);
+	return val;
 }
 static inline void vcpu_set_reg(struct kvm_vcpu *vcpu, uint64_t id, uint64_t val)
 {
 	struct kvm_one_reg reg = { .id = id, .addr = (uint64_t)&val };
+
+	TEST_ASSERT(KVM_REG_SIZE(id) <= sizeof(val), "Reg %lx too big", id);
 
 	vcpu_ioctl(vcpu, KVM_SET_ONE_REG, &reg);
 }
@@ -835,7 +962,7 @@ void *vcpu_map_dirty_ring(struct kvm_vcpu *vcpu);
  * VM VCPU Args Set
  *
  * Input Args:
- *   vm - Virtual Machine
+ *   vcpu - vCPU
  *   num - number of arguments
  *   ... - arguments, each of type uint64_t
  *
@@ -957,7 +1084,36 @@ static inline struct kvm_vm *vm_create_shape_with_one_vcpu(struct vm_shape shape
 
 struct kvm_vcpu *vm_recreate_with_one_vcpu(struct kvm_vm *vm);
 
-void kvm_pin_this_task_to_pcpu(uint32_t pcpu);
+void kvm_set_files_rlimit(uint32_t nr_vcpus);
+
+int __pin_task_to_cpu(pthread_t task, int cpu);
+
+static inline void pin_task_to_cpu(pthread_t task, int cpu)
+{
+	int r;
+
+	r = __pin_task_to_cpu(task, cpu);
+	TEST_ASSERT(!r, "Failed to set thread affinity to pCPU '%u'", cpu);
+}
+
+static inline int pin_task_to_any_cpu(pthread_t task)
+{
+	int cpu = sched_getcpu();
+
+	pin_task_to_cpu(task, cpu);
+	return cpu;
+}
+
+static inline void pin_self_to_cpu(int cpu)
+{
+	pin_task_to_cpu(pthread_self(), cpu);
+}
+
+static inline int pin_self_to_any_cpu(void)
+{
+	return pin_task_to_any_cpu(pthread_self());
+}
+
 void kvm_print_vcpu_pinning_help(void);
 void kvm_parse_vcpu_pinning(const char *pcpus_string, uint32_t vcpu_to_pcpu[],
 			    int nr_vcpus);
@@ -1071,6 +1227,7 @@ void virt_arch_pg_map(struct kvm_vm *vm, uint64_t vaddr, uint64_t paddr);
 static inline void virt_pg_map(struct kvm_vm *vm, uint64_t vaddr, uint64_t paddr)
 {
 	virt_arch_pg_map(vm, vaddr, paddr);
+	sparsebit_set(vm->vpages_mapped, vaddr >> vm->page_shift);
 }
 
 
@@ -1124,17 +1281,26 @@ static inline int __vm_disable_nx_huge_pages(struct kvm_vm *vm)
 	return __vm_enable_cap(vm, KVM_CAP_VM_DISABLE_NX_HUGE_PAGES, 0);
 }
 
+static inline uint64_t vm_page_align(struct kvm_vm *vm, uint64_t v)
+{
+	return (v + vm->page_size - 1) & ~(vm->page_size - 1);
+}
+
 /*
- * Arch hook that is invoked via a constructor, i.e. before exeucting main(),
+ * Arch hook that is invoked via a constructor, i.e. before executing main(),
  * to allow for arch-specific setup that is common to all tests, e.g. computing
  * the default guest "mode".
  */
 void kvm_selftest_arch_init(void);
 
-void kvm_arch_vm_post_create(struct kvm_vm *vm);
+void kvm_arch_vm_post_create(struct kvm_vm *vm, unsigned int nr_vcpus);
+void kvm_arch_vm_finalize_vcpus(struct kvm_vm *vm);
+void kvm_arch_vm_release(struct kvm_vm *vm);
 
 bool vm_is_gpa_protected(struct kvm_vm *vm, vm_paddr_t paddr);
 
 uint32_t guest_get_vcpuid(void);
+
+bool kvm_arch_has_default_irqchip(void);
 
 #endif /* SELFTEST_KVM_UTIL_H */

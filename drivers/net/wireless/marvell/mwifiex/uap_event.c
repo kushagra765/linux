@@ -105,7 +105,7 @@ int mwifiex_process_uap_event(struct mwifiex_private *priv)
 
 	switch (eventcause) {
 	case EVENT_UAP_STA_ASSOC:
-		sinfo = kzalloc(sizeof(*sinfo), GFP_KERNEL);
+		sinfo = kzalloc_obj(*sinfo);
 		if (!sinfo)
 			return -ENOMEM;
 
@@ -324,20 +324,4 @@ int mwifiex_process_uap_event(struct mwifiex_private *priv)
 	}
 
 	return 0;
-}
-
-/* This function deletes station entry from associated station list.
- * Also if both AP and STA are 11n enabled, RxReorder tables and TxBA stream
- * tables created for this station are deleted.
- */
-void mwifiex_uap_del_sta_data(struct mwifiex_private *priv,
-			      struct mwifiex_sta_node *node)
-{
-	if (priv->ap_11n_enabled && node->is_11n_enabled) {
-		mwifiex_11n_del_rx_reorder_tbl_by_ta(priv, node->mac_addr);
-		mwifiex_del_tx_ba_stream_tbl_by_ra(priv, node->mac_addr);
-	}
-	mwifiex_del_sta_entry(priv, node->mac_addr);
-
-	return;
 }

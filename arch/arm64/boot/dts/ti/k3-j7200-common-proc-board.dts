@@ -323,6 +323,7 @@
 &mcu_cpsw {
 	pinctrl-names = "default";
 	pinctrl-0 = <&mcu_cpsw_pins_default>, <&mcu_mdio_pins_default>;
+	status = "okay";
 };
 
 &davinci_mdio {
@@ -334,7 +335,7 @@
 };
 
 &cpsw_port1 {
-	phy-mode = "rgmii-rxid";
+	phy-mode = "rgmii-id";
 	phy-handle = <&phy0>;
 };
 
@@ -407,6 +408,10 @@
 &serdes_ln_ctrl {
 	idle-states = <J7200_SERDES0_LANE0_PCIE1_LANE0>, <J7200_SERDES0_LANE1_PCIE1_LANE1>,
 		      <J7200_SERDES0_LANE2_QSGMII_LANE1>, <J7200_SERDES0_LANE3_IP4_UNUSED>;
+};
+
+&mcu_spi1 {
+	mux-controls = <&spi1_linkdis 0>;
 };
 
 &usb_serdes_mux {

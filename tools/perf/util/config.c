@@ -13,12 +13,14 @@
 #include <sys/param.h>
 #include "cache.h"
 #include "callchain.h"
+#include "header.h"
 #include <subcmd/exec-cmd.h>
 #include "util/event.h"  /* proc_map_timeout */
 #include "util/hist.h"  /* perf_hist_config */
 #include "util/stat.h"  /* perf_stat__set_big_num */
 #include "util/evsel.h"  /* evsel__hw_names, evsel__use_bpf_counters */
-#include "util/srcline.h"  /* addr2line_timeout_ms */
+#include "util/addr2line.h"  /* addr2line_timeout_ms */
+#include "srcline.h"
 #include "build-id.h"
 #include "debug.h"
 #include "config.h"
@@ -34,6 +36,23 @@
 
 #define DEBUG_CACHE_DIR ".debug"
 
+#define METRIC_ONLY_LEN 20
+
+static struct stats walltime_nsecs_stats;
+
+struct perf_stat_config stat_config = {
+	.aggr_mode		= AGGR_GLOBAL,
+	.aggr_level		= MAX_CACHE_LVL + 1,
+	.scale			= true,
+	.unit_width		= 4, /* strlen("unit") */
+	.run_count		= 1,
+	.metric_only_len	= METRIC_ONLY_LEN,
+	.walltime_nsecs_stats	= &walltime_nsecs_stats,
+	.big_num		= true,
+	.ctl_fd			= -1,
+	.ctl_fd_ack		= -1,
+	.iostat_run		= false,
+};
 
 char buildid_dir[MAXPATHLEN]; /* root dir for buildid, binary cache */
 
@@ -455,6 +474,16 @@ static int perf_ui_config(const char *var, const char *value)
 	return 0;
 }
 
+void perf_stat__set_big_num(int set)
+{
+	stat_config.big_num = (set != 0);
+}
+
+static void perf_stat__set_no_csv_summary(int set)
+{
+	stat_config.no_csv_summary = (set != 0);
+}
+
 static int perf_stat_config(const char *var, const char *value)
 {
 	if (!strcmp(var, "stat.big-num"))
@@ -490,6 +519,9 @@ int perf_default_config(const char *var, const char *value,
 
 	if (strstarts(var, "stat."))
 		return perf_stat_config(var, value);
+
+	if (strstarts(var, "addr2line."))
+		return addr2line_configure(var, value, dummy);
 
 	/* Add other config variables here. */
 	return 0;
@@ -827,12 +859,6 @@ void perf_config__exit(void)
 {
 	perf_config_set__delete(config_set);
 	config_set = NULL;
-}
-
-void perf_config__refresh(void)
-{
-	perf_config__exit();
-	perf_config__init();
 }
 
 static void perf_config_item__delete(struct perf_config_item *item)

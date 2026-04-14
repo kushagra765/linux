@@ -976,11 +976,12 @@ static bool dcn31_program_pix_clk(
 	struct bp_pixel_clock_parameters bp_pc_params = {0};
 	enum transmitter_color_depth bp_pc_colour_depth = TRANSMITTER_COLOR_DEPTH_24;
 
-	// Apply ssed(spread spectrum) dpref clock for edp only.
-	if (clock_source->ctx->dc->clk_mgr->dp_dto_source_clock_in_khz != 0
-		&& pix_clk_params->signal_type == SIGNAL_TYPE_EDP
-		&& encoding == DP_8b_10b_ENCODING)
+	// Apply ssed(spread spectrum) dpref clock for edp and dp
+	if (clock_source->ctx->dc->clk_mgr->dp_dto_source_clock_in_khz != 0 &&
+		dc_is_dp_signal(pix_clk_params->signal_type) &&
+		encoding == DP_8b_10b_ENCODING)
 		dp_dto_ref_khz = clock_source->ctx->dc->clk_mgr->dp_dto_source_clock_in_khz;
+
 	// For these signal types Driver to program DP_DTO without calling VBIOS Command table
 	if (dc_is_dp_signal(pix_clk_params->signal_type) || dc_is_virtual_signal(pix_clk_params->signal_type)) {
 		if (e) {
@@ -1105,6 +1106,9 @@ static bool dcn401_program_pix_clk(
 				&dto_params);
 
 	} else {
+		if (pll_settings->actual_pix_clk_100hz > 6000000UL)
+			return false;
+
 		/* disables DP DTO when provided with TMDS signal type */
 		clock_source->ctx->dc->res_pool->dccg->funcs->set_dp_dto(
 				clock_source->ctx->dc->res_pool->dccg,
@@ -1472,16 +1476,12 @@ static void get_ss_info_from_atombios(
 	if (*ss_entries_num == 0)
 		return;
 
-	ss_info = kcalloc(*ss_entries_num,
-			  sizeof(struct spread_spectrum_info),
-			  GFP_KERNEL);
+	ss_info = kzalloc_objs(struct spread_spectrum_info, *ss_entries_num);
 	ss_info_cur = ss_info;
 	if (ss_info == NULL)
 		return;
 
-	ss_data = kcalloc(*ss_entries_num,
-			  sizeof(struct spread_spectrum_data),
-			  GFP_KERNEL);
+	ss_data = kzalloc_objs(struct spread_spectrum_data, *ss_entries_num);
 	if (ss_data == NULL)
 		goto out_free_info;
 

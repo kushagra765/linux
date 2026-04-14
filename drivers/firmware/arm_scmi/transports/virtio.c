@@ -871,6 +871,9 @@ static int scmi_vio_probe(struct virtio_device *vdev)
 	/* Ensure initialized scmi_vdev is visible */
 	smp_store_mb(scmi_vdev, vdev);
 
+	/* Set device ready */
+	virtio_device_ready(vdev);
+
 	ret = platform_driver_register(&scmi_virtio_driver);
 	if (ret) {
 		vdev->priv = NULL;
@@ -921,6 +924,7 @@ static const struct virtio_device_id id_table[] = {
 	{ VIRTIO_ID_SCMI, VIRTIO_DEV_ANY_ID },
 	{ 0 }
 };
+MODULE_DEVICE_TABLE(virtio, id_table);
 
 static struct virtio_driver virtio_scmi_driver = {
 	.driver.name = "scmi-virtio",

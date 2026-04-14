@@ -10,7 +10,7 @@
 #include <linux/pkeys.h>
 #include <linux/debugfs.h>
 #include <linux/proc_fs.h>
-#include <misc/cxl-base.h>
+#include <linux/page_table_check.h>
 
 #include <asm/pgalloc.h>
 #include <asm/tlb.h>
@@ -63,7 +63,7 @@ int pmdp_set_access_flags(struct vm_area_struct *vma, unsigned long address,
 {
 	int changed;
 #ifdef CONFIG_DEBUG_VM
-	WARN_ON(!pmd_trans_huge(*pmdp) && !pmd_devmap(*pmdp));
+	WARN_ON(!pmd_trans_huge(*pmdp));
 	assert_spin_locked(pmd_lockptr(vma->vm_mm, pmdp));
 #endif
 	changed = !pmd_same(*(pmdp), entry);
@@ -83,7 +83,6 @@ int pudp_set_access_flags(struct vm_area_struct *vma, unsigned long address,
 {
 	int changed;
 #ifdef CONFIG_DEBUG_VM
-	WARN_ON(!pud_devmap(*pudp));
 	assert_spin_locked(pud_lockptr(vma->vm_mm, pudp));
 #endif
 	changed = !pud_same(*(pudp), entry);
@@ -129,7 +128,8 @@ void set_pmd_at(struct mm_struct *mm, unsigned long addr,
 	WARN_ON(!(pmd_leaf(pmd)));
 #endif
 	trace_hugepage_set_pmd(addr, pmd_val(pmd));
-	return set_pte_at(mm, addr, pmdp_ptep(pmdp), pmd_pte(pmd));
+	page_table_check_pmd_set(mm, addr, pmdp, pmd);
+	return set_pte_at_unchecked(mm, addr, pmdp_ptep(pmdp), pmd_pte(pmd));
 }
 
 void set_pud_at(struct mm_struct *mm, unsigned long addr,
@@ -146,7 +146,8 @@ void set_pud_at(struct mm_struct *mm, unsigned long addr,
 	WARN_ON(!(pud_leaf(pud)));
 #endif
 	trace_hugepage_set_pud(addr, pud_val(pud));
-	return set_pte_at(mm, addr, pudp_ptep(pudp), pud_pte(pud));
+	page_table_check_pud_set(mm, addr, pudp, pud);
+	return set_pte_at_unchecked(mm, addr, pudp_ptep(pudp), pud_pte(pud));
 }
 
 static void do_serialize(void *arg)
@@ -181,23 +182,27 @@ void serialize_against_pte_lookup(struct mm_struct *mm)
 pmd_t pmdp_invalidate(struct vm_area_struct *vma, unsigned long address,
 		     pmd_t *pmdp)
 {
-	unsigned long old_pmd;
+	pmd_t old_pmd;
 
 	VM_WARN_ON_ONCE(!pmd_present(*pmdp));
-	old_pmd = pmd_hugepage_update(vma->vm_mm, address, pmdp, _PAGE_PRESENT, _PAGE_INVALID);
+	old_pmd = __pmd(pmd_hugepage_update(vma->vm_mm, address, pmdp, _PAGE_PRESENT, _PAGE_INVALID));
 	flush_pmd_tlb_range(vma, address, address + HPAGE_PMD_SIZE);
-	return __pmd(old_pmd);
+	page_table_check_pmd_clear(vma->vm_mm, address, old_pmd);
+
+	return old_pmd;
 }
 
 pud_t pudp_invalidate(struct vm_area_struct *vma, unsigned long address,
 		      pud_t *pudp)
 {
-	unsigned long old_pud;
+	pud_t old_pud;
 
 	VM_WARN_ON_ONCE(!pud_present(*pudp));
-	old_pud = pud_hugepage_update(vma->vm_mm, address, pudp, _PAGE_PRESENT, _PAGE_INVALID);
+	old_pud = __pud(pud_hugepage_update(vma->vm_mm, address, pudp, _PAGE_PRESENT, _PAGE_INVALID));
 	flush_pud_tlb_range(vma, address, address + HPAGE_PUD_SIZE);
-	return __pud(old_pud);
+	page_table_check_pud_clear(vma->vm_mm, address, old_pud);
+
+	return old_pud;
 }
 
 pmd_t pmdp_huge_get_and_clear_full(struct vm_area_struct *vma,
@@ -205,8 +210,8 @@ pmd_t pmdp_huge_get_and_clear_full(struct vm_area_struct *vma,
 {
 	pmd_t pmd;
 	VM_BUG_ON(addr & ~HPAGE_PMD_MASK);
-	VM_BUG_ON((pmd_present(*pmdp) && !pmd_trans_huge(*pmdp) &&
-		   !pmd_devmap(*pmdp)) || !pmd_present(*pmdp));
+	VM_BUG_ON((pmd_present(*pmdp) && !pmd_trans_huge(*pmdp)) ||
+		   !pmd_present(*pmdp));
 	pmd = pmdp_huge_get_and_clear(vma->vm_mm, addr, pmdp);
 	/*
 	 * if it not a fullmm flush, then we can possibly end up converting
@@ -224,8 +229,7 @@ pud_t pudp_huge_get_and_clear_full(struct vm_area_struct *vma,
 	pud_t pud;
 
 	VM_BUG_ON(addr & ~HPAGE_PMD_MASK);
-	VM_BUG_ON((pud_present(*pudp) && !pud_devmap(*pudp)) ||
-		  !pud_present(*pudp));
+	VM_BUG_ON(!pud_present(*pudp));
 	pud = pudp_huge_get_and_clear(vma->vm_mm, addr, pudp);
 	/*
 	 * if it not a fullmm flush, then we can possibly end up converting
@@ -268,11 +272,6 @@ pud_t pfn_pud(unsigned long pfn, pgprot_t pgprot)
 	pudv = (pfn << PAGE_SHIFT) & PTE_RPN_MASK;
 
 	return __pud_mkhuge(pud_set_protbits(__pud(pudv), pgprot));
-}
-
-pmd_t mk_pmd(struct page *page, pgprot_t pgprot)
-{
-	return pfn_pmd(page_to_pfn(page), pgprot);
 }
 
 pmd_t pmd_modify(pmd_t pmd, pgprot_t newprot)
@@ -330,11 +329,7 @@ void __init mmu_partition_table_init(void)
 	unsigned long ptcr;
 
 	/* Initialize the Partition Table with no entries */
-	partition_tb = memblock_alloc(patb_size, patb_size);
-	if (!partition_tb)
-		panic("%s: Failed to allocate %lu bytes align=0x%lx\n",
-		      __func__, patb_size, patb_size);
-
+	partition_tb = memblock_alloc_or_panic(patb_size, patb_size);
 	ptcr = __pa(partition_tb) | (PATB_SIZE_SHIFT - 12);
 	set_ptcr_when_no_uv(ptcr);
 	powernv_set_nmmu_ptcr(ptcr);
@@ -427,7 +422,7 @@ static pmd_t *__alloc_for_pmdcache(struct mm_struct *mm)
 	ptdesc = pagetable_alloc(gfp, 0);
 	if (!ptdesc)
 		return NULL;
-	if (!pagetable_pmd_ctor(ptdesc)) {
+	if (!pagetable_pmd_ctor(mm, ptdesc)) {
 		pagetable_free(ptdesc);
 		return NULL;
 	}
@@ -477,7 +472,7 @@ void pmd_fragment_free(unsigned long *pmd)
 
 	BUG_ON(atomic_read(&ptdesc->pt_frag_refcount) <= 0);
 	if (atomic_dec_and_test(&ptdesc->pt_frag_refcount)) {
-		pagetable_pmd_dtor(ptdesc);
+		pagetable_dtor(ptdesc);
 		pagetable_free(ptdesc);
 	}
 }
@@ -522,20 +517,21 @@ atomic_long_t direct_pages_count[MMU_PAGE_COUNT];
 
 void arch_report_meminfo(struct seq_file *m)
 {
-	/*
-	 * Hash maps the memory with one size mmu_linear_psize.
-	 * So don't bother to print these on hash
-	 */
-	if (!radix_enabled())
-		return;
 	seq_printf(m, "DirectMap4k:    %8lu kB\n",
 		   atomic_long_read(&direct_pages_count[MMU_PAGE_4K]) << 2);
-	seq_printf(m, "DirectMap64k:    %8lu kB\n",
+	seq_printf(m, "DirectMap64k:   %8lu kB\n",
 		   atomic_long_read(&direct_pages_count[MMU_PAGE_64K]) << 6);
-	seq_printf(m, "DirectMap2M:    %8lu kB\n",
-		   atomic_long_read(&direct_pages_count[MMU_PAGE_2M]) << 11);
-	seq_printf(m, "DirectMap1G:    %8lu kB\n",
-		   atomic_long_read(&direct_pages_count[MMU_PAGE_1G]) << 20);
+	if (radix_enabled()) {
+		seq_printf(m, "DirectMap2M:    %8lu kB\n",
+			   atomic_long_read(&direct_pages_count[MMU_PAGE_2M]) << 11);
+		seq_printf(m, "DirectMap1G:    %8lu kB\n",
+			   atomic_long_read(&direct_pages_count[MMU_PAGE_1G]) << 20);
+	} else {
+		seq_printf(m, "DirectMap16M:   %8lu kB\n",
+			   atomic_long_read(&direct_pages_count[MMU_PAGE_16M]) << 14);
+		seq_printf(m, "DirectMap16G:   %8lu kB\n",
+			   atomic_long_read(&direct_pages_count[MMU_PAGE_16G]) << 24);
+	}
 }
 #endif /* CONFIG_PROC_FS */
 
@@ -561,7 +557,7 @@ void ptep_modify_prot_commit(struct vm_area_struct *vma, unsigned long addr,
 	if (radix_enabled())
 		return radix__ptep_modify_prot_commit(vma, addr,
 						      ptep, old_pte, pte);
-	set_pte_at(vma->vm_mm, addr, ptep, pte);
+	set_pte_at_unchecked(vma->vm_mm, addr, ptep, pte);
 }
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
@@ -591,7 +587,7 @@ int pmd_move_must_withdraw(struct spinlock *new_pmd_ptl,
 /*
  * Does the CPU support tlbie?
  */
-bool tlbie_capable __read_mostly = true;
+bool tlbie_capable __read_mostly = IS_ENABLED(CONFIG_PPC_RADIX_BROADCAST_TLBIE);
 EXPORT_SYMBOL(tlbie_capable);
 
 /*
@@ -599,7 +595,7 @@ EXPORT_SYMBOL(tlbie_capable);
  * address spaces? tlbie may still be used for nMMU accelerators, and for KVM
  * guest address spaces.
  */
-bool tlbie_enabled __read_mostly = true;
+bool tlbie_enabled __read_mostly = IS_ENABLED(CONFIG_PPC_RADIX_BROADCAST_TLBIE);
 
 static int __init setup_disable_tlbie(char *str)
 {
@@ -654,7 +650,7 @@ unsigned long memremap_compat_align(void)
 EXPORT_SYMBOL_GPL(memremap_compat_align);
 #endif
 
-pgprot_t vm_get_page_prot(unsigned long vm_flags)
+pgprot_t vm_get_page_prot(vm_flags_t vm_flags)
 {
 	unsigned long prot;
 

@@ -260,7 +260,7 @@ struct pcc_acpi {
  * keypress events over the PS/2 kbd interface, filter these out.
  */
 static bool panasonic_i8042_filter(unsigned char data, unsigned char str,
-				   struct serio *port)
+				   struct serio *port, void *context)
 {
 	static bool extended;
 
@@ -1017,7 +1017,7 @@ static int acpi_pcc_hotkey_add(struct acpi_device *device)
 	 */
 	num_sifr++;
 
-	pcc = kzalloc(sizeof(struct pcc_acpi), GFP_KERNEL);
+	pcc = kzalloc_obj(struct pcc_acpi);
 	if (!pcc) {
 		pr_err("Couldn't allocate mem for pcc");
 		return -ENOMEM;
@@ -1033,8 +1033,8 @@ static int acpi_pcc_hotkey_add(struct acpi_device *device)
 	pcc->handle = device->handle;
 	pcc->num_sifr = num_sifr;
 	device->driver_data = pcc;
-	strcpy(acpi_device_name(device), ACPI_PCC_DEVICE_NAME);
-	strcpy(acpi_device_class(device), ACPI_PCC_CLASS);
+	strscpy(acpi_device_name(device), ACPI_PCC_DEVICE_NAME);
+	strscpy(acpi_device_class(device), ACPI_PCC_CLASS);
 
 	result = acpi_pcc_init_input(pcc);
 	if (result) {
@@ -1089,7 +1089,7 @@ static int acpi_pcc_hotkey_add(struct acpi_device *device)
 			PLATFORM_DEVID_NONE, NULL, 0);
 		if (IS_ERR(pcc->platform)) {
 			result = PTR_ERR(pcc->platform);
-			goto out_backlight;
+			goto out_sysfs;
 		}
 		result = device_create_file(&pcc->platform->dev,
 			&dev_attr_cdpower);
@@ -1100,11 +1100,13 @@ static int acpi_pcc_hotkey_add(struct acpi_device *device)
 		pcc->platform = NULL;
 	}
 
-	i8042_install_filter(panasonic_i8042_filter);
+	i8042_install_filter(panasonic_i8042_filter, NULL);
 	return 0;
 
 out_platform:
 	platform_device_unregister(pcc->platform);
+out_sysfs:
+	sysfs_remove_group(&device->dev.kobj, &pcc_attr_group);
 out_backlight:
 	backlight_device_unregister(pcc->backlight);
 out_input:

@@ -136,7 +136,7 @@ static irqreturn_t cxl_pci_mbox_irq(int irq, void *id)
 	if (opcode == CXL_MBOX_OP_SANITIZE) {
 		mutex_lock(&cxl_mbox->mbox_mutex);
 		if (mds->security.sanitize_node)
-			mod_delayed_work(system_wq, &mds->security.poll_dwork, 0);
+			mod_delayed_work(system_percpu_wq, &mds->security.poll_dwork, 0);
 		mutex_unlock(&cxl_mbox->mbox_mutex);
 	} else {
 		/* short-circuit the wait in __cxl_pci_mbox_send_cmd() */
@@ -379,7 +379,7 @@ static int cxl_pci_mbox_send(struct cxl_mailbox *cxl_mbox,
 {
 	int rc;
 
-	mutex_lock_io(&cxl_mbox->mbox_mutex);
+	mutex_lock(&cxl_mbox->mbox_mutex);
 	rc = __cxl_pci_mbox_send_cmd(cxl_mbox, cmd);
 	mutex_unlock(&cxl_mbox->mbox_mutex);
 
@@ -533,52 +533,6 @@ static int cxl_pci_setup_regs(struct pci_dev *pdev, enum cxl_regloc_type type,
 	}
 
 	return cxl_setup_regs(map);
-}
-
-static int cxl_pci_ras_unmask(struct pci_dev *pdev)
-{
-	struct cxl_dev_state *cxlds = pci_get_drvdata(pdev);
-	void __iomem *addr;
-	u32 orig_val, val, mask;
-	u16 cap;
-	int rc;
-
-	if (!cxlds->regs.ras) {
-		dev_dbg(&pdev->dev, "No RAS registers.\n");
-		return 0;
-	}
-
-	/* BIOS has PCIe AER error control */
-	if (!pcie_aer_is_native(pdev))
-		return 0;
-
-	rc = pcie_capability_read_word(pdev, PCI_EXP_DEVCTL, &cap);
-	if (rc)
-		return rc;
-
-	if (cap & PCI_EXP_DEVCTL_URRE) {
-		addr = cxlds->regs.ras + CXL_RAS_UNCORRECTABLE_MASK_OFFSET;
-		orig_val = readl(addr);
-
-		mask = CXL_RAS_UNCORRECTABLE_MASK_MASK |
-		       CXL_RAS_UNCORRECTABLE_MASK_F256B_MASK;
-		val = orig_val & ~mask;
-		writel(val, addr);
-		dev_dbg(&pdev->dev,
-			"Uncorrectable RAS Errors Mask: %#x -> %#x\n",
-			orig_val, val);
-	}
-
-	if (cap & PCI_EXP_DEVCTL_CERE) {
-		addr = cxlds->regs.ras + CXL_RAS_CORRECTABLE_MASK_OFFSET;
-		orig_val = readl(addr);
-		val = orig_val & ~CXL_RAS_CORRECTABLE_MASK_MASK;
-		writel(val, addr);
-		dev_dbg(&pdev->dev, "Correctable RAS Errors Mask: %#x -> %#x\n",
-			orig_val, val);
-	}
-
-	return 0;
 }
 
 static void free_event_buf(void *buf)
@@ -836,6 +790,9 @@ static ssize_t rcd_pcie_cap_emit(struct device *dev, u16 offset, char *buf, size
 	if (!root_dev)
 		return -ENXIO;
 
+	if (!dport->regs.rcd_pcie_cap)
+		return -ENXIO;
+
 	guard(device)(root_dev);
 	if (!root_dev->driver)
 		return -ENXIO;
@@ -900,19 +857,14 @@ __ATTRIBUTE_GROUPS(cxl_rcd);
 static int cxl_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct pci_host_bridge *host_bridge = pci_find_host_bridge(pdev->bus);
+	struct cxl_dpa_info range_info = { 0 };
 	struct cxl_memdev_state *mds;
 	struct cxl_dev_state *cxlds;
 	struct cxl_register_map map;
 	struct cxl_memdev *cxlmd;
-	int i, rc, pmu_count;
+	int rc, pmu_count;
+	unsigned int i;
 	bool irq_avail;
-
-	/*
-	 * Double check the anonymous union trickery in struct cxl_regs
-	 * FIXME switch to struct_group()
-	 */
-	BUILD_BUG_ON(offsetof(struct cxl_regs, memdev) !=
-		     offsetof(struct cxl_regs, device_regs.memdev));
 
 	rc = pcim_enable_device(pdev);
 	if (rc)
@@ -928,7 +880,7 @@ static int cxl_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	cxlds->rcd = is_cxl_restricted(pdev);
 	cxlds->serial = pci_get_dsn(pdev);
 	cxlds->cxl_dvsec = pci_find_dvsec_capability(
-		pdev, PCI_VENDOR_ID_CXL, CXL_DVSEC_PCIE_DEVICE);
+		pdev, PCI_VENDOR_ID_CXL, PCI_DVSEC_CXL_DEVICE);
 	if (!cxlds->cxl_dvsec)
 		dev_warn(&pdev->dev,
 			 "Device DVSEC not present, skip CXL.mem init\n");
@@ -937,7 +889,7 @@ static int cxl_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (rc)
 		return rc;
 
-	rc = cxl_map_device_regs(&map, &cxlds->regs.device_regs);
+	rc = cxl_map_device_regs(&map, &cxlds->regs);
 	if (rc)
 		return rc;
 
@@ -951,11 +903,6 @@ static int cxl_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		dev_warn(&pdev->dev, "No component registers (%d)\n", rc);
 	else if (!cxlds->reg_map.component_map.ras.valid)
 		dev_dbg(&pdev->dev, "RAS registers not found\n");
-
-	rc = cxl_map_component_regs(&cxlds->reg_map, &cxlds->regs.component,
-				    BIT(CXL_CM_CAP_CAP_ID_RAS));
-	if (rc)
-		dev_dbg(&pdev->dev, "Failed to map RAS capability.\n");
 
 	rc = cxl_pci_type3_init_mailbox(cxlds);
 	if (rc)
@@ -989,11 +936,19 @@ static int cxl_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (rc)
 		return rc;
 
-	rc = cxl_mem_create_range_info(mds);
+	rc = cxl_mem_dpa_fetch(mds, &range_info);
 	if (rc)
 		return rc;
 
-	cxlmd = devm_cxl_add_memdev(&pdev->dev, cxlds);
+	rc = cxl_dpa_setup(cxlds, &range_info);
+	if (rc)
+		return rc;
+
+	rc = devm_cxl_setup_features(cxlds);
+	if (rc)
+		dev_dbg(&pdev->dev, "No CXL Features discovered\n");
+
+	cxlmd = devm_cxl_add_memdev(cxlds, NULL);
 	if (IS_ERR(cxlmd))
 		return PTR_ERR(cxlmd);
 
@@ -1005,7 +960,14 @@ static int cxl_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (rc)
 		return rc;
 
+	rc = devm_cxl_setup_fwctl(&pdev->dev, cxlmd);
+	if (rc)
+		dev_dbg(&pdev->dev, "No CXL FWCTL setup\n");
+
 	pmu_count = cxl_count_regblock(pdev, CXL_REGLOC_RBI_PMU);
+	if (pmu_count < 0)
+		return pmu_count;
+
 	for (i = 0; i < pmu_count; i++) {
 		struct cxl_pmu_regs pmu_regs;
 
@@ -1031,10 +993,6 @@ static int cxl_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	rc = cxl_event_config(host_bridge, mds, irq_avail);
 	if (rc)
 		return rc;
-
-	rc = cxl_pci_ras_unmask(pdev);
-	if (rc)
-		dev_dbg(&pdev->dev, "No RAS reporting unmasked\n");
 
 	pci_save_state(pdev);
 

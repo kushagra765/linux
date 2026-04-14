@@ -181,19 +181,22 @@ int amdgpu_atomfirmware_allocate_fb_scratch(struct amdgpu_device *adev)
 	u8 frev, crev;
 	int usage_bytes = 0;
 
-	if (amdgpu_atom_parse_data_header(ctx, index, NULL, &frev, &crev, &data_offset)) {
-		if (frev == 2 && crev == 1) {
-			fw_usage_v2_1 =
-				(struct vram_usagebyfirmware_v2_1 *)(ctx->bios + data_offset);
-			amdgpu_atomfirmware_allocate_fb_v2_1(adev,
-					fw_usage_v2_1,
-					&usage_bytes);
-		} else if (frev >= 2 && crev >= 2) {
-			fw_usage_v2_2 =
-				(struct vram_usagebyfirmware_v2_2 *)(ctx->bios + data_offset);
-			amdgpu_atomfirmware_allocate_fb_v2_2(adev,
-					fw_usage_v2_2,
-					&usage_bytes);
+	/* Skip atomfirmware allocation for SRIOV VFs when dynamic crit regn is enabled */
+	if (!(amdgpu_sriov_vf(adev) && adev->virt.is_dynamic_crit_regn_enabled)) {
+		if (amdgpu_atom_parse_data_header(ctx, index, NULL, &frev, &crev, &data_offset)) {
+			if (frev == 2 && crev == 1) {
+				fw_usage_v2_1 =
+					(struct vram_usagebyfirmware_v2_1 *)(ctx->bios + data_offset);
+				amdgpu_atomfirmware_allocate_fb_v2_1(adev,
+						fw_usage_v2_1,
+						&usage_bytes);
+			} else if (frev >= 2 && crev >= 2) {
+				fw_usage_v2_2 =
+					(struct vram_usagebyfirmware_v2_2 *)(ctx->bios + data_offset);
+				amdgpu_atomfirmware_allocate_fb_v2_2(adev,
+						fw_usage_v2_2,
+						&usage_bytes);
+			}
 		}
 	}
 
@@ -281,6 +284,9 @@ static int convert_atom_mem_type_to_vram_type(struct amdgpu_device *adev,
 		case ATOM_DGPU_VRAM_TYPE_GDDR6:
 			vram_type = AMDGPU_VRAM_TYPE_GDDR6;
 			break;
+		case ATOM_DGPU_VRAM_TYPE_HBM3E:
+			vram_type = AMDGPU_VRAM_TYPE_HBM3E;
+			break;
 		default:
 			vram_type = AMDGPU_VRAM_TYPE_UNKNOWN;
 			break;
@@ -288,6 +294,83 @@ static int convert_atom_mem_type_to_vram_type(struct amdgpu_device *adev,
 	}
 
 	return vram_type;
+}
+
+static int amdgpu_atomfirmware_get_uma_carveout_info_v2_3(struct amdgpu_device *adev,
+							  union igp_info *igp_info,
+							  struct amdgpu_uma_carveout_info *uma_info)
+{
+	struct uma_carveout_option *opts;
+	uint8_t nr_uma_options;
+	int i;
+
+	nr_uma_options = igp_info->v23.UMACarveoutIndexMax;
+
+	if (!nr_uma_options)
+		return -ENODEV;
+
+	if (nr_uma_options > MAX_UMA_OPTION_ENTRIES) {
+		drm_dbg(adev_to_drm(adev),
+			"Number of UMA options exceeds max table size. Options will not be parsed");
+		return -EINVAL;
+	}
+
+	uma_info->num_entries = nr_uma_options;
+	uma_info->uma_option_index = igp_info->v23.UMACarveoutIndex;
+
+	opts = igp_info->v23.UMASizeControlOption;
+
+	for (i = 0; i < nr_uma_options; i++) {
+		if (!opts[i].memoryCarvedGb)
+			uma_info->entries[i].memory_carved_mb = 512;
+		else
+			uma_info->entries[i].memory_carved_mb = (uint32_t)opts[i].memoryCarvedGb << 10;
+
+		uma_info->entries[i].flags = opts[i].uma_carveout_option_flags.all8;
+		strscpy(uma_info->entries[i].name, opts[i].optionName, MAX_UMA_OPTION_NAME);
+	}
+
+	return 0;
+}
+
+int amdgpu_atomfirmware_get_uma_carveout_info(struct amdgpu_device *adev,
+					      struct amdgpu_uma_carveout_info *uma_info)
+{
+	struct amdgpu_mode_info *mode_info = &adev->mode_info;
+	union igp_info *igp_info;
+	u16 data_offset, size;
+	u8 frev, crev;
+	int index;
+
+	if (!(adev->flags & AMD_IS_APU))
+		return -ENODEV;
+
+	index = get_index_into_master_table(atom_master_list_of_data_tables_v2_1,
+					    integratedsysteminfo);
+
+	if (!amdgpu_atom_parse_data_header(mode_info->atom_context,
+					  index, &size,
+					  &frev, &crev, &data_offset)) {
+		return -EINVAL;
+	}
+
+	igp_info = (union igp_info *)
+			(mode_info->atom_context->bios + data_offset);
+
+	switch (frev) {
+	case 2:
+		switch (crev) {
+		case 3:
+			return amdgpu_atomfirmware_get_uma_carveout_info_v2_3(adev, igp_info, uma_info);
+		break;
+		default:
+			break;
+		}
+		break;
+	default:
+		break;
+	}
+	return -ENODEV;
 }
 
 int
@@ -549,9 +632,10 @@ bool amdgpu_atomfirmware_mem_ecc_supported(struct amdgpu_device *adev)
 	u16 data_offset, size;
 	union umc_info *umc_info;
 	u8 frev, crev;
-	bool ecc_default_enabled = false;
+	bool mem_ecc_enabled = false;
 	u8 umc_config;
 	u32 umc_config1;
+	adev->ras_default_ecc_enabled = false;
 
 	index = get_index_into_master_table(atom_master_list_of_data_tables_v2_1,
 			umc_info);
@@ -563,20 +647,22 @@ bool amdgpu_atomfirmware_mem_ecc_supported(struct amdgpu_device *adev)
 			switch (crev) {
 			case 1:
 				umc_config = le32_to_cpu(umc_info->v31.umc_config);
-				ecc_default_enabled =
+				mem_ecc_enabled =
 					(umc_config & UMC_CONFIG__DEFAULT_MEM_ECC_ENABLE) ? true : false;
 				break;
 			case 2:
 				umc_config = le32_to_cpu(umc_info->v32.umc_config);
-				ecc_default_enabled =
+				mem_ecc_enabled =
 					(umc_config & UMC_CONFIG__DEFAULT_MEM_ECC_ENABLE) ? true : false;
 				break;
 			case 3:
 				umc_config = le32_to_cpu(umc_info->v33.umc_config);
 				umc_config1 = le32_to_cpu(umc_info->v33.umc_config1);
-				ecc_default_enabled =
+				mem_ecc_enabled =
 					((umc_config & UMC_CONFIG__DEFAULT_MEM_ECC_ENABLE) ||
 					 (umc_config1 & UMC_CONFIG1__ENABLE_ECC_CAPABLE)) ? true : false;
+				adev->ras_default_ecc_enabled =
+					(umc_config & UMC_CONFIG__DEFAULT_MEM_ECC_ENABLE) ? true : false;
 				break;
 			default:
 				/* unsupported crev */
@@ -585,9 +671,12 @@ bool amdgpu_atomfirmware_mem_ecc_supported(struct amdgpu_device *adev)
 		} else if (frev == 4) {
 			switch (crev) {
 			case 0:
+				umc_config = le32_to_cpu(umc_info->v40.umc_config);
 				umc_config1 = le32_to_cpu(umc_info->v40.umc_config1);
-				ecc_default_enabled =
+				mem_ecc_enabled =
 					(umc_config1 & UMC_CONFIG1__ENABLE_ECC_CAPABLE) ? true : false;
+				adev->ras_default_ecc_enabled =
+					(umc_config & UMC_CONFIG__DEFAULT_MEM_ECC_ENABLE) ? true : false;
 				break;
 			default:
 				/* unsupported crev */
@@ -599,7 +688,7 @@ bool amdgpu_atomfirmware_mem_ecc_supported(struct amdgpu_device *adev)
 		}
 	}
 
-	return ecc_default_enabled;
+	return mem_ecc_enabled;
 }
 
 /*

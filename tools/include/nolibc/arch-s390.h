@@ -5,8 +5,12 @@
 
 #ifndef _NOLIBC_ARCH_S390_H
 #define _NOLIBC_ARCH_S390_H
-#include <asm/signal.h>
-#include <asm/unistd.h>
+
+#include "types.h"
+
+#include <linux/sched.h>
+#include <linux/signal.h>
+#include <linux/unistd.h>
 
 #include "compiler.h"
 #include "crt.h"
@@ -139,6 +143,7 @@
 	_arg1;								\
 })
 
+#ifndef NOLIBC_NO_RUNTIME
 /* startup code */
 void __attribute__((weak, noreturn)) __nolibc_entrypoint __no_stack_protector _start(void)
 {
@@ -150,6 +155,7 @@ void __attribute__((weak, noreturn)) __nolibc_entrypoint __no_stack_protector _s
 	);
 	__nolibc_entrypoint_epilogue();
 }
+#endif /* NOLIBC_NO_RUNTIME */
 
 struct s390_mmap_arg_struct {
 	unsigned long addr;
@@ -183,5 +189,12 @@ pid_t sys_fork(void)
 	return my_syscall5(__NR_clone, 0, SIGCHLD, 0, 0, 0);
 }
 #define sys_fork sys_fork
+
+static __attribute__((unused))
+pid_t sys_vfork(void)
+{
+	return my_syscall5(__NR_clone, 0, CLONE_VM | CLONE_VFORK | SIGCHLD, 0, 0, 0);
+}
+#define sys_vfork sys_vfork
 
 #endif /* _NOLIBC_ARCH_S390_H */

@@ -26,9 +26,8 @@ static int build_body(struct rv_jit_context *ctx, bool extra_pass, int *offset)
 		int ret;
 
 		ret = bpf_jit_emit_insn(insn, ctx, extra_pass);
-		/* BPF_LD | BPF_IMM | BPF_DW: skip the next instruction. */
 		if (ret > 0)
-			i++;
+			i++; /* skip the next instruction */
 		if (offset)
 			offset[i] = ctx->ninsns;
 		if (ret < 0)
@@ -64,7 +63,7 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 
 	jit_data = prog->aux->jit_data;
 	if (!jit_data) {
-		jit_data = kzalloc(sizeof(*jit_data), GFP_KERNEL);
+		jit_data = kzalloc_obj(*jit_data);
 		if (!jit_data) {
 			prog = orig_prog;
 			goto out;
@@ -83,7 +82,7 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 	ctx->arena_vm_start = bpf_arena_get_kern_vm_start(prog->aux->arena);
 	ctx->user_vm_start = bpf_arena_get_user_vm_start(prog->aux->arena);
 	ctx->prog = prog;
-	ctx->offset = kcalloc(prog->len, sizeof(int), GFP_KERNEL);
+	ctx->offset = kzalloc_objs(int, prog->len);
 	if (!ctx->offset) {
 		prog = orig_prog;
 		goto out_offset;

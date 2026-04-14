@@ -3,8 +3,7 @@
  *    Copyright IBM Corp. 2007
  */
 
-#define KMSG_COMPONENT "sclp_config"
-#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
+#define pr_fmt(fmt) "sclp_config: " fmt
 
 #include <linux/init.h>
 #include <linux/errno.h>
@@ -128,7 +127,7 @@ out:
 }
 
 static ssize_t sysfs_ofb_data_write(struct file *filp, struct kobject *kobj,
-				    struct bin_attribute *bin_attr,
+				    const struct bin_attribute *bin_attr,
 				    char *buf, loff_t off, size_t count)
 {
 	int rc;

@@ -522,7 +522,7 @@ static int mxic_spi_mem_exec_op(struct spi_mem *mem,
 	int i, ret;
 	u8 addr[8], cmd[2];
 
-	ret = mxic_spi_set_freq(mxic, mem->spi->max_speed_hz);
+	ret = mxic_spi_set_freq(mxic, op->max_freq);
 	if (ret)
 		return ret;
 
@@ -582,6 +582,7 @@ static const struct spi_controller_mem_caps mxic_spi_mem_caps = {
 	.dtr = true,
 	.ecc = true,
 	.swap16 = true,
+	.per_op_freq = true,
 };
 
 static void mxic_spi_set_cs(struct spi_device *spi, bool lvl)
@@ -767,7 +768,6 @@ static int mxic_spi_probe(struct platform_device *pdev)
 	mxic = spi_controller_get_devdata(host);
 	mxic->dev = &pdev->dev;
 
-	host->dev.of_node = pdev->dev.of_node;
 
 	mxic->ps_clk = devm_clk_get(&pdev->dev, "ps_clk");
 	if (IS_ERR(mxic->ps_clk))

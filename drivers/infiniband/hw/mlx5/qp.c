@@ -416,7 +416,7 @@ static void mlx5_ib_qp_event(struct mlx5_core_qp *qp, int type)
 	if (!ibqp->event_handler)
 		goto out_no_handler;
 
-	qpe_work = kzalloc(sizeof(*qpe_work), GFP_ATOMIC);
+	qpe_work = kzalloc_obj(*qpe_work, GFP_ATOMIC);
 	if (!qpe_work)
 		goto out_no_handler;
 
@@ -1185,8 +1185,7 @@ static int _create_kernel_qp(struct mlx5_ib_dev *dev,
 					sizeof(*qp->sq.wr_data), GFP_KERNEL);
 	qp->rq.wrid = kvmalloc_array(qp->rq.wqe_cnt,
 				     sizeof(*qp->rq.wrid), GFP_KERNEL);
-	qp->sq.w_list = kvmalloc_array(qp->sq.wqe_cnt,
-				       sizeof(*qp->sq.w_list), GFP_KERNEL);
+	qp->sq.w_list = kvmalloc_objs(*qp->sq.w_list, qp->sq.wqe_cnt);
 	qp->sq.wqe_head = kvmalloc_array(qp->sq.wqe_cnt,
 					 sizeof(*qp->sq.wqe_head), GFP_KERNEL);
 
@@ -3447,14 +3446,15 @@ static int ib_to_mlx5_rate_map(u8 rate)
 	return 0;
 }
 
-static int ib_rate_to_mlx5(struct mlx5_ib_dev *dev, u8 rate)
+int mlx5r_ib_rate(struct mlx5_ib_dev *dev, u8 rate)
 {
 	u32 stat_rate_support;
 
-	if (rate == IB_RATE_PORT_CURRENT)
+	if (rate == IB_RATE_PORT_CURRENT || rate == IB_RATE_800_GBPS ||
+	    rate == IB_RATE_1600_GBPS)
 		return 0;
 
-	if (rate < IB_RATE_2_5_GBPS || rate > IB_RATE_800_GBPS)
+	if (rate < IB_RATE_2_5_GBPS || rate > IB_RATE_1600_GBPS)
 		return -EINVAL;
 
 	stat_rate_support = MLX5_CAP_GEN(dev->mdev, stat_rate_support);
@@ -3596,7 +3596,7 @@ static int mlx5_set_path(struct mlx5_ib_dev *dev, struct mlx5_ib_qp *qp,
 		       sizeof(grh->dgid.raw));
 	}
 
-	err = ib_rate_to_mlx5(dev, rdma_ah_get_static_rate(ah));
+	err = mlx5r_ib_rate(dev, rdma_ah_get_static_rate(ah));
 	if (err < 0)
 		return err;
 	MLX5_SET(ads, path, stat_rate, err);
@@ -4361,6 +4361,11 @@ static int __mlx5_ib_modify_qp(struct ib_qp *ibqp,
 	optpar |= ib_mask_to_mlx5_opt(attr_mask);
 	optpar &= opt_mask[mlx5_cur][mlx5_new][mlx5_st];
 
+	if (attr_mask & IB_QP_RATE_LIMIT && qp->type != IB_QPT_RAW_PACKET) {
+		err = -EOPNOTSUPP;
+		goto out;
+	}
+
 	if (qp->type == IB_QPT_RAW_PACKET ||
 	    qp->flags & IB_QP_CREATE_SOURCE_QPN) {
 		struct mlx5_modify_raw_qp_param raw_qp_param = {};
@@ -4579,6 +4584,8 @@ static int mlx5_ib_modify_dct(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 
 		set_id = mlx5_ib_get_counters_id(dev, attr->port_num - 1);
 		MLX5_SET(dctc, dctc, counter_set_id, set_id);
+
+		qp->port = attr->port_num;
 	} else if (cur_state == IB_QPS_INIT && new_state == IB_QPS_RTR) {
 		struct mlx5_ib_modify_qp_resp resp = {};
 		u32 out[MLX5_ST_SZ_DW(create_dct_out)] = {};
@@ -5074,7 +5081,7 @@ static int mlx5_ib_dct_query_qp(struct mlx5_ib_dev *dev, struct mlx5_ib_qp *mqp,
 	}
 
 	if (qp_attr_mask & IB_QP_PORT)
-		qp_attr->port_num = MLX5_GET(dctc, dctc, port);
+		qp_attr->port_num = mqp->port;
 	if (qp_attr_mask & IB_QP_MIN_RNR_TIMER)
 		qp_attr->min_rnr_timer = MLX5_GET(dctc, dctc, min_rnr_nak);
 	if (qp_attr_mask & IB_QP_AV) {
@@ -5480,7 +5487,7 @@ struct ib_wq *mlx5_ib_create_wq(struct ib_pd *pd,
 	dev = to_mdev(pd->device);
 	switch (init_attr->wq_type) {
 	case IB_WQT_RQ:
-		rwq = kzalloc(sizeof(*rwq), GFP_KERNEL);
+		rwq = kzalloc_obj(*rwq);
 		if (!rwq)
 			return ERR_PTR(-ENOMEM);
 		err = prepare_user_rq(pd, init_attr, udata, rwq);

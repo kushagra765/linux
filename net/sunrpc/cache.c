@@ -11,6 +11,7 @@
 #include <linux/types.h>
 #include <linux/fs.h>
 #include <linux/file.h>
+#include <linux/hex.h>
 #include <linux/slab.h>
 #include <linux/signal.h>
 #include <linux/sched.h>
@@ -135,6 +136,8 @@ static struct cache_head *sunrpc_cache_add_entry(struct cache_detail *detail,
 
 	hlist_add_head_rcu(&new->cache_list, head);
 	detail->entries++;
+	if (detail->nextcheck > new->expiry_time)
+		detail->nextcheck = new->expiry_time + 1;
 	cache_get(new);
 	spin_unlock(&detail->hash_lock);
 
@@ -281,21 +284,7 @@ static int try_to_negate_entry(struct cache_detail *detail, struct cache_head *h
 	return rv;
 }
 
-/*
- * This is the generic cache management routine for all
- * the authentication caches.
- * It checks the currency of a cache item and will (later)
- * initiate an upcall to fill it if needed.
- *
- *
- * Returns 0 if the cache_head can be used, or cache_puts it and returns
- * -EAGAIN if upcall is pending and request has been queued
- * -ETIMEDOUT if upcall failed or request could not be queue or
- *           upcall completed but item is still invalid (implying that
- *           the cache item has been replaced with a newer one).
- * -ENOENT if cache entry was negative
- */
-int cache_check(struct cache_detail *detail,
+int cache_check_rcu(struct cache_detail *detail,
 		    struct cache_head *h, struct cache_req *rqstp)
 {
 	int rv;
@@ -336,6 +325,31 @@ int cache_check(struct cache_detail *detail,
 				rv = -ETIMEDOUT;
 		}
 	}
+
+	return rv;
+}
+EXPORT_SYMBOL_GPL(cache_check_rcu);
+
+/*
+ * This is the generic cache management routine for all
+ * the authentication caches.
+ * It checks the currency of a cache item and will (later)
+ * initiate an upcall to fill it if needed.
+ *
+ *
+ * Returns 0 if the cache_head can be used, or cache_puts it and returns
+ * -EAGAIN if upcall is pending and request has been queued
+ * -ETIMEDOUT if upcall failed or request could not be queue or
+ *           upcall completed but item is still invalid (implying that
+ *           the cache item has been replaced with a newer one).
+ * -ENOENT if cache entry was negative
+ */
+int cache_check(struct cache_detail *detail,
+		struct cache_head *h, struct cache_req *rqstp)
+{
+	int rv;
+
+	rv = cache_check_rcu(detail, h, rqstp);
 	if (rv)
 		cache_put(h, detail);
 	return rv;
@@ -451,24 +465,21 @@ static int cache_clean(void)
 		}
 	}
 
+	spin_lock(&current_detail->hash_lock);
+
 	/* find a non-empty bucket in the table */
-	while (current_detail &&
-	       current_index < current_detail->hash_size &&
+	while (current_index < current_detail->hash_size &&
 	       hlist_empty(&current_detail->hash_table[current_index]))
 		current_index++;
 
 	/* find a cleanable entry in the bucket and clean it, or set to next bucket */
-
-	if (current_detail && current_index < current_detail->hash_size) {
+	if (current_index < current_detail->hash_size) {
 		struct cache_head *ch = NULL;
 		struct cache_detail *d;
 		struct hlist_head *head;
 		struct hlist_node *tmp;
 
-		spin_lock(&current_detail->hash_lock);
-
 		/* Ok, now to clean this strand */
-
 		head = &current_detail->hash_table[current_index];
 		hlist_for_each_entry_safe(ch, tmp, head, cache_list) {
 			if (current_detail->nextcheck > ch->expiry_time)
@@ -489,8 +500,10 @@ static int cache_clean(void)
 		spin_unlock(&cache_list_lock);
 		if (ch)
 			sunrpc_end_cache_remove_entry(ch, d);
-	} else
+	} else {
+		spin_unlock(&current_detail->hash_lock);
 		spin_unlock(&cache_list_lock);
+	}
 
 	return rv;
 }
@@ -1025,7 +1038,7 @@ static int cache_open(struct inode *inode, struct file *filp,
 		return -EACCES;
 	nonseekable_open(inode, filp);
 	if (filp->f_mode & FMODE_READ) {
-		rp = kmalloc(sizeof(*rp), GFP_KERNEL);
+		rp = kmalloc_obj(*rp);
 		if (!rp) {
 			module_put(cd->owner);
 			return -ENOMEM;
@@ -1049,14 +1062,25 @@ static int cache_release(struct inode *inode, struct file *filp,
 	struct cache_reader *rp = filp->private_data;
 
 	if (rp) {
+		struct cache_request *rq = NULL;
+
 		spin_lock(&queue_lock);
 		if (rp->offset) {
 			struct cache_queue *cq;
-			for (cq= &rp->q; &cq->list != &cd->queue;
-			     cq = list_entry(cq->list.next, struct cache_queue, list))
+			for (cq = &rp->q; &cq->list != &cd->queue;
+			     cq = list_entry(cq->list.next,
+					     struct cache_queue, list))
 				if (!cq->reader) {
-					container_of(cq, struct cache_request, q)
-						->readers--;
+					struct cache_request *cr =
+						container_of(cq,
+						struct cache_request, q);
+					cr->readers--;
+					if (cr->readers == 0 &&
+					    !test_bit(CACHE_PENDING,
+						      &cr->item->flags)) {
+						list_del(&cr->q.list);
+						rq = cr;
+					}
 					break;
 				}
 			rp->offset = 0;
@@ -1064,9 +1088,14 @@ static int cache_release(struct inode *inode, struct file *filp,
 		list_del(&rp->q.list);
 		spin_unlock(&queue_lock);
 
+		if (rq) {
+			cache_put(rq->item, cd);
+			kfree(rq->buf);
+			kfree(rq);
+		}
+
 		filp->private_data = NULL;
 		kfree(rp);
-
 	}
 	if (filp->f_mode & FMODE_WRITE) {
 		atomic_dec(&cd->writers);
@@ -1212,7 +1241,7 @@ static int cache_pipe_upcall(struct cache_detail *detail, struct cache_head *h)
 	if (!buf)
 		return -EAGAIN;
 
-	crq = kmalloc(sizeof (*crq), GFP_KERNEL);
+	crq = kmalloc_obj(*crq);
 	if (!crq) {
 		kfree(buf);
 		return -EAGAIN;
@@ -1427,17 +1456,11 @@ static int c_show(struct seq_file *m, void *p)
 		seq_printf(m, "# expiry=%lld refcnt=%d flags=%lx\n",
 			   convert_to_wallclock(cp->expiry_time),
 			   kref_read(&cp->ref), cp->flags);
-	if (!cache_get_rcu(cp))
-		return 0;
 
-	if (cache_check(cd, cp, NULL))
-		/* cache_check does a cache_put on failure */
+	if (cache_check_rcu(cd, cp, NULL))
 		seq_puts(m, "# ");
-	else {
-		if (cache_is_expired(cd, cp))
-			seq_puts(m, "# ");
-		cache_put(cp, cd);
-	}
+	else if (cache_is_expired(cd, cp))
+		seq_puts(m, "# ");
 
 	return cd->cache_show(m, cd, cp);
 }
@@ -1669,11 +1692,13 @@ static void remove_cache_proc_entries(struct cache_detail *cd)
 	}
 }
 
-#ifdef CONFIG_PROC_FS
 static int create_cache_proc_entries(struct cache_detail *cd, struct net *net)
 {
 	struct proc_dir_entry *p;
 	struct sunrpc_net *sn;
+
+	if (!IS_ENABLED(CONFIG_PROC_FS))
+		return 0;
 
 	sn = net_generic(net, sunrpc_net_id);
 	cd->procfs = proc_mkdir(cd->name, sn->proc_net_rpc);
@@ -1702,12 +1727,6 @@ out_nomem:
 	remove_cache_proc_entries(cd);
 	return -ENOMEM;
 }
-#else /* CONFIG_PROC_FS */
-static int create_cache_proc_entries(struct cache_detail *cd, struct net *net)
-{
-	return 0;
-}
-#endif
 
 void __init cache_initialize(void)
 {
@@ -1742,8 +1761,7 @@ struct cache_detail *cache_create_net(const struct cache_detail *tmpl, struct ne
 	if (cd == NULL)
 		return ERR_PTR(-ENOMEM);
 
-	cd->hash_table = kcalloc(cd->hash_size, sizeof(struct hlist_head),
-				 GFP_KERNEL);
+	cd->hash_table = kzalloc_objs(struct hlist_head, cd->hash_size);
 	if (cd->hash_table == NULL) {
 		kfree(cd);
 		return ERR_PTR(-ENOMEM);

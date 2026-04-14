@@ -3,7 +3,7 @@
  * Copyright (c) 2023-2024 Oracle.  All Rights Reserved.
  * Author: Darrick J. Wong <djwong@kernel.org>
  */
-#include "xfs.h"
+#include "xfs_platform.h"
 #include "xfs_fs.h"
 #include "xfs_shared.h"
 #include "xfs_format.h"
@@ -21,6 +21,8 @@
 #include "xfs_trans_space.h"
 #include "xfs_attr.h"
 #include "xfs_rtgroup.h"
+#include "xfs_rtrmap_btree.h"
+#include "xfs_rtrefcount_btree.h"
 #include "scrub/scrub.h"
 #include "scrub/common.h"
 #include "scrub/trace.h"
@@ -77,7 +79,7 @@ xchk_metapath_cleanup(
 
 	if (mpath->dp_ilock_flags)
 		xfs_iunlock(mpath->dp, mpath->dp_ilock_flags);
-	kfree(mpath->path);
+	kfree_const(mpath->path);
 }
 
 /* Set up a metadir path scan.  @path must be dynamically allocated. */
@@ -96,13 +98,13 @@ xchk_setup_metapath_scan(
 
 	error = xchk_install_live_inode(sc, ip);
 	if (error) {
-		kfree(path);
+		kfree_const(path);
 		return error;
 	}
 
-	mpath = kzalloc(sizeof(struct xchk_metapath), XCHK_GFP_FLAGS);
+	mpath = kzalloc_obj(struct xchk_metapath, XCHK_GFP_FLAGS);
 	if (!mpath) {
-		kfree(path);
+		kfree_const(path);
 		return -ENOMEM;
 	}
 
@@ -130,7 +132,7 @@ xchk_setup_metapath_rtdir(
 		return -ENOENT;
 
 	return xchk_setup_metapath_scan(sc, sc->mp->m_metadirip,
-			kasprintf(GFP_KERNEL, "rtgroups"), sc->mp->m_rtdirip);
+			kstrdup_const("rtgroups", GFP_KERNEL), sc->mp->m_rtdirip);
 }
 
 /* Scan a rtgroup inode under the /rtgroups directory. */
@@ -177,7 +179,7 @@ xchk_setup_metapath_quotadir(
 		return -ENOENT;
 
 	return xchk_setup_metapath_scan(sc, sc->mp->m_metadirip,
-			kstrdup("quota", GFP_KERNEL), qi->qi_dirip);
+			kstrdup_const("quota", GFP_KERNEL), qi->qi_dirip);
 }
 
 /* Scan a quota inode under the /quota directory. */
@@ -210,7 +212,7 @@ xchk_setup_metapath_dqinode(
 		return -ENOENT;
 
 	return xchk_setup_metapath_scan(sc, qi->qi_dirip,
-			kstrdup(xfs_dqinode_path(type), GFP_KERNEL), ip);
+			kstrdup_const(xfs_dqinode_path(type), GFP_KERNEL), ip);
 }
 #else
 # define xchk_setup_metapath_quotadir(...)	(-ENOENT)
@@ -246,6 +248,10 @@ xchk_setup_metapath(
 		return xchk_setup_metapath_dqinode(sc, XFS_DQTYPE_GROUP);
 	case XFS_SCRUB_METAPATH_PRJQUOTA:
 		return xchk_setup_metapath_dqinode(sc, XFS_DQTYPE_PROJ);
+	case XFS_SCRUB_METAPATH_RTRMAPBT:
+		return xchk_setup_metapath_rtginode(sc, XFS_RTGI_RMAP);
+	case XFS_SCRUB_METAPATH_RTREFCOUNTBT:
+		return xchk_setup_metapath_rtginode(sc, XFS_RTGI_REFCOUNT);
 	default:
 		return -ENOENT;
 	}
@@ -312,9 +318,7 @@ xchk_metapath(
 		return 0;
 	}
 
-	error = xchk_trans_alloc_empty(sc);
-	if (error)
-		return error;
+	xchk_trans_alloc_empty(sc);
 
 	error = xchk_metapath_ilock_both(mpath);
 	if (error)

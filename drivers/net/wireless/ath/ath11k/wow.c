@@ -148,8 +148,10 @@ static int ath11k_wow_cleanup(struct ath11k *ar)
  * 802.11: |4B|dest mac(6B)| 6B |src mac(6B)|  8B  |type(2B)|  body...  |
  *         +--+------------+----+-----------+---------------+-----------+
  */
-static void ath11k_wow_convert_8023_to_80211(struct cfg80211_pkt_pattern *new,
-					     const struct cfg80211_pkt_pattern *old)
+/* clang stack usage explodes if this is inlined */
+static noinline_for_stack
+void ath11k_wow_convert_8023_to_80211(struct cfg80211_pkt_pattern *new,
+				      const struct cfg80211_pkt_pattern *old)
 {
 	u8 hdr_8023_pattern[ETH_HLEN] = {};
 	u8 hdr_8023_bit_mask[ETH_HLEN] = {};
@@ -379,7 +381,7 @@ static int ath11k_vif_wow_set_wakeups(struct ath11k_vif *arvif,
 			struct wmi_pno_scan_req *pno;
 			int ret;
 
-			pno = kzalloc(sizeof(*pno), GFP_KERNEL);
+			pno = kzalloc_obj(*pno);
 			if (!pno)
 				return -ENOMEM;
 
@@ -493,7 +495,7 @@ static int ath11k_vif_wow_clean_nlo(struct ath11k_vif *arvif)
 		if (ar->nlo_enabled) {
 			struct wmi_pno_scan_req *pno;
 
-			pno = kzalloc(sizeof(*pno), GFP_KERNEL);
+			pno = kzalloc_obj(*pno);
 			if (!pno)
 				return -ENOMEM;
 

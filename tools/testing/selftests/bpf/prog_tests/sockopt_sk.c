@@ -2,7 +2,7 @@
 #include <test_progs.h>
 #include "cgroup_helpers.h"
 
-#include <linux/tcp.h>
+#include <netinet/tcp.h>
 #include <linux/netlink.h>
 #include "sockopt_sk.skel.h"
 
@@ -142,7 +142,7 @@ static int getsetsockopt(void)
 
 	/* TCP_CONGESTION can extend the string */
 
-	strcpy(buf.cc, "nv");
+	strscpy(buf.cc, "nv");
 	err = setsockopt(fd, SOL_TCP, TCP_CONGESTION, &buf, strlen("nv"));
 	if (err) {
 		log_err("Failed to call setsockopt(TCP_CONGESTION)");

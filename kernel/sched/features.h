@@ -32,6 +32,15 @@ SCHED_FEAT(PREEMPT_SHORT, true)
 SCHED_FEAT(NEXT_BUDDY, false)
 
 /*
+ * Allow completely ignoring cfs_rq->next; which can be set from various
+ * places:
+ *   - NEXT_BUDDY (wakeup preemption)
+ *   - yield_to_task()
+ *   - cgroup dequeue / pick
+ */
+SCHED_FEAT(PICK_BUDDY, true)
+
+/*
  * Consider buddies to be cache hot, decreases the likeliness of a
  * cache buddy being migrated away, increases cache locality.
  */
@@ -54,8 +63,13 @@ SCHED_FEAT(DELAY_ZERO, true)
  */
 SCHED_FEAT(WAKEUP_PREEMPTION, true)
 
+#ifdef CONFIG_HRTIMER_REARM_DEFERRED
+SCHED_FEAT(HRTICK, true)
+SCHED_FEAT(HRTICK_DL, true)
+#else
 SCHED_FEAT(HRTICK, false)
 SCHED_FEAT(HRTICK_DL, false)
+#endif
 
 /*
  * Decrement CPU capacity based on time not spent running tasks
@@ -112,3 +126,8 @@ SCHED_FEAT(WA_BIAS, true)
 SCHED_FEAT(UTIL_EST, true)
 
 SCHED_FEAT(LATENCY_WARN, false)
+
+/*
+ * Do newidle balancing proportional to its success rate using randomization.
+ */
+SCHED_FEAT(NI_RANDOM, true)

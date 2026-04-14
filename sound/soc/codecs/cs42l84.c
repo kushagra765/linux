@@ -84,7 +84,7 @@ static const struct regmap_config cs42l84_regmap = {
 static int cs42l84_put_dac_vol(struct snd_kcontrol *kctl,
 			struct snd_ctl_elem_value *val)
 {
-	struct snd_soc_component *component = snd_soc_kcontrol_component(kctl);
+	struct snd_soc_component *component = snd_kcontrol_chip(kctl);
 	struct soc_mixer_control *mc = (struct soc_mixer_control *) kctl->private_value;
 	int vola, volb;
 	int ret, ret2, updated = 0;
@@ -138,7 +138,7 @@ bail:
 static int cs42l84_get_dac_vol(struct snd_kcontrol *kctl,
 			struct snd_ctl_elem_value *val)
 {
-	struct snd_soc_component *component = snd_soc_kcontrol_component(kctl);
+	struct snd_soc_component *component = snd_kcontrol_chip(kctl);
 	struct soc_mixer_control *mc = (struct soc_mixer_control *) kctl->private_value;
 	int vola, volb;
 	int ret;
@@ -1087,7 +1087,7 @@ static const struct of_device_id cs42l84_of_match[] = {
 MODULE_DEVICE_TABLE(of, cs42l84_of_match);
 
 static const struct i2c_device_id cs42l84_id[] = {
-	{"cs42l84", 0},
+	{ "cs42l84" },
 	{}
 };
 MODULE_DEVICE_TABLE(i2c, cs42l84_id);

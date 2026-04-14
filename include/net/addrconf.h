@@ -8,7 +8,8 @@
 
 #define MIN_VALID_LIFETIME		(2*3600)	/* 2 hours */
 
-#define TEMP_VALID_LIFETIME		(7*86400)       /* 1 week */
+/* TEMP_VALID_LIFETIME default value as specified in RFC 8981 3.8 */
+#define TEMP_VALID_LIFETIME		(2*86400)       /* 2 days */
 #define TEMP_PREFERRED_LIFETIME		(86400)         /* 24 hours */
 #define REGEN_MIN_ADVANCE		(2)             /* 2 seconds */
 #define REGEN_MAX_RETRY			(3)
@@ -86,6 +87,23 @@ struct ifa6_config {
 	u32			preferred_lft;
 	u32			valid_lft;
 	u16			scope;
+};
+
+enum addr_type_t {
+	UNICAST_ADDR,
+	MULTICAST_ADDR,
+	ANYCAST_ADDR,
+};
+
+struct inet6_fill_args {
+	u32 portid;
+	u32 seq;
+	int event;
+	unsigned int flags;
+	int netnsid;
+	int ifindex;
+	enum addr_type_t type;
+	bool force_rt_scope_universe;
 };
 
 int addrconf_init(void);
@@ -330,6 +348,16 @@ static inline struct inet6_dev *__in6_dev_get(const struct net_device *dev)
 	return rcu_dereference_rtnl(dev->ip6_ptr);
 }
 
+static inline struct inet6_dev *in6_dev_rcu(const struct net_device *dev)
+{
+	return rcu_dereference(dev->ip6_ptr);
+}
+
+static inline struct inet6_dev *__in6_dev_get_rtnl_net(const struct net_device *dev)
+{
+	return rtnl_net_dereference(dev_net(dev), dev->ip6_ptr);
+}
+
 /**
  * __in6_dev_stats_get - get inet6_dev pointer for stats
  * @dev: network device
@@ -525,4 +553,11 @@ int if6_proc_init(void);
 void if6_proc_exit(void);
 #endif
 
+int inet6_fill_ifmcaddr(struct sk_buff *skb,
+			const struct ifmcaddr6 *ifmca,
+			struct inet6_fill_args *args);
+
+int inet6_fill_ifacaddr(struct sk_buff *skb,
+			const struct ifacaddr6 *ifaca,
+			struct inet6_fill_args *args);
 #endif

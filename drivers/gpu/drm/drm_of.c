@@ -55,7 +55,8 @@ EXPORT_SYMBOL(drm_of_crtc_port_mask);
  * and generate the DRM mask of CRTCs which may be attached to this
  * encoder.
  *
- * See Documentation/devicetree/bindings/graph.txt for the bindings.
+ * See https://github.com/devicetree-org/dt-schema/blob/main/dtschema/schemas/graph.yaml
+ * for the bindings.
  */
 uint32_t drm_of_find_possible_crtcs(struct drm_device *dev,
 				    struct device_node *port)
@@ -106,7 +107,9 @@ EXPORT_SYMBOL_GPL(drm_of_component_match_add);
  * Parse the platform device OF node and bind all the components associated
  * with the master. Interface ports are added before the encoders in order to
  * satisfy their .bind requirements
- * See Documentation/devicetree/bindings/graph.txt for the bindings.
+ *
+ * See https://github.com/devicetree-org/dt-schema/blob/main/dtschema/schemas/graph.yaml
+ * for the bindings.
  *
  * Returns zero if successful, or one of the standard error codes if it fails.
  */
@@ -268,9 +271,9 @@ int drm_of_find_panel_or_bridge(const struct device_node *np,
 			*panel = NULL;
 	}
 
-	/* No panel found yet, check for a bridge next. */
 	if (bridge) {
 		if (ret) {
+			/* No panel found yet, check for a bridge next. */
 			*bridge = of_drm_find_bridge(remote);
 			if (*bridge)
 				ret = 0;
@@ -564,6 +567,8 @@ EXPORT_SYMBOL_GPL(drm_of_get_data_lanes_count_ep);
  * Gets parent DSI bus for a DSI device controlled through a bus other
  * than MIPI-DCS (SPI, I2C, etc.) using the Device Tree.
  *
+ * This function assumes that the device's port@0 is the DSI input.
+ *
  * Returns pointer to mipi_dsi_host if successful, -EINVAL if the
  * request is unsupported, -EPROBE_DEFER if the DSI host is found but
  * not available, or -ENODEV otherwise.
@@ -576,7 +581,7 @@ struct mipi_dsi_host *drm_of_get_dsi_bus(struct device *dev)
 	/*
 	 * Get first endpoint child from device.
 	 */
-	endpoint = of_graph_get_next_endpoint(dev->of_node, NULL);
+	endpoint = of_graph_get_endpoint_by_regs(dev->of_node, 0, -1);
 	if (!endpoint)
 		return ERR_PTR(-ENODEV);
 

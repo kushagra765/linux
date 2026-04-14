@@ -5,6 +5,9 @@
 #include <linux/perf_event.h>
 #include <linux/types.h>
 
+struct machine;
+struct thread;
+
 /* number of register is bound by the number of bits in regs_dump::mask (64) */
 #define PERF_SAMPLE_REGS_CACHE_SIZE (8 * sizeof(u64))
 
@@ -67,7 +70,7 @@ struct aux_sample {
 };
 
 struct simd_flags {
-	u64	arch:1,	/* architecture (isa) */
+	u8	arch:1,	/* architecture (isa) */
 		pred:2;	/* predication */
 };
 
@@ -104,23 +107,32 @@ struct perf_sample {
 	u8  cpumode;
 	u16 misc;
 	u16 ins_lat;
-	union {
-		u16 p_stage_cyc;
-		u16 retire_lat;
-	};
+	/** @weight3: On x86 holds retire_lat, on powerpc holds p_stage_cyc. */
+	u16 weight3;
 	bool no_hw_idx;		/* No hw_idx collected in branch_stack */
+	bool deferred_callchain;	/* Has deferred user callchains */
+	u64 deferred_cookie;
 	char insn[MAX_INSN];
 	void *raw_data;
 	struct ip_callchain *callchain;
 	struct branch_stack *branch_stack;
 	u64 *branch_stack_cntr;
-	struct regs_dump  user_regs;
-	struct regs_dump  intr_regs;
+	struct regs_dump  *user_regs;
+	struct regs_dump  *intr_regs;
 	struct stack_dump user_stack;
 	struct sample_read read;
 	struct aux_sample aux_sample;
 	struct simd_flags simd_flags;
 };
+
+void perf_sample__init(struct perf_sample *sample, bool all);
+void perf_sample__exit(struct perf_sample *sample);
+struct regs_dump *perf_sample__user_regs(struct perf_sample *sample);
+struct regs_dump *perf_sample__intr_regs(struct perf_sample *sample);
+
+void perf_sample__fetch_insn(struct perf_sample *sample,
+			     struct thread *thread,
+			     struct machine *machine);
 
 /*
  * raw_data is always 4 bytes from an 8-byte boundary, so subtract 4 to get

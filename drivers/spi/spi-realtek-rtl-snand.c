@@ -364,7 +364,6 @@ static int rtl_snand_probe(struct platform_device *pdev)
 		.reg_bits	= 32,
 		.val_bits	= 32,
 		.reg_stride	= 4,
-		.cache_type	= REGCACHE_NONE,
 	};
 	int irq, ret;
 
@@ -401,7 +400,6 @@ static int rtl_snand_probe(struct platform_device *pdev)
 	ctrl->mem_ops = &rtl_snand_mem_ops;
 	ctrl->bits_per_word_mask = SPI_BPW_MASK(8);
 	ctrl->mode_bits = SPI_RX_DUAL | SPI_RX_QUAD | SPI_TX_DUAL | SPI_TX_QUAD;
-	device_set_node(&ctrl->dev, dev_fwnode(dev));
 
 	return devm_spi_register_controller(dev, ctrl);
 }

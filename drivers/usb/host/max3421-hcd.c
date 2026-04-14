@@ -1523,7 +1523,7 @@ max3421_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 	max3421_ep = urb->ep->hcpriv;
 	if (!max3421_ep) {
 		/* gets freed in max3421_endpoint_disable: */
-		max3421_ep = kzalloc(sizeof(struct max3421_ep), GFP_ATOMIC);
+		max3421_ep = kzalloc_obj(struct max3421_ep, GFP_ATOMIC);
 		if (!max3421_ep) {
 			retval = -ENOMEM;
 			goto out;
@@ -1878,10 +1878,10 @@ max3421_probe(struct spi_device *spi)
 	INIT_LIST_HEAD(&max3421_hcd->ep_list);
 	spi_set_drvdata(spi, max3421_hcd);
 
-	max3421_hcd->tx = kmalloc(sizeof(*max3421_hcd->tx), GFP_KERNEL);
+	max3421_hcd->tx = kmalloc_obj(*max3421_hcd->tx);
 	if (!max3421_hcd->tx)
 		goto error;
-	max3421_hcd->rx = kmalloc(sizeof(*max3421_hcd->rx), GFP_KERNEL);
+	max3421_hcd->rx = kmalloc_obj(*max3421_hcd->rx);
 	if (!max3421_hcd->rx)
 		goto error;
 
@@ -1916,7 +1916,7 @@ error:
 	if (hcd) {
 		kfree(max3421_hcd->tx);
 		kfree(max3421_hcd->rx);
-		if (max3421_hcd->spi_thread)
+		if (!IS_ERR_OR_NULL(max3421_hcd->spi_thread))
 			kthread_stop(max3421_hcd->spi_thread);
 		usb_put_hcd(hcd);
 	}
@@ -1946,6 +1946,12 @@ max3421_remove(struct spi_device *spi)
 	usb_put_hcd(hcd);
 }
 
+static const struct spi_device_id max3421_spi_ids[] = {
+	{ "max3421" },
+	{ },
+};
+MODULE_DEVICE_TABLE(spi, max3421_spi_ids);
+
 static const struct of_device_id max3421_of_match_table[] = {
 	{ .compatible = "maxim,max3421", },
 	{},
@@ -1955,6 +1961,7 @@ MODULE_DEVICE_TABLE(of, max3421_of_match_table);
 static struct spi_driver max3421_driver = {
 	.probe		= max3421_probe,
 	.remove		= max3421_remove,
+	.id_table	= max3421_spi_ids,
 	.driver		= {
 		.name	= "max3421-hcd",
 		.of_match_table = max3421_of_match_table,

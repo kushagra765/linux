@@ -147,13 +147,13 @@ void saa7146_buffer_next(struct saa7146_dev *dev,
 			printk("vdma%d.num_line_byte: 0x%08x\n", 1,saa7146_read(dev,NUM_LINE_BYTE1));
 */
 		}
-		del_timer(&q->timeout);
+		timer_delete(&q->timeout);
 	}
 }
 
 void saa7146_buffer_timeout(struct timer_list *t)
 {
-	struct saa7146_dmaqueue *q = from_timer(q, t, timeout);
+	struct saa7146_dmaqueue *q = timer_container_of(q, t, timeout);
 	struct saa7146_dev *dev = q->dev;
 	unsigned long flags;
 
@@ -186,11 +186,11 @@ static ssize_t fops_write(struct file *file, const char __user *data, size_t cou
 	struct saa7146_dev *dev = video_drvdata(file);
 	int ret;
 
-	if (vdev->vfl_type != VFL_TYPE_VBI || !dev->ext_vv_data->vbi_fops.write)
+	if (vdev->vfl_type != VFL_TYPE_VBI || !dev->ext_vv_data->vbi_write)
 		return -EINVAL;
 	if (mutex_lock_interruptible(vdev->lock))
 		return -ERESTARTSYS;
-	ret = dev->ext_vv_data->vbi_fops.write(file, data, count, ppos);
+	ret = dev->ext_vv_data->vbi_write(file, data, count, ppos);
 	mutex_unlock(vdev->lock);
 	return ret;
 }
@@ -266,7 +266,7 @@ int saa7146_vv_init(struct saa7146_dev* dev, struct saa7146_ext_vv *ext_vv)
 	}
 	dev->v4l2_dev.ctrl_handler = hdl;
 
-	vv = kzalloc(sizeof(struct saa7146_vv), GFP_KERNEL);
+	vv = kzalloc_obj(struct saa7146_vv);
 	if (vv == NULL) {
 		ERR("out of memory. aborting.\n");
 		v4l2_ctrl_handler_free(hdl);

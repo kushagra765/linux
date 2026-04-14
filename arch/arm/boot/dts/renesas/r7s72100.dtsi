@@ -14,6 +14,7 @@
 	compatible = "renesas,r7s72100";
 	#address-cells = <1>;
 	#size-cells = <1>;
+	interrupt-parent = <&gic>;
 
 	aliases {
 		i2c0 = &i2c0;
@@ -41,6 +42,7 @@
 		#address-cells = <1>;
 		#size-cells = <1>;
 		ranges = <0 0 0x18000000>;
+		bootph-all;
 	};
 
 	cpus {
@@ -83,7 +85,7 @@
 
 	pmu {
 		compatible = "arm,cortex-a9-pmu";
-		interrupts-extended = <&gic GIC_PPI 0 IRQ_TYPE_LEVEL_HIGH>;
+		interrupts = <GIC_PPI 0 IRQ_TYPE_LEVEL_HIGH>;
 	};
 
 	rtc_x1_clk: rtc_x1 {
@@ -102,11 +104,11 @@
 
 	soc {
 		compatible = "simple-bus";
-		interrupt-parent = <&gic>;
 
 		#address-cells = <1>;
 		#size-cells = <1>;
 		ranges;
+		bootph-all;
 
 		L2: cache-controller@3ffff000 {
 			compatible = "arm,pl310-cache";
@@ -238,6 +240,8 @@
 				     <GIC_SPI 240 IRQ_TYPE_LEVEL_HIGH>;
 			interrupt-names = "error", "rx", "tx";
 			clocks = <&mstp10_clks R7S72100_CLK_SPI0>;
+			dmas = <&dmac 0x2d21>, <&dmac 0x2d22>;
+			dma-names = "tx", "rx";
 			power-domains = <&cpg_clocks>;
 			num-cs = <1>;
 			#address-cells = <1>;
@@ -253,6 +257,8 @@
 				     <GIC_SPI 243 IRQ_TYPE_LEVEL_HIGH>;
 			interrupt-names = "error", "rx", "tx";
 			clocks = <&mstp10_clks R7S72100_CLK_SPI1>;
+			dmas = <&dmac 0x2d25>, <&dmac 0x2d26>;
+			dma-names = "tx", "rx";
 			power-domains = <&cpg_clocks>;
 			num-cs = <1>;
 			#address-cells = <1>;
@@ -268,6 +274,8 @@
 				     <GIC_SPI 246 IRQ_TYPE_LEVEL_HIGH>;
 			interrupt-names = "error", "rx", "tx";
 			clocks = <&mstp10_clks R7S72100_CLK_SPI2>;
+			dmas = <&dmac 0x2d29>, <&dmac 0x2d2a>;
+			dma-names = "tx", "rx";
 			power-domains = <&cpg_clocks>;
 			num-cs = <1>;
 			#address-cells = <1>;
@@ -283,6 +291,8 @@
 				     <GIC_SPI 249 IRQ_TYPE_LEVEL_HIGH>;
 			interrupt-names = "error", "rx", "tx";
 			clocks = <&mstp10_clks R7S72100_CLK_SPI3>;
+			dmas = <&dmac 0x2d2d>, <&dmac 0x2d2e>;
+			dma-names = "tx", "rx";
 			power-domains = <&cpg_clocks>;
 			num-cs = <1>;
 			#address-cells = <1>;
@@ -298,6 +308,8 @@
 				     <GIC_SPI 252 IRQ_TYPE_LEVEL_HIGH>;
 			interrupt-names = "error", "rx", "tx";
 			clocks = <&mstp10_clks R7S72100_CLK_SPI4>;
+			dmas = <&dmac 0x2d31>, <&dmac 0x2d32>;
+			dma-names = "tx", "rx";
 			power-domains = <&cpg_clocks>;
 			num-cs = <1>;
 			#address-cells = <1>;
@@ -547,6 +559,7 @@
 
 		pinctrl: pinctrl@fcfe3000 {
 			compatible = "renesas,r7s72100-ports";
+			bootph-all;
 
 			reg = <0xfcfe3000 0x4230>;
 

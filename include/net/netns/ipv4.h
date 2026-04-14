@@ -47,6 +47,11 @@ struct sysctl_fib_multipath_hash_seed {
 };
 #endif
 
+struct udp_tunnel_gro {
+	struct sock __rcu *sk;
+	struct hlist_head list;
+};
+
 struct netns_ipv4 {
 	/* Cacheline organization can be found documented in
 	 * Documentation/networking/net_cachelines/netns_ipv4_sysctl.rst.
@@ -69,21 +74,33 @@ struct netns_ipv4 {
 
 	/* TXRX readonly hotpath cache lines */
 	__cacheline_group_begin(netns_ipv4_read_txrx);
-	u8 sysctl_tcp_moderate_rcvbuf;
 	__cacheline_group_end(netns_ipv4_read_txrx);
 
 	/* RX readonly hotpath cache line */
 	__cacheline_group_begin(netns_ipv4_read_rx);
+	u8 sysctl_tcp_moderate_rcvbuf;
 	u8 sysctl_ip_early_demux;
 	u8 sysctl_tcp_early_demux;
 	u8 sysctl_tcp_l3mdev_accept;
 	/* 3 bytes hole, try to pack */
 	int sysctl_tcp_reordering;
 	int sysctl_tcp_rmem[3];
+	int sysctl_tcp_rcvbuf_low_rtt;
 	__cacheline_group_end(netns_ipv4_read_rx);
+
+	/* ICMP rate limiter hot cache line. */
+	__cacheline_group_begin_aligned(icmp);
+	atomic_t	icmp_global_credit;
+	u32		icmp_global_stamp;
+	__cacheline_group_end_aligned(icmp);
 
 	struct inet_timewait_death_row tcp_death_row;
 	struct udp_table *udp_table;
+
+#if IS_ENABLED(CONFIG_NET_UDP_TUNNEL)
+	/* Not in a pernet subsys because need to be available at GRO stage */
+	struct udp_tunnel_gro udp_tunnel_gro[2];
+#endif
 
 #ifdef CONFIG_SYSCTL
 	struct ctl_table_header	*forw_hdr;
@@ -111,6 +128,9 @@ struct netns_ipv4 {
 #endif
 	struct hlist_head	*fib_table_hash;
 	struct sock		*fibnl;
+	struct hlist_head	*fib_info_hash;
+	unsigned int		fib_info_hash_bits;
+	unsigned int		fib_info_cnt;
 
 	struct sock		*mc_autojoin_sk;
 
@@ -122,12 +142,12 @@ struct netns_ipv4 {
 	u8 sysctl_icmp_echo_ignore_broadcasts;
 	u8 sysctl_icmp_ignore_bogus_error_responses;
 	u8 sysctl_icmp_errors_use_inbound_ifaddr;
+	u8 sysctl_icmp_errors_extension_mask;
 	int sysctl_icmp_ratelimit;
 	int sysctl_icmp_ratemask;
 	int sysctl_icmp_msgs_per_sec;
 	int sysctl_icmp_msgs_burst;
-	atomic_t icmp_global_credit;
-	u32 icmp_global_stamp;
+
 	u32 ip_rt_min_pmtu;
 	int ip_rt_mtu_expires;
 	int ip_rt_min_advmss;
@@ -135,6 +155,8 @@ struct netns_ipv4 {
 	struct local_ports ip_local_ports;
 
 	u8 sysctl_tcp_ecn;
+	u8 sysctl_tcp_ecn_option;
+	u8 sysctl_tcp_ecn_option_beacon;
 	u8 sysctl_tcp_ecn_fallback;
 
 	u8 sysctl_ip_default_ttl;
@@ -175,11 +197,13 @@ struct netns_ipv4 {
 	u8 sysctl_tcp_retries2;
 	u8 sysctl_tcp_orphan_retries;
 	u8 sysctl_tcp_tw_reuse;
+	unsigned int sysctl_tcp_tw_reuse_delay;
 	int sysctl_tcp_fin_timeout;
 	u8 sysctl_tcp_sack;
 	u8 sysctl_tcp_window_scaling;
 	u8 sysctl_tcp_timestamps;
 	int sysctl_tcp_rto_min_us;
+	int sysctl_tcp_rto_max_ms;
 	u8 sysctl_tcp_recovery;
 	u8 sysctl_tcp_thin_linear_timeouts;
 	u8 sysctl_tcp_slow_start_after_idle;
@@ -203,6 +227,7 @@ struct netns_ipv4 {
 	int sysctl_tcp_pacing_ss_ratio;
 	int sysctl_tcp_pacing_ca_ratio;
 	unsigned int sysctl_tcp_child_ehash_entries;
+	int sysctl_tcp_comp_sack_rtt_percent;
 	unsigned long sysctl_tcp_comp_sack_delay_ns;
 	unsigned long sysctl_tcp_comp_sack_slack_ns;
 	int sysctl_max_syn_backlog;
@@ -236,6 +261,7 @@ struct netns_ipv4 {
 	int sysctl_igmp_qrv;
 
 	struct ping_group_range ping_group_range;
+	u16			ping_port_rover;
 
 	atomic_t dev_addr_genid;
 
@@ -272,4 +298,5 @@ struct netns_ipv4 {
 	struct hlist_head	*inet_addr_lst;
 	struct delayed_work	addr_chk_work;
 };
+
 #endif

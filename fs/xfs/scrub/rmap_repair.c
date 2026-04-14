@@ -3,7 +3,7 @@
  * Copyright (c) 2018-2024 Oracle.  All Rights Reserved.
  * Author: Darrick J. Wong <djwong@kernel.org>
  */
-#include "xfs.h"
+#include "xfs_platform.h"
 #include "xfs_fs.h"
 #include "xfs_shared.h"
 #include "xfs_format.h"
@@ -31,6 +31,9 @@
 #include "xfs_refcount.h"
 #include "xfs_refcount_btree.h"
 #include "xfs_ag.h"
+#include "xfs_rtrmap_btree.h"
+#include "xfs_rtgroup.h"
+#include "xfs_rtrefcount_btree.h"
 #include "scrub/xfs_scrub.h"
 #include "scrub/scrub.h"
 #include "scrub/common.h"
@@ -161,18 +164,15 @@ xrep_setup_ag_rmapbt(
 	struct xfs_scrub	*sc)
 {
 	struct xrep_rmap	*rr;
-	char			*descr;
 	int			error;
 
 	xchk_fsgates_enable(sc, XCHK_FSGATES_RMAP);
 
-	descr = xchk_xfile_ag_descr(sc, "reverse mapping records");
-	error = xrep_setup_xfbtree(sc, descr);
-	kfree(descr);
+	error = xrep_setup_xfbtree(sc, "reverse mapping records");
 	if (error)
 		return error;
 
-	rr = kzalloc(sizeof(struct xrep_rmap), XCHK_GFP_FLAGS);
+	rr = kzalloc_obj(struct xrep_rmap, XCHK_GFP_FLAGS);
 	if (!rr)
 		return -ENOMEM;
 
@@ -499,6 +499,69 @@ xrep_rmap_scan_iext(
 	return xrep_rmap_stash_accumulated(rf);
 }
 
+static int
+xrep_rmap_scan_meta_btree(
+	struct xrep_rmap_ifork	*rf,
+	struct xfs_inode	*ip)
+{
+	struct xfs_scrub	*sc = rf->rr->sc;
+	struct xfs_rtgroup	*rtg = NULL;
+	struct xfs_btree_cur	*cur = NULL;
+	enum xfs_rtg_inodes	type;
+	int			error;
+
+	if (rf->whichfork != XFS_DATA_FORK)
+		return -EFSCORRUPTED;
+
+	switch (ip->i_metatype) {
+	case XFS_METAFILE_RTRMAP:
+		type = XFS_RTGI_RMAP;
+		break;
+	case XFS_METAFILE_RTREFCOUNT:
+		type = XFS_RTGI_REFCOUNT;
+		break;
+	default:
+		ASSERT(0);
+		return -EFSCORRUPTED;
+	}
+
+	while ((rtg = xfs_rtgroup_next(sc->mp, rtg))) {
+		if (ip == rtg->rtg_inodes[type])
+			goto found;
+	}
+
+	/*
+	 * We should never find an rt metadata btree inode that isn't
+	 * associated with an rtgroup yet has ondisk blocks allocated to it.
+	 */
+	if (ip->i_nblocks) {
+		ASSERT(0);
+		return -EFSCORRUPTED;
+	}
+
+	return 0;
+
+found:
+	switch (ip->i_metatype) {
+	case XFS_METAFILE_RTRMAP:
+		cur = xfs_rtrmapbt_init_cursor(sc->tp, rtg);
+		break;
+	case XFS_METAFILE_RTREFCOUNT:
+		cur = xfs_rtrefcountbt_init_cursor(sc->tp, rtg);
+		break;
+	default:
+		ASSERT(0);
+		error = -EFSCORRUPTED;
+		goto out_rtg;
+	}
+
+	error = xrep_rmap_scan_iroot_btree(rf, cur);
+	xfs_btree_del_cursor(cur, error);
+out_rtg:
+	xfs_rtgroup_rele(rtg);
+	return error;
+}
+
 /* Find all the extents from a given AG in an inode fork. */
 STATIC int
 xrep_rmap_scan_ifork(
@@ -512,14 +575,14 @@ xrep_rmap_scan_ifork(
 		.whichfork	= whichfork,
 	};
 	struct xfs_ifork	*ifp = xfs_ifork_ptr(ip, whichfork);
+	bool			mappings_done;
 	int			error = 0;
 
 	if (!ifp)
 		return 0;
 
-	if (ifp->if_format == XFS_DINODE_FMT_BTREE) {
-		bool		mappings_done;
-
+	switch (ifp->if_format) {
+	case XFS_DINODE_FMT_BTREE:
 		/*
 		 * Scan the bmap btree for data device mappings.  This includes
 		 * the btree blocks themselves, even if this is a realtime
@@ -528,15 +591,18 @@ xrep_rmap_scan_ifork(
 		error = xrep_rmap_scan_bmbt(&rf, ip, &mappings_done);
 		if (error || mappings_done)
 			return error;
-	} else if (ifp->if_format != XFS_DINODE_FMT_EXTENTS) {
-		return 0;
+		fallthrough;
+	case XFS_DINODE_FMT_EXTENTS:
+		/* Scan incore extent cache if this isn't a realtime file. */
+		if (xfs_ifork_is_realtime(ip, whichfork))
+			return 0;
+
+		return xrep_rmap_scan_iext(&rf, ifp);
+	case XFS_DINODE_FMT_META_BTREE:
+		return xrep_rmap_scan_meta_btree(&rf, ip);
 	}
 
-	/* Scan incore extent cache if this isn't a realtime file. */
-	if (xfs_ifork_is_realtime(ip, whichfork))
-		return 0;
-
-	return xrep_rmap_scan_iext(&rf, ifp);
+	return 0;
 }
 
 /*
@@ -882,9 +948,7 @@ end_agscan:
 	sa->agf_bp = NULL;
 	sa->agi_bp = NULL;
 	xchk_trans_cancel(sc);
-	error = xchk_trans_alloc_empty(sc);
-	if (error)
-		return error;
+	xchk_trans_alloc_empty(sc);
 
 	/* Iterate all AGs for inodes rmaps. */
 	while ((error = xchk_iscan_iter(&rr->iscan, &ip)) == 1) {
@@ -1543,7 +1607,6 @@ xrep_rmapbt_live_update(
 	struct xfs_mount		*mp;
 	struct xfs_btree_cur		*mcur;
 	struct xfs_trans		*tp;
-	void				*txcookie;
 	int				error;
 
 	rr = container_of(nb, struct xrep_rmap, rhook.rmap_hook.nb);
@@ -1552,11 +1615,9 @@ xrep_rmapbt_live_update(
 	if (!xrep_rmapbt_want_live_update(&rr->iscan, &p->oinfo))
 		goto out_unlock;
 
-	trace_xrep_rmap_live_update(rr->sc->sa.pag, action, p);
+	trace_xrep_rmap_live_update(pag_group(rr->sc->sa.pag), action, p);
 
-	error = xrep_trans_alloc_hook_dummy(mp, &txcookie, &tp);
-	if (error)
-		goto out_abort;
+	tp = xfs_trans_alloc_empty(mp);
 
 	mutex_lock(&rr->lock);
 	mcur = xfs_rmapbt_mem_cursor(rr->sc->sa.pag, tp, &rr->rmap_btree);
@@ -1570,14 +1631,13 @@ xrep_rmapbt_live_update(
 	if (error)
 		goto out_cancel;
 
-	xrep_trans_cancel_hook_dummy(&txcookie, tp);
+	xfs_trans_cancel(tp);
 	mutex_unlock(&rr->lock);
 	return NOTIFY_DONE;
 
 out_cancel:
 	xfbtree_trans_cancel(&rr->rmap_btree, tp);
-	xrep_trans_cancel_hook_dummy(&txcookie, tp);
-out_abort:
+	xfs_trans_cancel(tp);
 	mutex_unlock(&rr->lock);
 	xchk_iscan_abort(&rr->iscan);
 out_unlock:

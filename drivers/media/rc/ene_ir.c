@@ -659,7 +659,7 @@ exit:
 /* timer to simulate tx done interrupt */
 static void ene_tx_irqsim(struct timer_list *t)
 {
-	struct ene_device *dev = from_timer(dev, t, tx_sim_timer);
+	struct ene_device *dev = timer_container_of(dev, t, tx_sim_timer);
 	unsigned long flags;
 
 	spin_lock_irqsave(&dev->hw_lock, flags);
@@ -993,7 +993,7 @@ static int ene_probe(struct pnp_dev *pnp_dev, const struct pnp_device_id *id)
 	struct ene_device *dev;
 
 	/* allocate memory */
-	dev = kzalloc(sizeof(struct ene_device), GFP_KERNEL);
+	dev = kzalloc_obj(struct ene_device);
 	rdev = rc_allocate_device(RC_DRIVER_IR_RAW);
 	if (!dev || !rdev)
 		goto exit_free_dev_rdev;
@@ -1104,7 +1104,7 @@ static void ene_remove(struct pnp_dev *pnp_dev)
 	unsigned long flags;
 
 	rc_unregister_device(dev->rdev);
-	del_timer_sync(&dev->tx_sim_timer);
+	timer_delete_sync(&dev->tx_sim_timer);
 	spin_lock_irqsave(&dev->hw_lock, flags);
 	ene_rx_disable(dev);
 	ene_rx_restore_hw_buffer(dev);

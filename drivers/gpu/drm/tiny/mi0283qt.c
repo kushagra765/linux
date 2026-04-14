@@ -13,8 +13,8 @@
 #include <linux/regulator/consumer.h>
 #include <linux/spi/spi.h>
 
+#include <drm/clients/drm_client_setup.h>
 #include <drm/drm_atomic_helper.h>
-#include <drm/drm_client_setup.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_fbdev_dma.h>
 #include <drm/drm_gem_atomic_helper.h>
@@ -22,6 +22,7 @@
 #include <drm/drm_managed.h>
 #include <drm/drm_mipi_dbi.h>
 #include <drm/drm_modeset_helper.h>
+#include <drm/drm_print.h>
 #include <video/mipi_display.h>
 
 #define ILI9341_FRMCTR1		0xb1
@@ -159,7 +160,6 @@ static const struct drm_driver mi0283qt_driver = {
 	.debugfs_init		= mipi_dbi_debugfs_init,
 	.name			= "mi0283qt",
 	.desc			= "Multi-Inno MI0283QT",
-	.date			= "20160614",
 	.major			= 1,
 	.minor			= 0,
 };

@@ -17,6 +17,7 @@
 #include <drm/drm_ioctl.h>
 #include <drm/drm_of.h>
 #include <drm/drm_prime.h>
+#include <drm/drm_print.h>
 
 #include "etnaviv_cmdbuf.h"
 #include "etnaviv_drv.h"
@@ -65,7 +66,7 @@ static int etnaviv_open(struct drm_device *dev, struct drm_file *file)
 	struct etnaviv_file_private *ctx;
 	int ret, i;
 
-	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	ctx = kzalloc_obj(*ctx);
 	if (!ctx)
 		return -ENOMEM;
 
@@ -488,7 +489,16 @@ static const struct drm_ioctl_desc etnaviv_ioctls[] = {
 	ETNA_IOCTL(PM_QUERY_SIG, pm_query_sig, DRM_RENDER_ALLOW),
 };
 
-DEFINE_DRM_GEM_FOPS(fops);
+static void etnaviv_show_fdinfo(struct drm_printer *p, struct drm_file *file)
+{
+	drm_show_memory_stats(p, file);
+}
+
+static const struct file_operations fops = {
+	.owner = THIS_MODULE,
+	DRM_GEM_FOPS,
+	.show_fdinfo = drm_show_fdinfo,
+};
 
 static const struct drm_driver etnaviv_drm_driver = {
 	.driver_features    = DRIVER_GEM | DRIVER_RENDER,
@@ -498,12 +508,12 @@ static const struct drm_driver etnaviv_drm_driver = {
 #ifdef CONFIG_DEBUG_FS
 	.debugfs_init       = etnaviv_debugfs_init,
 #endif
+	.show_fdinfo        = etnaviv_show_fdinfo,
 	.ioctls             = etnaviv_ioctls,
 	.num_ioctls         = DRM_ETNAVIV_NUM_IOCTLS,
 	.fops               = &fops,
 	.name               = "etnaviv",
 	.desc               = "etnaviv DRM",
-	.date               = "20151214",
 	.major              = 1,
 	.minor              = 4,
 };
@@ -521,7 +531,7 @@ static int etnaviv_bind(struct device *dev)
 	if (IS_ERR(drm))
 		return PTR_ERR(drm);
 
-	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+	priv = kzalloc_obj(*priv);
 	if (!priv) {
 		dev_err(dev, "failed to allocate private data\n");
 		ret = -ENOMEM;
@@ -590,6 +600,9 @@ static void etnaviv_unbind(struct device *dev)
 	drm_dev_unregister(drm);
 
 	component_unbind_all(dev, drm);
+
+	etnaviv_cmdbuf_free(priv->flop_reset_data_ppu);
+	kfree(priv->flop_reset_data_ppu);
 
 	etnaviv_cmdbuf_suballoc_destroy(priv->cmdbuf_suballoc);
 

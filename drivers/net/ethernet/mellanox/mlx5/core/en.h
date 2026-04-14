@@ -47,6 +47,7 @@
 #include <linux/rhashtable.h>
 #include <net/udp_tunnel.h>
 #include <net/switchdev.h>
+#include <net/psp/types.h>
 #include <net/xdp.h>
 #include <linux/dim.h>
 #include <linux/bits.h>
@@ -81,12 +82,14 @@ struct page_pool;
 
 #define MLX5E_RX_MAX_HEAD (256)
 #define MLX5E_SHAMPO_LOG_HEADER_ENTRY_SIZE (8)
-#define MLX5E_SHAMPO_LOG_MAX_HEADER_ENTRY_SIZE (9)
-#define MLX5E_SHAMPO_WQ_HEADER_PER_PAGE (PAGE_SIZE >> MLX5E_SHAMPO_LOG_MAX_HEADER_ENTRY_SIZE)
-#define MLX5E_SHAMPO_LOG_WQ_HEADER_PER_PAGE (PAGE_SHIFT - MLX5E_SHAMPO_LOG_MAX_HEADER_ENTRY_SIZE)
-#define MLX5E_SHAMPO_WQ_BASE_HEAD_ENTRY_SIZE (64)
-#define MLX5E_SHAMPO_WQ_RESRV_SIZE (64 * 1024)
-#define MLX5E_SHAMPO_WQ_BASE_RESRV_SIZE (4096)
+#define MLX5E_SHAMPO_WQ_HEADER_PER_PAGE \
+	(PAGE_SIZE >> MLX5E_SHAMPO_LOG_HEADER_ENTRY_SIZE)
+#define MLX5E_SHAMPO_LOG_WQ_HEADER_PER_PAGE \
+	(PAGE_SHIFT - MLX5E_SHAMPO_LOG_HEADER_ENTRY_SIZE)
+#define MLX5E_SHAMPO_WQ_BASE_HEAD_ENTRY_SIZE_SHIFT (6)
+#define MLX5E_SHAMPO_WQ_RESRV_SIZE_BASE_SHIFT (12)
+#define MLX5E_SHAMPO_WQ_LOG_RESRV_SIZE (16)
+#define MLX5E_SHAMPO_WQ_RESRV_SIZE BIT(MLX5E_SHAMPO_WQ_LOG_RESRV_SIZE)
 
 #define MLX5_MPWRQ_MIN_LOG_STRIDE_SZ(mdev) \
 	(6 + MLX5_CAP_GEN(mdev, cache_line_128byte)) /* HW restriction */
@@ -94,8 +97,6 @@ struct page_pool;
 	max_t(u32, MLX5_MPWRQ_MIN_LOG_STRIDE_SZ(mdev), req)
 #define MLX5_MPWRQ_DEF_LOG_STRIDE_SZ(mdev) \
 	MLX5_MPWRQ_LOG_STRIDE_SZ(mdev, order_base_2(MLX5E_RX_MAX_HEAD))
-
-#define MLX5_MPWRQ_MAX_LOG_WQE_SZ 18
 
 /* Keep in sync with mlx5e_mpwrq_log_wqe_sz.
  * These are theoretical maximums, which can be further restricted by
@@ -179,7 +180,8 @@ static inline u16 mlx5_min_rx_wqes(int wq_type, u32 wq_size)
 }
 
 /* Use this function to get max num channels (rxqs/txqs) only to create netdev */
-static inline int mlx5e_get_max_num_channels(struct mlx5_core_dev *mdev)
+static inline unsigned int
+mlx5e_get_max_num_channels(struct mlx5_core_dev *mdev)
 {
 	return is_kdump_kernel() ?
 		MLX5E_MIN_NUM_CHANNELS :
@@ -232,16 +234,22 @@ struct mlx5e_rx_wqe_cyc {
 	DECLARE_FLEX_ARRAY(struct mlx5_wqe_data_seg, data);
 };
 
-struct mlx5e_umr_wqe {
+struct mlx5e_umr_wqe_hdr {
 	struct mlx5_wqe_ctrl_seg       ctrl;
 	struct mlx5_wqe_umr_ctrl_seg   uctrl;
 	struct mlx5_mkey_seg           mkc;
+};
+
+struct mlx5e_umr_wqe {
+	struct mlx5e_umr_wqe_hdr hdr;
 	union {
 		DECLARE_FLEX_ARRAY(struct mlx5_mtt, inline_mtts);
 		DECLARE_FLEX_ARRAY(struct mlx5_klm, inline_klms);
 		DECLARE_FLEX_ARRAY(struct mlx5_ksm, inline_ksms);
 	};
 };
+static_assert(offsetof(struct mlx5e_umr_wqe, inline_mtts) == sizeof(struct mlx5e_umr_wqe_hdr),
+	      "struct members should be included in struct mlx5e_umr_wqe_hdr, not in struct mlx5e_umr_wqe");
 
 enum mlx5e_priv_flag {
 	MLX5E_PFLAG_RX_CQE_BASED_MODER,
@@ -274,10 +282,6 @@ enum packet_merge {
 struct mlx5e_packet_merge_param {
 	enum packet_merge type;
 	u32 timeout;
-	struct {
-		u8 match_criteria_type;
-		u8 alignment_granularity;
-	} shampo;
 };
 
 struct mlx5e_params {
@@ -343,6 +347,7 @@ struct mlx5e_cq {
 	/* data path - accessed per napi poll */
 	u16                        event_ctr;
 	struct napi_struct        *napi;
+	struct mlx5_uars_page     *uar;
 	struct mlx5_core_cq        mcq;
 	struct mlx5e_ch_stats     *ch_stats;
 
@@ -374,7 +379,7 @@ struct mlx5e_sq_dma {
 	enum mlx5e_dma_map_type type;
 };
 
-/* Keep this enum consistent with with the corresponding strings array
+/* Keep this enum consistent with the corresponding strings array
  * declared in en/reporter_tx.c
  */
 enum {
@@ -383,10 +388,9 @@ enum {
 	MLX5E_SQ_STATE_RECOVERING,
 	MLX5E_SQ_STATE_IPSEC,
 	MLX5E_SQ_STATE_DIM,
-	MLX5E_SQ_STATE_VLAN_NEED_L2_INLINE,
 	MLX5E_SQ_STATE_PENDING_XSK_TX,
 	MLX5E_SQ_STATE_PENDING_TLS_RX_RESYNC,
-	MLX5E_SQ_STATE_XDP_MULTIBUF,
+	MLX5E_SQ_STATE_LOCK_NEEDED,
 	MLX5E_NUM_SQ_STATES, /* Must be kept last */
 };
 
@@ -395,6 +399,7 @@ struct mlx5e_tx_mpwqe {
 	struct mlx5e_tx_wqe *wqe;
 	u32 bytes_count;
 	u8 ds_count;
+	u8 ds_count_max;
 	u8 pkt_count;
 	u8 inline_on;
 };
@@ -516,6 +521,12 @@ struct mlx5e_xdpsq {
 	struct mlx5e_channel      *channel;
 } ____cacheline_aligned_in_smp;
 
+struct mlx5e_xdp_buff {
+	struct xdp_buff xdp;
+	struct mlx5_cqe64 *cqe;
+	struct mlx5e_rq *rq;
+};
+
 struct mlx5e_ktls_resync_resp;
 
 struct mlx5e_icosq {
@@ -537,6 +548,11 @@ struct mlx5e_icosq {
 	u32                        sqn;
 	u16                        reserved_room;
 	unsigned long              state;
+	/* icosq can be accessed from any CPU and from different contexts
+	 * (NAPI softirq or process/workqueue). Always use spin_lock_bh for
+	 * simplicity and correctness across all contexts.
+	 */
+	spinlock_t                 lock;
 	struct mlx5e_ktls_resync_resp *ktls_resync;
 
 	/* control path */
@@ -547,7 +563,7 @@ struct mlx5e_icosq {
 } ____cacheline_aligned_in_smp;
 
 struct mlx5e_frag_page {
-	struct page *page;
+	netmem_ref netmem;
 	u16 frags;
 };
 
@@ -624,15 +640,11 @@ struct mlx5e_dma_info {
 };
 
 struct mlx5e_shampo_hd {
-	u32 mkey;
-	struct mlx5e_frag_page *pages;
 	u32 hd_per_wq;
-	u16 hd_per_wqe;
-	u16 pages_per_wq;
-	unsigned long *bitmap;
-	u16 pi;
-	u16 ci;
-	__be32 key;
+	u32 hd_buf_size;
+	u32 mkey;
+	u32 nentries;
+	DECLARE_FLEX_ARRAY(struct mlx5e_dma_info, hd_buf_pages);
 };
 
 struct mlx5e_hw_gro_data {
@@ -660,7 +672,7 @@ struct mlx5e_rq {
 		} wqe;
 		struct {
 			struct mlx5_wq_ll      wq;
-			struct mlx5e_umr_wqe   umr_wqe;
+			struct mlx5e_umr_wqe_hdr umr_wqe;
 			struct mlx5e_mpw_info *info;
 			mlx5e_fp_skb_from_cqe_mpwrq skb_from_cqe_mpwrq;
 			__be32                 umr_mkey_be;
@@ -690,7 +702,7 @@ struct mlx5e_rq {
 	struct mlx5e_rq_stats *stats;
 	struct mlx5e_cq        cq;
 	struct mlx5e_cq_decomp cqd;
-	struct hwtstamp_config *tstamp;
+	struct kernel_hwtstamp_config *hwtstamp_config;
 	struct mlx5_clock      *clock;
 	struct mlx5e_icosq    *icosq;
 	struct mlx5e_priv     *priv;
@@ -711,12 +723,18 @@ struct mlx5e_rq {
 	struct bpf_prog __rcu *xdp_prog;
 	struct mlx5e_xdpsq    *xdpsq;
 	DECLARE_BITMAP(flags, 8);
+
+	/* page pools */
 	struct page_pool      *page_pool;
+	struct page_pool      *hd_page_pool;
+
+	struct mlx5e_xdp_buff mxbuf;
 
 	/* AF_XDP zero-copy */
 	struct xsk_buff_pool  *xsk_pool;
 
 	struct work_struct     recover_work;
+	struct work_struct     rx_timeout_work;
 
 	/* control */
 	struct mlx5_wq_ctrl    wq_ctrl;
@@ -761,9 +779,7 @@ struct mlx5e_channel {
 	struct mlx5e_xdpsq         xsksq;
 
 	/* Async ICOSQ */
-	struct mlx5e_icosq         async_icosq;
-	/* async_icosq can be accessed from any CPU - the spinlock protects it. */
-	spinlock_t                 async_icosq_lock;
+	struct mlx5e_icosq        *async_icosq;
 
 	/* data path - accessed per napi poll */
 	const struct cpumask	  *aff_mask;
@@ -772,12 +788,12 @@ struct mlx5e_channel {
 	/* control */
 	struct mlx5e_priv         *priv;
 	struct mlx5_core_dev      *mdev;
-	struct hwtstamp_config    *tstamp;
 	DECLARE_BITMAP(state, MLX5E_CHANNEL_NUM_STATES);
 	int                        ix;
 	int                        vec_ix;
 	int                        sd_ix;
 	int                        cpu;
+	struct mlx5_sq_bfreg      *bfreg;
 	/* Sync between icosq recovery and XSK enable/disable. */
 	struct mutex               icosq_recovery_lock;
 
@@ -785,6 +801,21 @@ struct mlx5e_channel {
 	struct dim_cq_moder        rx_cq_moder;
 	struct dim_cq_moder        tx_cq_moder;
 };
+
+static inline bool mlx5e_icosq_sync_lock(struct mlx5e_icosq *sq)
+{
+	if (likely(!test_bit(MLX5E_SQ_STATE_LOCK_NEEDED, &sq->state)))
+		return false;
+
+	spin_lock_bh(&sq->lock);
+	return true;
+}
+
+static inline void mlx5e_icosq_sync_unlock(struct mlx5e_icosq *sq, bool locked)
+{
+	if (unlikely(locked))
+		spin_unlock_bh(&sq->lock);
+}
 
 struct mlx5e_ptp;
 
@@ -905,11 +936,14 @@ struct mlx5e_priv {
 	u8                         max_opened_tc;
 	bool                       tx_ptp_opened;
 	bool                       rx_ptp_opened;
-	struct hwtstamp_config     tstamp;
+	bool                       ktls_rx_was_enabled;
+	struct kernel_hwtstamp_config hwtstamp_config;
 	u16                        q_counter[MLX5_SD_MAX_GROUP_SZ];
 	u16                        drop_rq_q_counter;
 	struct notifier_block      events_nb;
 	struct notifier_block      blocking_events_nb;
+
+	struct mlx5e_pcie_cong_event *cong_event;
 
 	struct udp_tunnel_nic_info nic_info;
 #ifdef CONFIG_MLX5_CORE_EN_DCB
@@ -923,6 +957,9 @@ struct mlx5e_priv {
 #endif
 #ifdef CONFIG_MLX5_EN_IPSEC
 	struct mlx5e_ipsec        *ipsec;
+#endif
+#ifdef CONFIG_MLX5_EN_PSP
+	struct mlx5e_psp          *psp;
 #endif
 #ifdef CONFIG_MLX5_EN_TLS
 	struct mlx5e_tls          *tls;
@@ -938,10 +975,11 @@ struct mlx5e_priv {
 	struct mlx5e_mqprio_rl    *mqprio_rl;
 	struct dentry             *dfs_root;
 	struct mlx5_devcom_comp_dev *devcom;
+	struct ethtool_fec_hist_range *fec_ranges;
 };
 
 struct mlx5e_dev {
-	struct mlx5e_priv *priv;
+	struct net_device *netdev;
 	struct devlink_port dl_port;
 };
 
@@ -997,8 +1035,6 @@ void mlx5e_build_ptys2ethtool_map(void);
 bool mlx5e_check_fragmented_striding_rq_cap(struct mlx5_core_dev *mdev, u8 page_shift,
 					    enum mlx5e_mpwrq_umr_mode umr_mode);
 
-void mlx5e_shampo_fill_umr(struct mlx5e_rq *rq, int len);
-void mlx5e_shampo_dealloc_hd(struct mlx5e_rq *rq);
 void mlx5e_get_stats(struct net_device *dev, struct rtnl_link_stats64 *stats);
 void mlx5e_fold_sw_stats64(struct mlx5e_priv *priv, struct rtnl_link_stats64 *s);
 
@@ -1008,8 +1044,11 @@ void mlx5e_self_test(struct net_device *ndev, struct ethtool_test *etest,
 		     u64 *buf);
 void mlx5e_set_rx_mode_work(struct work_struct *work);
 
-int mlx5e_hwstamp_set(struct mlx5e_priv *priv, struct ifreq *ifr);
-int mlx5e_hwstamp_get(struct mlx5e_priv *priv, struct ifreq *ifr);
+int mlx5e_hwtstamp_set(struct mlx5e_priv *priv,
+		       struct kernel_hwtstamp_config *config,
+		       struct netlink_ext_ack *extack);
+int mlx5e_hwtstamp_get(struct mlx5e_priv *priv,
+		       struct kernel_hwtstamp_config *config);
 int mlx5e_modify_rx_cqe_compression_locked(struct mlx5e_priv *priv, bool val, bool rx_filter);
 
 int mlx5e_vlan_rx_add_vid(struct net_device *dev, __always_unused __be16 proto,
@@ -1048,6 +1087,7 @@ struct mlx5e_create_cq_param {
 	struct mlx5e_ch_stats *ch_stats;
 	int node;
 	int ix;
+	struct mlx5_uars_page *uar;
 };
 
 struct mlx5e_cq_param;
@@ -1064,6 +1104,7 @@ int mlx5e_open_locked(struct net_device *netdev);
 int mlx5e_close_locked(struct net_device *netdev);
 
 void mlx5e_trigger_napi_icosq(struct mlx5e_channel *c);
+void mlx5e_trigger_napi_async_icosq(struct mlx5e_channel *c);
 void mlx5e_trigger_napi_sched(struct napi_struct *napi);
 
 int mlx5e_open_channels(struct mlx5e_priv *priv,
@@ -1134,7 +1175,9 @@ extern const struct ethtool_ops mlx5e_ethtool_ops;
 int mlx5e_create_mkey(struct mlx5_core_dev *mdev, u32 pdn, u32 *mkey);
 int mlx5e_create_mdev_resources(struct mlx5_core_dev *mdev, bool create_tises);
 void mlx5e_destroy_mdev_resources(struct mlx5_core_dev *mdev);
-int mlx5e_refresh_tirs(struct mlx5e_priv *priv, bool enable_uc_lb,
+int mlx5e_modify_tirs_lb(struct mlx5_core_dev *mdev, bool enable_uc_lb,
+			 bool enable_mc_lb);
+int mlx5e_refresh_tirs(struct mlx5_core_dev *mdev, bool enable_uc_lb,
 		       bool enable_mc_lb);
 void mlx5e_mkey_set_relaxed_ordering(struct mlx5_core_dev *mdev, void *mkc);
 
@@ -1215,14 +1258,17 @@ struct net_device *
 mlx5e_create_netdev(struct mlx5_core_dev *mdev, const struct mlx5e_profile *profile);
 int mlx5e_attach_netdev(struct mlx5e_priv *priv);
 void mlx5e_detach_netdev(struct mlx5e_priv *priv);
-void mlx5e_destroy_netdev(struct mlx5e_priv *priv);
-int mlx5e_netdev_change_profile(struct mlx5e_priv *priv,
-				const struct mlx5e_profile *new_profile, void *new_ppriv);
-void mlx5e_netdev_attach_nic_profile(struct mlx5e_priv *priv);
+void mlx5e_destroy_netdev(struct net_device *netdev);
+int mlx5e_netdev_change_profile(struct net_device *netdev,
+				struct mlx5_core_dev *mdev,
+				const struct mlx5e_profile *new_profile,
+				void *new_ppriv);
+void mlx5e_netdev_attach_nic_profile(struct net_device *netdev,
+				     struct mlx5_core_dev *mdev);
 void mlx5e_set_netdev_mtu_boundaries(struct mlx5e_priv *priv);
 void mlx5e_build_nic_params(struct mlx5e_priv *priv, struct mlx5e_xsk *xsk, u16 mtu);
 
-void mlx5e_set_xdp_feature(struct net_device *netdev);
+void mlx5e_set_xdp_feature(struct mlx5e_priv *priv);
 netdev_features_t mlx5e_features_check(struct sk_buff *skb,
 				       struct net_device *netdev,
 				       netdev_features_t features);

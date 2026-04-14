@@ -13,10 +13,14 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/regulator/consumer.h>
+#include <linux/reset.h>
 #include <linux/thermal.h>
+
+#include <drm/drm_print.h>
 
 #include "etnaviv_cmdbuf.h"
 #include "etnaviv_dump.h"
+#include "etnaviv_flop_reset.h"
 #include "etnaviv_gpu.h"
 #include "etnaviv_gem.h"
 #include "etnaviv_mmu.h"
@@ -168,6 +172,29 @@ int etnaviv_gpu_get_param(struct etnaviv_gpu *gpu, u32 param, u64 *value)
 		DBG("%s: invalid param: %u", dev_name(gpu->dev), param);
 		return -EINVAL;
 	}
+
+	return 0;
+}
+
+static int etnaviv_gpu_reset_deassert(struct etnaviv_gpu *gpu)
+{
+	int ret;
+
+	/*
+	 * 32 core clock cycles (slowest clock) required before deassertion
+	 * 1 microsecond might match all implementations without computation
+	 */
+	usleep_range(1, 2);
+
+	ret = reset_control_deassert(gpu->rst);
+	if (ret)
+		return ret;
+
+	/*
+	 * 128 core clock cycles (slowest clock) required before any activity on AHB
+	 * 1 microsecond might match all implementations without computation
+	 */
+	usleep_range(1, 2);
 
 	return 0;
 }
@@ -799,12 +826,28 @@ int etnaviv_gpu_init(struct etnaviv_gpu *gpu)
 		goto pm_put;
 	}
 
+	ret = etnaviv_gpu_reset_deassert(gpu);
+	if (ret) {
+		dev_err(gpu->dev, "GPU reset deassert failed\n");
+		goto fail;
+	}
+
 	etnaviv_hw_identify(gpu);
 
 	if (gpu->identity.model == 0) {
 		dev_err(gpu->dev, "Unknown GPU model\n");
 		ret = -ENXIO;
 		goto fail;
+	}
+
+	if (etnaviv_flop_reset_ppu_require(&gpu->identity) &&
+	    !priv->flop_reset_data_ppu) {
+		ret = etnaviv_flop_reset_ppu_init(priv);
+		if (ret) {
+			dev_err(gpu->dev,
+				"Unable to initialize PPU flop reset data\n");
+			goto fail;
+		}
 	}
 
 	if (gpu->identity.nn_core_count > 0)
@@ -1141,7 +1184,7 @@ static struct dma_fence *etnaviv_gpu_fence_alloc(struct etnaviv_gpu *gpu)
 	 */
 	lockdep_assert_held(&gpu->lock);
 
-	f = kzalloc(sizeof(*f), GFP_KERNEL);
+	f = kzalloc_obj(*f);
 	if (!f)
 		return NULL;
 
@@ -1859,6 +1902,17 @@ static int etnaviv_gpu_platform_probe(struct platform_device *pdev)
 	gpu->mmio = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(gpu->mmio))
 		return PTR_ERR(gpu->mmio);
+
+
+	/* Get Reset: */
+	gpu->rst = devm_reset_control_get_optional_exclusive(&pdev->dev, NULL);
+	if (IS_ERR(gpu->rst))
+		return dev_err_probe(dev, PTR_ERR(gpu->rst),
+				     "failed to get reset\n");
+
+	err = reset_control_assert(gpu->rst);
+	if (err)
+		return dev_err_probe(dev, err, "failed to assert reset\n");
 
 	/* Get Interrupt: */
 	gpu->irq = platform_get_irq(pdev, 0);

@@ -41,7 +41,7 @@ static int pch_fivr_read(acpi_handle handle, char *method, struct pch_fivr_resp 
 	ret = 0;
 
 release_buffer:
-	kfree(buffer.pointer);
+	ACPI_FREE(buffer.pointer);
 	return ret;
 }
 
@@ -152,6 +152,7 @@ static const struct acpi_device_id pch_fivr_device_ids[] = {
 	{"INTC1064", 0},
 	{"INTC106B", 0},
 	{"INTC10A3", 0},
+	{"INTC10D7", 0},
 	{"", 0},
 };
 MODULE_DEVICE_TABLE(acpi, pch_fivr_device_ids);

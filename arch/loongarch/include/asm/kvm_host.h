@@ -12,6 +12,7 @@
 #include <linux/kvm.h>
 #include <linux/kvm_types.h>
 #include <linux/mutex.h>
+#include <linux/perf_event.h>
 #include <linux/spinlock.h>
 #include <linux/threads.h>
 #include <linux/types.h>
@@ -36,6 +37,7 @@
 #define KVM_REQ_TLB_FLUSH_GPA		KVM_ARCH_REQ(0)
 #define KVM_REQ_STEAL_UPDATE		KVM_ARCH_REQ(1)
 #define KVM_REQ_PMU			KVM_ARCH_REQ(2)
+#define KVM_REQ_AUX_LOAD		KVM_ARCH_REQ(3)
 
 #define KVM_GUESTDBG_SW_BP_MASK		\
 	(KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP)
@@ -49,12 +51,6 @@ struct kvm_vm_stat {
 	struct kvm_vm_stat_generic generic;
 	u64 pages;
 	u64 hugepages;
-	u64 ipi_read_exits;
-	u64 ipi_write_exits;
-	u64 eiointc_read_exits;
-	u64 eiointc_write_exits;
-	u64 pch_pic_read_exits;
-	u64 pch_pic_write_exits;
 };
 
 struct kvm_vcpu_stat {
@@ -64,6 +60,12 @@ struct kvm_vcpu_stat {
 	u64 cpucfg_exits;
 	u64 signal_exits;
 	u64 hypercall_exits;
+	u64 ipi_read_exits;
+	u64 ipi_write_exits;
+	u64 eiointc_read_exits;
+	u64 eiointc_write_exits;
+	u64 pch_pic_read_exits;
+	u64 pch_pic_write_exits;
 };
 
 #define KVM_MEM_HUGEPAGE_CAPABLE	(1UL << 0)
@@ -125,6 +127,8 @@ struct kvm_arch {
 	struct kvm_phyid_map  *phyid_map;
 	/* Enabled PV features */
 	unsigned long pv_features;
+	/* Supported KVM features */
+	unsigned long kvm_features;
 
 	s64 time_offset;
 	struct kvm_context __percpu *vmcs;
@@ -161,7 +165,9 @@ enum emulation_result {
 
 #define LOONGARCH_PV_FEAT_UPDATED	BIT_ULL(63)
 #define LOONGARCH_PV_FEAT_MASK		(BIT(KVM_FEATURE_IPI) |		\
+					 BIT(KVM_FEATURE_PREEMPT) |	\
 					 BIT(KVM_FEATURE_STEAL_TIME) |	\
+					 BIT(KVM_FEATURE_USER_HCALL) |	\
 					 BIT(KVM_FEATURE_VIRT_EXTIOI))
 
 struct kvm_vcpu_arch {
@@ -174,6 +180,9 @@ struct kvm_vcpu_arch {
 
 	/* Pointers stored here for easy accessing from assembly code */
 	int (*handle_exit)(struct kvm_run *run, struct kvm_vcpu *vcpu);
+
+	/* GPA (=HVA) of PGD for secondary mmu */
+	unsigned long kvm_pgd;
 
 	/* Host registers preserved across guest mode execution */
 	unsigned long host_sp;
@@ -193,6 +202,7 @@ struct kvm_vcpu_arch {
 
 	/* Which auxiliary state is loaded (KVM_LARCH_*) */
 	unsigned int aux_inuse;
+	unsigned int aux_ldtype;
 
 	/* FPU state */
 	struct loongarch_fpu fpu FPU_ALIGN;
@@ -245,6 +255,7 @@ struct kvm_vcpu_arch {
 		u64 guest_addr;
 		u64 last_steal;
 		struct gfn_to_hva_cache cache;
+		u8  preempted;
 	} st;
 };
 
@@ -256,6 +267,11 @@ static inline unsigned long readl_sw_gcsr(struct loongarch_csrs *csr, int reg)
 static inline void writel_sw_gcsr(struct loongarch_csrs *csr, int reg, unsigned long val)
 {
 	csr->csrs[reg] = val;
+}
+
+static inline bool kvm_guest_has_msgint(struct kvm_vcpu_arch *arch)
+{
+	return arch->cpucfg[1] & CPUCFG1_MSGINT;
 }
 
 static inline bool kvm_guest_has_fpu(struct kvm_vcpu_arch *arch)
@@ -288,13 +304,21 @@ static inline int kvm_get_pmu_num(struct kvm_vcpu_arch *arch)
 	return (arch->cpucfg[6] & CPUCFG6_PMNUM) >> CPUCFG6_PMNUM_SHIFT;
 }
 
+/* Check whether KVM support this feature (VMM may disable it) */
+static inline bool kvm_vm_support(struct kvm_arch *arch, int feature)
+{
+	return !!(arch->kvm_features & BIT_ULL(feature));
+}
+
+bool kvm_arch_pmi_in_guest(struct kvm_vcpu *vcpu);
+
 /* Debug: dump vcpu state */
 int kvm_arch_vcpu_dump_regs(struct kvm_vcpu *vcpu);
 
 /* MMU handling */
 void kvm_flush_tlb_all(void);
 void kvm_flush_tlb_gpa(struct kvm_vcpu *vcpu, unsigned long gpa);
-int kvm_handle_mm_fault(struct kvm_vcpu *vcpu, unsigned long badv, bool write);
+int kvm_handle_mm_fault(struct kvm_vcpu *vcpu, unsigned long badv, bool write, int ecode);
 
 int kvm_unmap_hva_range(struct kvm *kvm, unsigned long start, unsigned long end, bool blockable);
 int kvm_age_hva(struct kvm *kvm, unsigned long start, unsigned long end);
@@ -319,7 +343,6 @@ static inline bool kvm_is_ifetch_fault(struct kvm_vcpu_arch *arch)
 
 /* Misc */
 static inline void kvm_arch_hardware_unsetup(void) {}
-static inline void kvm_arch_sync_events(struct kvm *kvm) {}
 static inline void kvm_arch_memslots_updated(struct kvm *kvm, u64 gen) {}
 static inline void kvm_arch_vcpu_blocking(struct kvm_vcpu *vcpu) {}
 static inline void kvm_arch_vcpu_unblocking(struct kvm_vcpu *vcpu) {}

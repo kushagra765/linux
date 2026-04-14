@@ -3249,7 +3249,7 @@ hfcm_l1callback(struct dchannel *dch, u_int cmd)
 		}
 		test_and_clear_bit(FLG_TX_BUSY, &dch->Flags);
 		if (test_and_clear_bit(FLG_BUSY_TIMER, &dch->Flags))
-			del_timer(&dch->timer);
+			timer_delete(&dch->timer);
 		spin_unlock_irqrestore(&hc->lock, flags);
 		__skb_queue_purge(&free_queue);
 		break;
@@ -3394,7 +3394,7 @@ handle_dmsg(struct mISDNchannel *ch, struct sk_buff *skb)
 			}
 			test_and_clear_bit(FLG_TX_BUSY, &dch->Flags);
 			if (test_and_clear_bit(FLG_BUSY_TIMER, &dch->Flags))
-				del_timer(&dch->timer);
+				timer_delete(&dch->timer);
 #ifdef FIXME
 			if (test_and_clear_bit(FLG_L1_BUSY, &dch->Flags))
 				dchannel_sched_event(&hc->dch, D_CLEARBUSY);
@@ -4522,7 +4522,7 @@ release_port(struct hfc_multi *hc, struct dchannel *dch)
 	spin_lock_irqsave(&hc->lock, flags);
 
 	if (dch->timer.function) {
-		del_timer(&dch->timer);
+		timer_delete(&dch->timer);
 		dch->timer.function = NULL;
 	}
 
@@ -4777,7 +4777,7 @@ init_e1_port(struct hfc_multi *hc, struct hm_map *m, int pt)
 	char		name[MISDN_MAX_IDLEN];
 	int		bcount = 0;
 
-	dch = kzalloc(sizeof(struct dchannel), GFP_KERNEL);
+	dch = kzalloc_obj(struct dchannel);
 	if (!dch)
 		return -ENOMEM;
 	dch->debug = debug;
@@ -4795,7 +4795,7 @@ init_e1_port(struct hfc_multi *hc, struct hm_map *m, int pt)
 	for (ch = 1; ch <= 31; ch++) {
 		if (!((1 << ch) & hc->bmask[pt])) /* skip unused channel */
 			continue;
-		bch = kzalloc(sizeof(struct bchannel), GFP_KERNEL);
+		bch = kzalloc_obj(struct bchannel);
 		if (!bch) {
 			printk(KERN_ERR "%s: no memory for bchannel\n",
 			    __func__);
@@ -4850,7 +4850,7 @@ init_multi_port(struct hfc_multi *hc, int pt)
 	int		ch, i, ret = 0;
 	char		name[MISDN_MAX_IDLEN];
 
-	dch = kzalloc(sizeof(struct dchannel), GFP_KERNEL);
+	dch = kzalloc_obj(struct dchannel);
 	if (!dch)
 		return -ENOMEM;
 	dch->debug = debug;
@@ -4868,7 +4868,7 @@ init_multi_port(struct hfc_multi *hc, int pt)
 	hc->chan[i + 2].port = pt;
 	hc->chan[i + 2].nt_timer = -1;
 	for (ch = 0; ch < dch->dev.nrbchan; ch++) {
-		bch = kzalloc(sizeof(struct bchannel), GFP_KERNEL);
+		bch = kzalloc_obj(struct bchannel);
 		if (!bch) {
 			printk(KERN_ERR "%s: no memory for bchannel\n",
 			       __func__);
@@ -4991,7 +4991,7 @@ hfcmulti_init(struct hm_map *m, struct pci_dev *pdev,
 		       type[HFC_cnt]);
 
 	/* allocate card+fifo structure */
-	hc = kzalloc(sizeof(struct hfc_multi), GFP_KERNEL);
+	hc = kzalloc_obj(struct hfc_multi);
 	if (!hc) {
 		printk(KERN_ERR "No kmem for HFC-Multi card\n");
 		return -ENOMEM;

@@ -80,7 +80,7 @@ static int l2cap_validate_le_psm(u16 psm)
 	return 0;
 }
 
-static int l2cap_sock_bind(struct socket *sock, struct sockaddr *addr, int alen)
+static int l2cap_sock_bind(struct socket *sock, struct sockaddr_unsized *addr, int alen)
 {
 	struct sock *sk = sock->sk;
 	struct l2cap_chan *chan = l2cap_pi(sk)->chan;
@@ -178,7 +178,7 @@ done:
 	return err;
 }
 
-static int l2cap_sock_connect(struct socket *sock, struct sockaddr *addr,
+static int l2cap_sock_connect(struct socket *sock, struct sockaddr_unsized *addr,
 			      int alen, int flags)
 {
 	struct sock *sk = sock->sk;
@@ -255,7 +255,7 @@ static int l2cap_sock_connect(struct socket *sock, struct sockaddr *addr,
 
 	err = l2cap_chan_connect(chan, la.l2_psm, __le16_to_cpu(la.l2_cid),
 				 &la.l2_bdaddr, la.l2_bdaddr_type,
-				 sk->sk_sndtimeo);
+				 READ_ONCE(sk->sk_sndtimeo));
 	if (err)
 		return err;
 
@@ -710,12 +710,12 @@ static bool l2cap_valid_mtu(struct l2cap_chan *chan, u16 mtu)
 {
 	switch (chan->scid) {
 	case L2CAP_CID_ATT:
-		if (mtu < L2CAP_LE_MIN_MTU)
+		if (mtu && mtu < L2CAP_LE_MIN_MTU)
 			return false;
 		break;
 
 	default:
-		if (mtu < L2CAP_DEFAULT_MIN_MTU)
+		if (mtu && mtu < L2CAP_DEFAULT_MIN_MTU)
 			return false;
 	}
 
@@ -885,7 +885,7 @@ static int l2cap_sock_setsockopt(struct socket *sock, int level, int optname,
 	struct bt_power pwr;
 	struct l2cap_conn *conn;
 	int err = 0;
-	u32 opt;
+	u32 opt, phys;
 	u16 mtu;
 	u8 mode;
 
@@ -1029,10 +1029,17 @@ static int l2cap_sock_setsockopt(struct socket *sock, int level, int optname,
 			break;
 		}
 
-		/* Setting is not supported as it's the remote side that
-		 * decides this.
-		 */
-		err = -EPERM;
+		/* Only allow setting output MTU when not connected */
+		if (sk->sk_state == BT_CONNECTED) {
+			err = -EISCONN;
+			break;
+		}
+
+		err = copy_safe_from_sockptr(&mtu, sizeof(mtu), optval, optlen);
+		if (err)
+			break;
+
+		chan->omtu = mtu;
 		break;
 
 	case BT_RCVMTU:
@@ -1057,6 +1064,24 @@ static int l2cap_sock_setsockopt(struct socket *sock, int level, int optname,
 		else
 			chan->imtu = mtu;
 
+		break;
+
+	case BT_PHY:
+		if (sk->sk_state != BT_CONNECTED) {
+			err = -ENOTCONN;
+			break;
+		}
+
+		err = copy_safe_from_sockptr(&phys, sizeof(phys), optval,
+					     optlen);
+		if (err)
+			break;
+
+		if (!chan->conn)
+			break;
+
+		conn = chan->conn;
+		err = hci_conn_set_phy(conn->hcon, phys);
 		break;
 
 	case BT_MODE:
@@ -1106,6 +1131,7 @@ static int l2cap_sock_sendmsg(struct socket *sock, struct msghdr *msg,
 {
 	struct sock *sk = sock->sk;
 	struct l2cap_chan *chan = l2cap_pi(sk)->chan;
+	struct sockcm_cookie sockc;
 	int err;
 
 	BT_DBG("sock %p, sk %p", sock, sk);
@@ -1120,6 +1146,14 @@ static int l2cap_sock_sendmsg(struct socket *sock, struct msghdr *msg,
 	if (sk->sk_state != BT_CONNECTED)
 		return -ENOTCONN;
 
+	hci_sockcm_init(&sockc, sk);
+
+	if (msg->msg_controllen) {
+		err = sock_cmsg_send(sk, msg, &sockc);
+		if (err)
+			return err;
+	}
+
 	lock_sock(sk);
 	err = bt_sock_wait_ready(sk, msg->msg_flags);
 	release_sock(sk);
@@ -1127,7 +1161,7 @@ static int l2cap_sock_sendmsg(struct socket *sock, struct msghdr *msg,
 		return err;
 
 	l2cap_chan_lock(chan);
-	err = l2cap_chan_send(chan, msg, len);
+	err = l2cap_chan_send(chan, msg, len, &sockc);
 	l2cap_chan_unlock(chan);
 
 	return err;
@@ -1167,6 +1201,10 @@ static int l2cap_sock_recvmsg(struct socket *sock, struct msghdr *msg,
 	struct sock *sk = sock->sk;
 	struct l2cap_pinfo *pi = l2cap_pi(sk);
 	int err;
+
+	if (unlikely(flags & MSG_ERRQUEUE))
+		return sock_recv_errqueue(sk, msg, len, SOL_BLUETOOTH,
+					  BT_SCM_ERROR);
 
 	lock_sock(sk);
 
@@ -1326,9 +1364,10 @@ static int l2cap_sock_shutdown(struct socket *sock, int how)
 	/* prevent sk structure from being freed whilst unlocked */
 	sock_hold(sk);
 
-	chan = l2cap_pi(sk)->chan;
 	/* prevent chan structure from being freed whilst unlocked */
-	l2cap_chan_hold(chan);
+	chan = l2cap_chan_hold_unless_zero(l2cap_pi(sk)->chan);
+	if (!chan)
+		goto shutdown_already;
 
 	BT_DBG("chan %p state %s", chan, state_to_string(chan->state));
 
@@ -1358,22 +1397,20 @@ static int l2cap_sock_shutdown(struct socket *sock, int how)
 	release_sock(sk);
 
 	l2cap_chan_lock(chan);
-	conn = chan->conn;
-	if (conn)
-		/* prevent conn structure from being freed */
-		l2cap_conn_get(conn);
+	/* prevent conn structure from being freed */
+	conn = l2cap_conn_hold_unless_zero(chan->conn);
 	l2cap_chan_unlock(chan);
 
 	if (conn)
 		/* mutex lock must be taken before l2cap_chan_lock() */
-		mutex_lock(&conn->chan_lock);
+		mutex_lock(&conn->lock);
 
 	l2cap_chan_lock(chan);
 	l2cap_chan_close(chan, 0);
 	l2cap_chan_unlock(chan);
 
 	if (conn) {
-		mutex_unlock(&conn->chan_lock);
+		mutex_unlock(&conn->lock);
 		l2cap_conn_put(conn);
 	}
 
@@ -1410,7 +1447,10 @@ static int l2cap_sock_release(struct socket *sock)
 	if (!sk)
 		return 0;
 
+	lock_sock_nested(sk, L2CAP_NESTING_PARENT);
 	l2cap_sock_cleanup_listen(sk);
+	release_sock(sk);
+
 	bt_sock_unlink(&l2cap_sk_list, sk);
 
 	err = l2cap_sock_shutdown(sock, SHUT_RDWR);
@@ -1531,8 +1571,7 @@ static int l2cap_sock_recv_cb(struct l2cap_chan *chan, struct sk_buff *skb)
 	    (chan->mode == L2CAP_MODE_ERTM ||
 	     chan->mode == L2CAP_MODE_LE_FLOWCTL ||
 	     chan->mode == L2CAP_MODE_EXT_FLOWCTL)) {
-		struct l2cap_rx_busy *rx_busy =
-			kmalloc(sizeof(*rx_busy), GFP_KERNEL);
+		struct l2cap_rx_busy *rx_busy = kmalloc_obj(*rx_busy);
 		if (!rx_busy) {
 			err = -ENOMEM;
 			goto done;
@@ -1659,6 +1698,9 @@ static void l2cap_sock_ready_cb(struct l2cap_chan *chan)
 	struct sock *sk = chan->data;
 	struct sock *parent;
 
+	if (!sk)
+		return;
+
 	lock_sock(sk);
 
 	parent = bt_sk(sk)->parent;
@@ -1691,6 +1733,9 @@ static void l2cap_sock_resume_cb(struct l2cap_chan *chan)
 {
 	struct sock *sk = chan->data;
 
+	if (!sk)
+		return;
+
 	if (test_and_clear_bit(FLAG_PENDING_SECURITY, &chan->flags)) {
 		sk->sk_state = BT_CONNECTED;
 		chan->state = BT_CONNECTED;
@@ -1713,7 +1758,7 @@ static long l2cap_sock_get_sndtimeo_cb(struct l2cap_chan *chan)
 {
 	struct sock *sk = chan->data;
 
-	return sk->sk_sndtimeo;
+	return READ_ONCE(sk->sk_sndtimeo);
 }
 
 static struct pid *l2cap_sock_get_peer_pid_cb(struct l2cap_chan *chan)
@@ -1781,6 +1826,7 @@ static void l2cap_sock_destruct(struct sock *sk)
 
 	skb_queue_purge(&sk->sk_receive_queue);
 	skb_queue_purge(&sk->sk_write_queue);
+	skb_queue_purge(&sk->sk_error_queue);
 }
 
 static void l2cap_skb_msg_name(struct sk_buff *skb, void *msg_name,
@@ -1888,7 +1934,8 @@ static struct sock *l2cap_sock_alloc(struct net *net, struct socket *sock,
 	chan = l2cap_chan_create();
 	if (!chan) {
 		sk_free(sk);
-		sock->sk = NULL;
+		if (sock)
+			sock->sk = NULL;
 		return NULL;
 	}
 

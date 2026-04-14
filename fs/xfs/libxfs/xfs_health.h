@@ -70,6 +70,8 @@ struct xfs_rtgroup;
 #define XFS_SICK_RG_SUPER	(1 << 0)  /* rt group superblock */
 #define XFS_SICK_RG_BITMAP	(1 << 1)  /* rt group bitmap */
 #define XFS_SICK_RG_SUMMARY	(1 << 2)  /* rt groups summary */
+#define XFS_SICK_RG_RMAPBT	(1 << 3)  /* reverse mappings */
+#define XFS_SICK_RG_REFCNTBT	(1 << 4)  /* reference counts */
 
 /* Observable health issues for AG metadata. */
 #define XFS_SICK_AG_SB		(1 << 0)  /* superblock */
@@ -115,7 +117,9 @@ struct xfs_rtgroup;
 
 #define XFS_SICK_RG_PRIMARY	(XFS_SICK_RG_SUPER | \
 				 XFS_SICK_RG_BITMAP | \
-				 XFS_SICK_RG_SUMMARY)
+				 XFS_SICK_RG_SUMMARY | \
+				 XFS_SICK_RG_RMAPBT | \
+				 XFS_SICK_RG_REFCNTBT)
 
 #define XFS_SICK_AG_PRIMARY	(XFS_SICK_AG_SB | \
 				 XFS_SICK_AG_AGF | \
@@ -284,5 +288,10 @@ void xfs_bulkstat_health(struct xfs_inode *ip, struct xfs_bulkstat *bs);
 
 #define xfs_metadata_is_sick(error) \
 	(unlikely((error) == -EFSCORRUPTED || (error) == -EFSBADCRC))
+
+unsigned int xfs_healthmon_inode_mask(unsigned int sick_mask);
+unsigned int xfs_healthmon_rtgroup_mask(unsigned int sick_mask);
+unsigned int xfs_healthmon_perag_mask(unsigned int sick_mask);
+unsigned int xfs_healthmon_fs_mask(unsigned int sick_mask);
 
 #endif	/* __XFS_HEALTH_H__ */

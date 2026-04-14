@@ -248,7 +248,7 @@ static int trace_selftest_ops(struct trace_array *tr, int cnt)
 		goto out;
 
 	/* Add a dynamic probe */
-	dyn_ops = kzalloc(sizeof(*dyn_ops), GFP_KERNEL);
+	dyn_ops = kzalloc_obj(*dyn_ops);
 	if (!dyn_ops) {
 		printk("MEMORY ERROR ");
 		goto out;
@@ -774,7 +774,8 @@ struct fgraph_fixture {
 };
 
 static __init int store_entry(struct ftrace_graph_ent *trace,
-			      struct fgraph_ops *gops)
+			      struct fgraph_ops *gops,
+			      struct ftrace_regs *fregs)
 {
 	struct fgraph_fixture *fixture = container_of(gops, struct fgraph_fixture, gops);
 	const char *type = fixture->store_type_name;
@@ -807,7 +808,8 @@ static __init int store_entry(struct ftrace_graph_ent *trace,
 }
 
 static __init void store_return(struct ftrace_graph_ret *trace,
-				struct fgraph_ops *gops)
+				struct fgraph_ops *gops,
+				struct ftrace_regs *fregs)
 {
 	struct fgraph_fixture *fixture = container_of(gops, struct fgraph_fixture, gops);
 	const char *type = fixture->store_type_name;
@@ -1025,7 +1027,8 @@ static unsigned int graph_hang_thresh;
 
 /* Wrap the real function entry probe to avoid possible hanging */
 static int trace_graph_entry_watchdog(struct ftrace_graph_ent *trace,
-				      struct fgraph_ops *gops)
+				      struct fgraph_ops *gops,
+				      struct ftrace_regs *fregs)
 {
 	/* This is harmlessly racy, we want to approximately detect a hang */
 	if (unlikely(++graph_hang_thresh > GRAPH_MAX_FUNC_TEST)) {
@@ -1039,7 +1042,7 @@ static int trace_graph_entry_watchdog(struct ftrace_graph_ent *trace,
 		return 0;
 	}
 
-	return trace_graph_entry(trace, gops);
+	return trace_graph_entry(trace, gops, fregs);
 }
 
 static struct fgraph_ops fgraph_ops __initdata  = {
@@ -1222,7 +1225,7 @@ trace_selftest_startup_irqsoff(struct tracer *trace, struct trace_array *tr)
 	/* check both trace buffers */
 	ret = trace_test_buffer(&tr->array_buffer, NULL);
 	if (!ret)
-		ret = trace_test_buffer(&tr->max_buffer, &count);
+		ret = trace_test_buffer(&tr->snapshot_buffer, &count);
 	trace->reset(tr);
 	tracing_start();
 
@@ -1284,7 +1287,7 @@ trace_selftest_startup_preemptoff(struct tracer *trace, struct trace_array *tr)
 	/* check both trace buffers */
 	ret = trace_test_buffer(&tr->array_buffer, NULL);
 	if (!ret)
-		ret = trace_test_buffer(&tr->max_buffer, &count);
+		ret = trace_test_buffer(&tr->snapshot_buffer, &count);
 	trace->reset(tr);
 	tracing_start();
 
@@ -1352,7 +1355,7 @@ trace_selftest_startup_preemptirqsoff(struct tracer *trace, struct trace_array *
 	if (ret)
 		goto out;
 
-	ret = trace_test_buffer(&tr->max_buffer, &count);
+	ret = trace_test_buffer(&tr->snapshot_buffer, &count);
 	if (ret)
 		goto out;
 
@@ -1382,7 +1385,7 @@ trace_selftest_startup_preemptirqsoff(struct tracer *trace, struct trace_array *
 	if (ret)
 		goto out;
 
-	ret = trace_test_buffer(&tr->max_buffer, &count);
+	ret = trace_test_buffer(&tr->snapshot_buffer, &count);
 
 	if (!ret && !count) {
 		printk(KERN_CONT ".. no entries found ..");
@@ -1510,7 +1513,7 @@ trace_selftest_startup_wakeup(struct tracer *trace, struct trace_array *tr)
 	/* check both trace buffers */
 	ret = trace_test_buffer(&tr->array_buffer, NULL);
 	if (!ret)
-		ret = trace_test_buffer(&tr->max_buffer, &count);
+		ret = trace_test_buffer(&tr->snapshot_buffer, &count);
 
 
 	trace->reset(tr);

@@ -31,7 +31,7 @@
 #define LDMA_ASK_VALID		BIT(2)
 #define LDMA_START		BIT(3) /* DMA start operation */
 #define LDMA_STOP		BIT(4) /* DMA stop operation */
-#define LDMA_CONFIG_MASK	GENMASK(4, 0) /* DMA controller config bits mask */
+#define LDMA_CONFIG_MASK	GENMASK_ULL(4, 0) /* DMA controller config bits mask */
 
 /* Bitfields in ndesc_addr field of HW descriptor */
 #define LDMA_DESC_EN		BIT(0) /*1: The next descriptor is valid */
@@ -335,7 +335,7 @@ ls2x_dma_prep_slave_sg(struct dma_chan *chan, struct scatterlist *sgl,
 	if (!burst_size)
 		return NULL;
 
-	desc = kzalloc(struct_size(desc, sg, sg_len), GFP_NOWAIT);
+	desc = kzalloc_flex(*desc, sg, sg_len, GFP_NOWAIT);
 	if (!desc)
 		return NULL;
 
@@ -400,7 +400,7 @@ ls2x_dma_prep_dma_cyclic(struct dma_chan *chan, dma_addr_t buf_addr, size_t buf_
 		return NULL;
 
 	num_periods = buf_len / period_len;
-	desc = kzalloc(struct_size(desc, sg, num_periods), GFP_NOWAIT);
+	desc = kzalloc_flex(*desc, sg, num_periods, GFP_NOWAIT);
 	if (!desc)
 		return NULL;
 

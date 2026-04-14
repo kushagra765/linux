@@ -3,7 +3,7 @@
  * Copyright (C) 2018-2023 Oracle.  All Rights Reserved.
  * Author: Darrick J. Wong <djwong@kernel.org>
  */
-#include "xfs.h"
+#include "xfs_platform.h"
 #include "xfs_fs.h"
 #include "xfs_shared.h"
 #include "xfs_format.h"
@@ -37,6 +37,13 @@
 #include "xfs_da_btree.h"
 #include "xfs_attr.h"
 #include "xfs_dir2.h"
+#include "xfs_rtrmap_btree.h"
+#include "xfs_rtbitmap.h"
+#include "xfs_rtgroup.h"
+#include "xfs_rtalloc.h"
+#include "xfs_metafile.h"
+#include "xfs_rtrefcount_btree.h"
+#include "xfs_zone_alloc.h"
 #include "scrub/scrub.h"
 #include "scrub/common.h"
 #include "scrub/trace.h"
@@ -62,6 +69,7 @@ xrep_attempt(
 	trace_xrep_attempt(XFS_I(file_inode(sc->file)), sc->sm, error);
 
 	xchk_ag_btcur_free(&sc->sa);
+	xchk_rtgroup_btcur_free(&sc->sr);
 
 	/* Repair whatever's broken. */
 	ASSERT(sc->ops->repair);
@@ -377,6 +385,41 @@ xrep_calc_ag_resblks(
 
 	return max(max(bnobt_sz, inobt_sz), max(rmapbt_sz, refcbt_sz));
 }
+
+#ifdef CONFIG_XFS_RT
+/*
+ * Figure out how many blocks to reserve for a rtgroup repair.  We calculate
+ * the worst case estimate for the number of blocks we'd need to rebuild one of
+ * any type of per-rtgroup btree.
+ */
+xfs_extlen_t
+xrep_calc_rtgroup_resblks(
+	struct xfs_scrub		*sc)
+{
+	struct xfs_mount		*mp = sc->mp;
+	struct xfs_scrub_metadata	*sm = sc->sm;
+	uint64_t			usedlen;
+	xfs_extlen_t			rmapbt_sz = 0;
+
+	if (!(sm->sm_flags & XFS_SCRUB_IFLAG_REPAIR))
+		return 0;
+	if (!xfs_has_rtgroups(mp)) {
+		ASSERT(0);
+		return -EFSCORRUPTED;
+	}
+
+	usedlen = xfs_rtbxlen_to_blen(mp, xfs_rtgroup_extents(mp, sm->sm_agno));
+	ASSERT(usedlen <= XFS_MAX_RGBLOCKS);
+
+	if (xfs_has_rmapbt(mp))
+		rmapbt_sz = xfs_rtrmapbt_calc_size(mp, usedlen);
+
+	trace_xrep_calc_rtgroup_resblks_btsize(mp, sm->sm_agno, usedlen,
+			rmapbt_sz);
+
+	return rmapbt_sz;
+}
+#endif /* CONFIG_XFS_RT */
 
 /*
  * Reconstructing per-AG Btrees
@@ -954,6 +997,27 @@ xrep_ag_init(
 }
 
 #ifdef CONFIG_XFS_RT
+/* Initialize all the btree cursors for a RT repair. */
+void
+xrep_rtgroup_btcur_init(
+	struct xfs_scrub	*sc,
+	struct xchk_rt		*sr)
+{
+	struct xfs_mount	*mp = sc->mp;
+
+	ASSERT(sr->rtg != NULL);
+
+	if (sc->sm->sm_type != XFS_SCRUB_TYPE_RTRMAPBT &&
+	    (sr->rtlock_flags & XFS_RTGLOCK_RMAP) &&
+	    xfs_has_rtrmapbt(mp))
+		sr->rmap_cur = xfs_rtrmapbt_init_cursor(sc->tp, sr->rtg);
+
+	if (sc->sm->sm_type != XFS_SCRUB_TYPE_RTREFCBT &&
+	    (sr->rtlock_flags & XFS_RTGLOCK_REFCOUNT) &&
+	    xfs_has_rtreflink(mp))
+		sr->refc_cur = xfs_rtrefcountbt_init_cursor(sc->tp, sr->rtg);
+}
+
 /*
  * Given a reference to a rtgroup structure, lock rtgroup btree inodes and
  * create btree cursors.  Must only be called to repair a regular rt file.
@@ -972,6 +1036,39 @@ xrep_rtgroup_init(
 
 	/* Grab our own passive reference from the caller's ref. */
 	sr->rtg = xfs_rtgroup_hold(rtg);
+	xrep_rtgroup_btcur_init(sc, sr);
+	return 0;
+}
+
+/* Ensure that all rt blocks in the given range are not marked free. */
+int
+xrep_require_rtext_inuse(
+	struct xfs_scrub	*sc,
+	xfs_rgblock_t		rgbno,
+	xfs_filblks_t		len)
+{
+	struct xfs_mount	*mp = sc->mp;
+	xfs_rtxnum_t		startrtx;
+	xfs_rtxnum_t		endrtx;
+	bool			is_free = false;
+	int			error = 0;
+
+	if (xfs_has_zoned(mp)) {
+		if (!xfs_zone_rgbno_is_valid(sc->sr.rtg, rgbno + len - 1))
+			return -EFSCORRUPTED;
+		return 0;
+	}
+
+	startrtx = xfs_rgbno_to_rtx(mp, rgbno);
+	endrtx = xfs_rgbno_to_rtx(mp, rgbno + len - 1);
+
+	error = xfs_rtalloc_extent_is_free(sc->sr.rtg, sc->tp, startrtx,
+			endrtx - startrtx + 1, &is_free);
+	if (error)
+		return error;
+	if (is_free)
+		return -EFSCORRUPTED;
+
 	return 0;
 }
 #endif /* CONFIG_XFS_RT */
@@ -1013,7 +1110,7 @@ xrep_will_attempt(
 		return true;
 
 	/* Let debug users force us into the repair routines. */
-	if (XFS_TEST_ERROR(false, sc->mp, XFS_ERRTAG_FORCE_SCRUB_REPAIR))
+	if (XFS_TEST_ERROR(sc->mp, XFS_ERRTAG_FORCE_SCRUB_REPAIR))
 		return true;
 
 	/* Metadata is corrupt or failed cross-referencing. */
@@ -1039,6 +1136,9 @@ xrep_metadata_inode_subtype(
 	 * setup/teardown routines.
 	 */
 	sub = xchk_scrub_create_subord(sc, scrub_type);
+	if (!sub)
+		return -ENOMEM;
+
 	error = sub->sc.ops->scrub(&sub->sc);
 	if (error)
 		goto out;
@@ -1172,42 +1272,6 @@ xrep_setup_xfbtree(
 }
 
 /*
- * Create a dummy transaction for use in a live update hook function.  This
- * function MUST NOT be called from regular repair code because the current
- * process' transaction is saved via the cookie.
- */
-int
-xrep_trans_alloc_hook_dummy(
-	struct xfs_mount	*mp,
-	void			**cookiep,
-	struct xfs_trans	**tpp)
-{
-	int			error;
-
-	*cookiep = current->journal_info;
-	current->journal_info = NULL;
-
-	error = xfs_trans_alloc_empty(mp, tpp);
-	if (!error)
-		return 0;
-
-	current->journal_info = *cookiep;
-	*cookiep = NULL;
-	return error;
-}
-
-/* Cancel a dummy transaction used by a live update hook function. */
-void
-xrep_trans_cancel_hook_dummy(
-	void			**cookiep,
-	struct xfs_trans	*tp)
-{
-	xfs_trans_cancel(tp);
-	current->journal_info = *cookiep;
-	*cookiep = NULL;
-}
-
-/*
  * See if this buffer can pass the given ->verify_struct() function.
  *
  * If the buffer already has ops attached and they're not the ones that were
@@ -1236,4 +1300,111 @@ xrep_buf_verify_struct(
 	bp->b_error = old_error;
 
 	return fa == NULL;
+}
+
+/* Check the sanity of a rmap record for a metadata btree inode. */
+int
+xrep_check_ino_btree_mapping(
+	struct xfs_scrub		*sc,
+	const struct xfs_rmap_irec	*rec)
+{
+	enum xbtree_recpacking		outcome;
+	int				error;
+
+	/*
+	 * Metadata btree inodes never have extended attributes, and all blocks
+	 * should have the bmbt block flag set.
+	 */
+	if ((rec->rm_flags & XFS_RMAP_ATTR_FORK) ||
+	    !(rec->rm_flags & XFS_RMAP_BMBT_BLOCK))
+		return -EFSCORRUPTED;
+
+	/* Make sure the block is within the AG. */
+	if (!xfs_verify_agbext(sc->sa.pag, rec->rm_startblock,
+				rec->rm_blockcount))
+		return -EFSCORRUPTED;
+
+	/* Make sure this isn't free space. */
+	error = xfs_alloc_has_records(sc->sa.bno_cur, rec->rm_startblock,
+			rec->rm_blockcount, &outcome);
+	if (error)
+		return error;
+	if (outcome != XBTREE_RECPACKING_EMPTY)
+		return -EFSCORRUPTED;
+
+	return 0;
+}
+
+/*
+ * Reset the block count of the inode being repaired, and adjust the dquot
+ * block usage to match.  The inode must not have an xattr fork.
+ */
+void
+xrep_inode_set_nblocks(
+	struct xfs_scrub	*sc,
+	int64_t			new_blocks)
+{
+	int64_t			delta =
+		new_blocks - sc->ip->i_nblocks;
+
+	sc->ip->i_nblocks = new_blocks;
+
+	xfs_trans_log_inode(sc->tp, sc->ip, XFS_ILOG_CORE);
+	if (delta != 0)
+		xfs_trans_mod_dquot_byino(sc->tp, sc->ip, XFS_TRANS_DQ_BCOUNT,
+				delta);
+}
+
+/* Reset the block reservation for a metadata inode. */
+int
+xrep_reset_metafile_resv(
+	struct xfs_scrub	*sc)
+{
+	struct xfs_mount	*mp = sc->mp;
+	int64_t			delta;
+	int			error;
+
+	delta = mp->m_metafile_resv_used + mp->m_metafile_resv_avail -
+		mp->m_metafile_resv_target;
+	if (delta == 0)
+		return 0;
+
+	/*
+	 * Too many blocks have been reserved, transfer some from the incore
+	 * reservation back to the filesystem.
+	 */
+	if (delta > 0) {
+		int64_t		give_back;
+
+		give_back = min_t(uint64_t, delta, mp->m_metafile_resv_avail);
+		if (give_back > 0) {
+			xfs_mod_sb_delalloc(mp, -give_back);
+			xfs_add_fdblocks(mp, give_back);
+			mp->m_metafile_resv_avail -= give_back;
+		}
+
+		return 0;
+	}
+
+	/*
+	 * Not enough reservation; try to take some blocks from the filesystem
+	 * to the metabtree reservation.
+	 */
+	delta = -delta; /* delta is negative here, so invert the sign. */
+	error = xfs_dec_fdblocks(mp, delta, true);
+	while (error == -ENOSPC) {
+		delta--;
+		if (delta == 0) {
+			xfs_warn(sc->mp,
+"Insufficient free space to reset metabtree reservation after repair.");
+			return 0;
+		}
+		error = xfs_dec_fdblocks(mp, delta, true);
+	}
+	if (error)
+		return error;
+
+	xfs_mod_sb_delalloc(mp, delta);
+	mp->m_metafile_resv_avail += delta;
+	return 0;
 }

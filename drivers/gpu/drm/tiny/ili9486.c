@@ -14,8 +14,8 @@
 
 #include <video/mipi_display.h>
 
+#include <drm/clients/drm_client_setup.h>
 #include <drm/drm_atomic_helper.h>
-#include <drm/drm_client_setup.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_fbdev_dma.h>
 #include <drm/drm_gem_atomic_helper.h>
@@ -23,6 +23,7 @@
 #include <drm/drm_managed.h>
 #include <drm/drm_mipi_dbi.h>
 #include <drm/drm_modeset_helper.h>
+#include <drm/drm_print.h>
 
 #define ILI9486_ITFCTR1         0xb0
 #define ILI9486_PWCTRL1         0xc2
@@ -177,7 +178,6 @@ static const struct drm_driver ili9486_driver = {
 	.debugfs_init		= mipi_dbi_debugfs_init,
 	.name			= "ili9486",
 	.desc			= "Ilitek ILI9486",
-	.date			= "20200118",
 	.major			= 1,
 	.minor			= 0,
 };

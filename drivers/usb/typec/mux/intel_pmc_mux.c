@@ -718,7 +718,7 @@ DEFINE_SHOW_ATTRIBUTE(port_iom_status);
 static void pmc_mux_port_debugfs_init(struct pmc_usb_port *port)
 {
 	struct dentry *debugfs_dir;
-	char name[6];
+	char name[8];
 
 	snprintf(name, sizeof(name), "port%d", port->usb3_port - 1);
 
@@ -754,7 +754,7 @@ static int pmc_usb_probe(struct platform_device *pdev)
 
 	pmc->ipc = devm_intel_scu_ipc_dev_get(&pdev->dev);
 	if (!pmc->ipc)
-		return -ENODEV;
+		return -EPROBE_DEFER;
 
 	pmc->dev = &pdev->dev;
 
